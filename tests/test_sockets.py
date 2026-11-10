@@ -7,6 +7,7 @@ from __future__ import annotations
 import errno
 import socket
 import socketserver
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -224,14 +225,18 @@ def test_a_non_blocking_connect_is_in_progress_then_completes(guest: Guest, port
         "r = socket.socket(); r.setblocking(False)\n"
         "try: r.connect(dead)\nexcept BlockingIOError: pass\n"
         "p = select.poll(); p.register(r, select.POLLOUT)\n"
-        "print('POLLERR:', [ev & select.POLLERR != 0 for _, ev in p.poll(3000)])\n"
+        "rv = p.poll(3000)\n"
+        "print('POLLERR:', [ev & select.POLLERR != 0 for _, ev in rv])\n"
+        "print('revents:', [hex(ev) for _, ev in rv])\n"
         "print('SO_ERROR:', r.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == errno.ECONNREFUSED)\n"
         "k = socket.socket(); k.settimeout(3)\n"
         "try: k.connect(dead)\nexcept ConnectionRefusedError: print('timeout connect: refused')\n"
         "k = socket.socket(); k.settimeout(3); k.connect(('127.0.0.1', PORT))\n"
         "print('timeout connect:', k.getpeername()[1] == PORT)\n",
     )
-    assert out == [
+    # the "revents" line is only for the message: macOS gave POLLERR [False] (CI run 42829422107) and what it gives
+    # instead (POLLHUP?) is not known yet
+    assert [x for x in out if not x.startswith("revents:")] == [
         "connect: True",
         "POLLOUT: [True]",
         "SO_ERROR: 0 True",
@@ -239,7 +244,7 @@ def test_a_non_blocking_connect_is_in_progress_then_completes(guest: Guest, port
         "SO_ERROR: True",
         "timeout connect: refused",
         "timeout connect: True",
-    ]
+    ], out
 
 
 def test_poll_reports_a_hang_up(guest: Guest, port: int):
@@ -250,10 +255,16 @@ def test_poll_reports_a_hang_up(guest: Guest, port: int):
         "c = socket.create_connection(l.getsockname()); s, _ = l.accept(); c.close(); time.sleep(0.1)\n"
         "p = select.poll(); p.register(s, select.POLLIN | select.POLLOUT)\n"
         "print([(ev & select.POLLIN != 0, ev & select.POLLHUP != 0) for _, ev in p.poll(1000)], s.recv(5))\n"
-        "s.shutdown(socket.SHUT_RDWR)\n"
+        "try: s.shutdown(socket.SHUT_RDWR)\n"
+        "except OSError as e: print('shutdown:', errno.errorcode[e.errno])\n"
         "print([ev & select.POLLHUP != 0 for _, ev in p.poll(1000)])\n",
     )
-    assert out == ["[(True, False)] b''", "[True]"]
+    if sys.platform == "darwin":
+        # BSD refuses shutdown() on a socket whose peer has closed (ENOTCONN: CI run 42829422107); Linux accepts it.
+        # What poll says after it is not known there yet: the line is in the message
+        assert out[:2] == ["[(True, False)] b''", "shutdown: ENOTCONN"], out
+    else:
+        assert out == ["[(True, False)] b''", "[True]"]
 
 
 def test_udp_has_addresses_in_both_directions(guest: Guest, port: int):
@@ -275,7 +286,7 @@ def test_udp_has_addresses_in_both_directions(guest: Guest, port: int):
         "try: c.sendmsg([b'x'], [(socket.SOL_SOCKET, 1, bytes(4))])\n"
         "except OSError as e: print('SCM_RIGHTS:', e.errno == errno.EOPNOTSUPP)\n"
         "try: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).send(b'x')\n"
-        "except OSError as e: print('no address:', e.errno == errno.EDESTADDRREQ)\n",
+        "except OSError as e: print('no address:', errno.errorcode.get(e.errno, e.errno))\n",
     )
     assert out == [
         "SO_TYPE: 2",
@@ -287,7 +298,7 @@ def test_udp_has_addresses_in_both_directions(guest: Guest, port: int):
         "peek: b'0123'",
         "truncated: b'0123' True",
         "SCM_RIGHTS: True",
-        "no address: True",
+        "no address: EDESTADDRREQ",
     ]
 
 
@@ -342,7 +353,8 @@ def test_getaddrinfo_lists_the_hosts_addresses(guest: Guest, port: int):
         "print()\n",
     )
     assert out[0] == f"{sorted(families)} {{(1, 6)}}"  # the host's families, stream, protocol 6
-    assert out[1] == "(17, '', ('127.0.0.1', 53)) localhost [('0.0.0.0', 8080)]"
+    canon = socket.getaddrinfo("localhost", 80, flags=socket.AI_CANONNAME)[0][3]  # Windows says its own name
+    assert out[1] == f"(17, '', ('127.0.0.1', 53)) {canon} [('0.0.0.0', 8080)]"
     assert out[2] == "-1 -7 -6 -2 -2 -8 "
 
 
@@ -428,13 +440,17 @@ def test_sockaddr_translation_round_trips():
     assert Pyodide._sockaddr_tuple(raw) == v4
 
 
+# Winsock takes a whole 10 MB buffer into the kernel at once (CI run 42829422107: not "partial"): fine there
+LESS = "<=" if sys.platform == "win32" else "<"
+
+
 def test_a_non_blocking_send_never_waits(guest: Guest, port: int):
     out = run(
         guest,
         port,
         "a, b = socket.socketpair(); a.setblocking(False)\n"
         "t = time.time(); n = a.send(b'x' * 10_000_000)\n"
-        "print('partial:', 0 < n < 10_000_000, 'quick:', time.time() - t < 20)\n"
+        "print('partial:', 0 < n " + LESS + " 10_000_000, 'quick:', time.time() - t < 20)\n"
         "try:\n    while True: a.send(b'x' * 1_000_000)\nexcept BlockingIOError: print('full: EAGAIN')\n"
         "a.setblocking(True)\n"
         "try: a.send(b'y' * 10_000_000, socket.MSG_DONTWAIT)\nexcept BlockingIOError: print('MSG_DONTWAIT: EAGAIN')\n"

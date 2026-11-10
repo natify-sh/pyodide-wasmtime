@@ -176,7 +176,13 @@ libc.llabs(-3)
 
 def test_closures_reuse_their_wasmtime_functions(flavor: str) -> None:
     """A wasmtime Func is never freed before its store: 20000 created and freed callbacks must not make 20000."""
-    import resource
+    try:
+        import resource
+    except ImportError:  # Windows: no ru_maxrss; the pool checks below still run
+        resource = None
+
+    def maxrss() -> int:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else 0
 
     code = """
 import ctypes as c
@@ -188,8 +194,8 @@ for i in range(20000):
 """
     with Pyodide(flavor) as py:
         assert py.run("pass") == 0
-        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        before = maxrss()
         assert py.run(code) == 0
-        grown_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before
+        grown_kb = maxrss() - before
         assert sum(len(v) for v in py.func_pool.values()) <= 2 and not py.live_funcs
     assert grown_kb < 40_000  # it was 150 MB

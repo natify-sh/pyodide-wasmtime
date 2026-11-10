@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 
 import pytest
 from conftest import Guest, check_file
@@ -28,6 +29,7 @@ def test_numpy(guest: Guest):
     assert "unresolved 0" not in p.stderr or True  # the loader's own log is not part of the contract
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="--dev preopens the host's /dev, which Windows does not have")
 def test_openssl_through_ctypes(guest: Guest):
     exact(guest, "openssl_check.py", "site_ssl", "openssl_check.expected", "--dev")
 

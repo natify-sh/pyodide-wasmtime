@@ -7,7 +7,17 @@ answer; a failed assertion is a traceback and exit status 1.
 
 from __future__ import annotations
 
+import sys
+
+import pytest
 from conftest import Guest
+
+WIN = sys.platform == "win32"
+# wasmtime's path_symlink on Windows takes the target relative to the directory descriptor it is given (the root), not
+# to the directory of the link, and refuses a ".." that leaves it (CI run 42829422107: ENOENT for a link 'ln' to its
+# sibling 'f' in a subdirectory, EPERM for the relative form of an absolute target); a symlink test can not run there
+# until that is solved (a gap, not a Windows rule: a link to a sibling is allowed by Windows itself).
+NO_WIN_SYMLINK = pytest.mark.skipif(WIN, reason="wasmtime's path_symlink on Windows resolves the target from the root")
 
 HEAD = """\
 import os, stat, errno, shutil, ctypes, fcntl, sys
@@ -26,7 +36,7 @@ def err(f, *a, **k):
 
 
 def check(guest: Guest, code: str, **kw: str) -> None:
-    p = guest.run(HEAD + code + "\nprint('ok')", None, *[x for k, v in kw.items() for x in (k, v)])
+    p = guest.run(f"WIN = {WIN}\n" + HEAD + code + "\nprint('ok')", None, *[x for k, v in kw.items() for x in (k, v)])
     assert p.returncode == 0, p.stderr[-3000:]
     assert p.stdout.split() == ["ok"], p.stdout + p.stderr[-2000:]
 
@@ -100,7 +110,7 @@ assert err(os.symlink, 'f', B + '/d/l') == 'EACCES'
 assert err(os.symlink, B + '/f', B + '/d/l') == 'EACCES'
 # the existing name or the missing one is reported first, as the system call does
 assert err(os.mkdir, B + '/d/sub') == 'EEXIST' and err(os.unlink, B + '/d/nope') == 'ENOENT'
-assert err(os.open, B + '/d/f', os.O_RDONLY) is None  # reading a file in it is allowed
+assert err(lambda p: os.close(os.open(p, os.O_RDONLY)), B + '/d/f') is None  # reading a file in it is allowed
 os.chmod(B + '/d', 0o755)
 os.mkdir(B + '/d/new')
 os.chmod(B + '/d', 0o700 & ~0o100)  # no search permission either
@@ -154,8 +164,9 @@ os.chdir('/..')
 assert os.getcwd() == '/'
 s = os.stat(B)
 assert s.st_ino > 0 and s.st_dev > 0 and os.fstat(d).st_dev == s.st_dev and os.fstat(d).st_ino == s.st_ino
-os.symlink('f', B + '/l')
-assert stat.S_ISLNK(os.lstat(B + '/l').st_mode) and oct(os.lstat(B + '/l').st_mode) == '0o120777'
+if not WIN:  # NO_WIN_SYMLINK
+    os.symlink('f', B + '/l')
+    assert stat.S_ISLNK(os.lstat(B + '/l').st_mode) and oct(os.lstat(B + '/l').st_mode) == '0o120777'
 """,
     )
 
@@ -179,11 +190,13 @@ assert not os.path.exists('x')  # not the root's: the cwd + the name, not the na
 assert os.read(os.dup(os.open(deep + 'f', os.O_RDONLY)), 2) == b'hi'  # dup() keeps a path of any length
 os.chdir('/')
 assert err(os.chdir, '/' + 'a/' * 600) == 'ENOENT'
-assert err(os.stat, '/' + 'a/' * 3000) == 'ENAMETOOLONG'
+e = err(os.stat, '/' + 'a/' * 3000)  # Linux's kernel refuses 6000 bytes before it looks at a name
+assert e == 'ENAMETOOLONG', e
 """,
     )
 
 
+@NO_WIN_SYMLINK
 def test_chdir_is_physical(guest: Guest):
     check(
         guest,
@@ -218,6 +231,7 @@ assert os.getcwd() == '/'
     )
 
 
+@NO_WIN_SYMLINK
 def test_absolute_symlinks_work_and_read_back_as_stored(guest: Guest):
     check(
         guest,
@@ -341,7 +355,7 @@ os.utime(B + '/f', ns=(1000000001, 2000000002))
 s = os.stat(B + '/f')
 assert (s.st_atime_ns, s.st_mtime_ns) in ((1000000001, 2000000002), (1000000000, 2000000000))
 assert err(os.utime, B + '/nope', (1, 1)) == 'ENOENT'
-fd = os.open(B + '/f', os.O_RDONLY)
+fd = os.open(B + '/f', os.O_RDWR)  # Windows sets the times of a handle that can write attributes only
 os.utime(fd, (5, 6))
 assert (os.fstat(fd).st_atime, os.fstat(fd).st_mtime) == (5.0, 6.0)
 os.utime(B + '/f', None)
@@ -360,9 +374,10 @@ now = (TS * 2)(TS(0, 0x3FFFFFFF), TS(44, 0))  # UTIME_NOW, then a time
 assert libc.utimensat(-100, (B + '/f').encode(), now, 0) == 0
 s = os.stat(B + '/f')
 assert abs(s.st_atime - time.time()) < 100 and s.st_mtime == 44.0
-os.symlink('f', B + '/l')
-assert libc.utimensat(-100, (B + '/l').encode(), (TS * 2)(TS(7, 0), TS(8, 0)), 0x100) == 0  # AT_SYMLINK_NOFOLLOW
-assert os.lstat(B + '/l').st_mtime == 8.0 and os.stat(B + '/f').st_mtime == 44.0
+if not WIN:  # NO_WIN_SYMLINK
+    os.symlink('f', B + '/l')
+    assert libc.utimensat(-100, (B + '/l').encode(), (TS * 2)(TS(7, 0), TS(8, 0)), 0x100) == 0  # AT_SYMLINK_NOFOLLOW
+    assert os.lstat(B + '/l').st_mtime == 8.0 and os.stat(B + '/f').st_mtime == 44.0
 """,
     )
 
@@ -466,15 +481,16 @@ assert libc.unlinkat(-100, (B + '/f').encode(), 0x200) == -1 and ctypes.get_errn
 os.mkdir(B + '/d')
 assert libc.unlinkat(-100, (B + '/d').encode(), 0x200) == 0 and not os.path.exists(B + '/d')
 libc.linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-os.symlink('f', B + '/l')
-assert libc.linkat(-100, (B + '/l').encode(), -100, (B + '/h1').encode(), 0x400) == 0  # AT_SYMLINK_FOLLOW
-assert not os.path.islink(B + '/h1') and os.stat(B + '/h1').st_ino == os.stat(B + '/f').st_ino
-assert os.stat(B + '/f').st_nlink == 2
-assert libc.linkat(-100, (B + '/l').encode(), -100, (B + '/h2').encode(), 0) == 0  # the link itself
-assert os.path.islink(B + '/h2')
-os.symlink(B + '/f', B + '/labs')  # a link to a link, with an absolute target
-assert libc.linkat(-100, (B + '/labs').encode(), -100, (B + '/h3').encode(), 0x400) == 0
-assert os.stat(B + '/h3').st_ino == os.stat(B + '/f').st_ino and not os.path.islink(B + '/h3')
+if not WIN:  # NO_WIN_SYMLINK
+    os.symlink('f', B + '/l')
+    assert libc.linkat(-100, (B + '/l').encode(), -100, (B + '/h1').encode(), 0x400) == 0  # AT_SYMLINK_FOLLOW
+    assert not os.path.islink(B + '/h1') and os.stat(B + '/h1').st_ino == os.stat(B + '/f').st_ino
+    assert os.stat(B + '/f').st_nlink == 2
+    assert libc.linkat(-100, (B + '/l').encode(), -100, (B + '/h2').encode(), 0) == 0  # the link itself
+    assert os.path.islink(B + '/h2')
+    os.symlink(B + '/f', B + '/labs')  # a link to a link, with an absolute target
+    assert libc.linkat(-100, (B + '/labs').encode(), -100, (B + '/h3').encode(), 0x400) == 0
+    assert os.stat(B + '/h3').st_ino == os.stat(B + '/f').st_ino and not os.path.islink(B + '/h3')
 """,
     )
 
@@ -522,6 +538,7 @@ assert oct(os.stat(B + '/m0').st_mode) == '0o100600' and oct(os.stat(B + '/m2999
     )
 
 
+@NO_WIN_SYMLINK
 def test_statvfs_never_gives_the_host_a_path_from_the_guest(guest: Guest, tmp_path):
     host = tmp_path / "h"
     host.mkdir()
@@ -639,19 +656,21 @@ open('/p/q/marker', 'w').write('real')
 d = os.open('/p/q/d', os.O_RDONLY)
 assert os.read(os.open('sub/../sub/f', os.O_RDONLY, dir_fd=d), 2) == b'in'
 assert os.read(os.open('../marker', os.O_RDONLY, dir_fd=d), 4) == b'real'  # out of the descriptor: walked from its path
-os.rename('/p/q', '/p/r')
-assert os.read(os.open('sub/../sub/f', os.O_RDONLY, dir_fd=d), 2) == b'in'  # WASI resolves it from the descriptor
-os.makedirs('/p/q/d')  # a decoy where the descriptor used to be
-open('/p/q/marker', 'w').write('DECOY')
-try:
-    got = os.read(os.open('../marker', os.O_RDONLY, dir_fd=d), 5)
-except OSError:
-    got = None  # refused, as WASI does
-assert got in (None, b'real'), got
+if not WIN:  # Windows refuses to rename a directory with an open handle inside (EACCES in CI run 42829422107)
+    os.rename('/p/q', '/p/r')
+    assert os.read(os.open('sub/../sub/f', os.O_RDONLY, dir_fd=d), 2) == b'in'  # WASI resolves it from the descriptor
+    os.makedirs('/p/q/d')  # a decoy where the descriptor used to be
+    open('/p/q/marker', 'w').write('DECOY')
+    try:
+        got = os.read(os.open('../marker', os.O_RDONLY, dir_fd=d), 5)
+    except OSError:
+        got = None  # refused, as WASI does
+    assert got in (None, b'real'), got
 """,
     )
 
 
+@NO_WIN_SYMLINK
 def test_a_renamed_directory_keeps_its_absolute_symlinks_pointing_at_the_same_file(guest: Guest):
     check(
         guest,
@@ -687,6 +706,7 @@ assert err(os.open, B + '/f', os.O_RDWR) == 'EACCES'  # opening anew is still ch
     )
 
 
+@pytest.mark.skipif(WIN, reason="Windows can not delete a file that is open (the test unlinks one that is)")
 def test_an_unlinked_open_file_keeps_its_mode_until_the_last_close(guest: Guest):
     check(
         guest,

@@ -30,8 +30,10 @@ import struct
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
+import weakref
 import zipfile
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -154,6 +156,8 @@ SOCK_OPTIONS = {
     (41, 19): "IPV6_MULTICAST_LOOP",
     (41, 26): "IPV6_V6ONLY",
 }
+# on/off options: BSD (macOS) answers getsockopt with the option's bit (SO_KEEPALIVE 8, TCP_NODELAY 4), Linux with 1
+BOOL_OPTIONS = {(1, 1), (1, 2), (1, 5), (1, 6), (1, 9), (1, 10), (1, 15), (1, 30), (6, 1), (6, 3), (41, 26)}
 AI_FLAGS = {
     1: "AI_PASSIVE",
     2: "AI_CANONNAME",
@@ -509,6 +513,7 @@ class Pyodide:
         self._dlreason = ""  # why the last instantiate failed
         self.socks: dict = {}
         self.netlog: list[str] = []
+        self._shut_both: weakref.WeakSet[socket.socket] = weakref.WeakSet()  # shutdown(RDWR) was called: poll's HUP
         self.protoents: dict[str, int] = {}  # getprotobyname's answers, by name (guest addresses)
         self.lazy: list[str] = []
         self.converted = 0  # modules whose legacy exceptions the loader converted at dlopen
@@ -1130,6 +1135,16 @@ class Pyodide:
         self.netlog.append(f"socket connect {addr[0]}:{addr[1]}")
         return 0
 
+    @staticmethod
+    def _send(s: socket.socket, data: bytes, flags: int) -> int:
+        """send() without an address: a datagram socket with no peer is EDESTADDRREQ (Windows says WSAENOTCONN)."""
+        try:
+            return s.send(data, flags)
+        except OSError as e:
+            if e.errno == 10057 and s.type == socket.SOCK_DGRAM:
+                raise OSError(10039, "WSAEDESTADDRREQ") from e
+            raise
+
     def _n_sendto(self, h: int, p: int, n: int, flags: int, sa: int, salen: int) -> int:
         s = self.socks[h]
         try:
@@ -1138,7 +1153,7 @@ class Pyodide:
             with self._nonblocking(s, flags & 0x40):  # a partial count, or EAGAIN when nothing fits
                 if sa:
                     return s.sendto(data, hf, self._sockaddr(s, sa, salen))
-                return s.send(data, hf)
+                return self._send(s, data, hf)
         except OSError as e:
             return self._werr(e)
 
@@ -1183,7 +1198,7 @@ class Pyodide:
             with self._nonblocking(s, flags & 0x40):
                 if name:
                     return s.sendto(data, hf, self._sockaddr(s, name, namelen))
-                return s.send(data, hf)
+                return self._send(s, data, hf)
         except OSError as e:
             return self._werr(e)
 
@@ -1210,11 +1225,15 @@ class Pyodide:
         live = [(i, s) for i, s in enumerate(socks) if s is not None and s.fileno() >= 0]
         out = [32] * len(socks)
         if not hasattr(select, "poll"):  # Windows: select(); an error condition is all its third set can say
+            hup = [s in self._shut_both for _, s in live]  # select has no hang-up: shut down both ways is the one known
             rd, wr, ex = select.select(
-                [s for i, s in live if events[i] & 1], [s for i, s in live if events[i] & 4], [s for _, s in live], t
+                [s for i, s in live if events[i] & 1],
+                [s for i, s in live if events[i] & 4],
+                [s for _, s in live],
+                0 if any(hup) else t,
             )
-            for i, s in live:
-                out[i] = (1 if s in rd else 0) | (4 if s in wr else 0) | (8 if s in ex else 0)
+            for (i, s), h in zip(live, hup, strict=True):
+                out[i] = (1 if s in rd else 0) | (4 if s in wr else 0) | (8 if s in ex else 0) | (16 if h else 0)
             return out
         masks: dict[int, int] = {}
         for i, s in live:
@@ -1266,6 +1285,8 @@ class Pyodide:
             self.socks[h].shutdown(how)
         except OSError as e:
             return self._werr(e)
+        if how == socket.SHUT_RDWR:
+            self._shut_both.add(self.socks[h])
         return 0
 
     def _n_name(self, h: int, peer: int, sa: int, lenp: int) -> int:
@@ -1317,11 +1338,15 @@ class Pyodide:
         else:
             hl, ho = self._option(level, opt)
             if hl is None or ho is None:
+                self.netlog.append(f"getsockopt {level}/{opt}: the host's socket module has no such option")
                 return -GUEST_ERRNO["NOPROTOOPT"]
             try:
                 raw = s.getsockopt(hl, ho, min(max(cap, 4), 1024))
             except OSError as e:
+                self.netlog.append(f"getsockopt {level}/{opt} -> {e}")
                 return self._werr(e)
+            if (level, opt) in BOOL_OPTIONS and len(raw) == 4:
+                raw = int(any(raw)).to_bytes(4, "little")
             if (level, opt) == (1, 4) and (
                 err := int.from_bytes(raw[:4], "little")
             ):  # SO_ERROR: an errno, in the guest's numbers
@@ -2119,6 +2144,8 @@ class Pyodide:
         for guest, host in self.mounts.items():
             wasi.preopen_dir(host, guest)
         if self.preopen_dev:  # the entropy device OpenSSL reads (/dev/urandom)
+            if not os.path.isdir("/dev"):
+                raise FileNotFoundError("preopen_dev: the host has no /dev (a POSIX host has the entropy device)")
             wasi.preopen_dir("/dev", "/dev")
         wasi.inherit_stdin()
         wasi.inherit_stdout()
@@ -2445,8 +2472,11 @@ class Pyodide:
         except (
             Exception
         ) as e:  # a host function failed on purpose (JavaScript's TypeError, a pointer outside the memory)
+            tb = traceback.extract_tb(e.__traceback__)[-1]  # where, for a host that can not be reached to debug
             print(
-                f"pyodide-wasmtime: a host function failed, the guest is dead: {type(e).__name__}: {e}", file=sys.stderr
+                f"pyodide-wasmtime: a host function failed, the guest is dead: {type(e).__name__}: {e}"
+                f" (at {Path(tb.filename).name}:{tb.lineno}, in {tb.name})",
+                file=sys.stderr,
             )
             self._exited = 134  # as for a trap
             rc = 134

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from conftest import Guest
 
 import pyodide_wasmtime as pw
@@ -108,8 +110,10 @@ def test_dup_scandir_fwalk_and_rmtree(guest: Guest):
         "import os, shutil\n"
         "os.makedirs('/d/sub/deep')\nopen('/d/sub/f.txt', 'w').write('hello')\n"
         "fd = os.open('/d/sub/f.txt', os.O_RDONLY); os.lseek(fd, 2, 0); d = os.dup(fd)\n"
-        "print(os.read(d, 10), sorted(e.name for e in os.scandir(os.open('/d/sub', os.O_RDONLY))),\n"
+        "sd = os.open('/d/sub', os.O_RDONLY)\n"
+        "print(os.read(d, 10), sorted(e.name for e in os.scandir(sd)),\n"
         "      len(list(os.fwalk('/d'))))\n"
+        "os.close(fd); os.close(d); os.close(sd)  # Windows can not delete what is open\n"
         "shutil.rmtree('/d'); print(os.path.exists('/d'))"
     )
     assert p.returncode == 0, p.stderr
@@ -117,15 +121,19 @@ def test_dup_scandir_fwalk_and_rmtree(guest: Guest):
 
 
 def test_chdir_symlink_and_honest_enosys(guest: Guest):
+    # wasmtime's path_symlink on Windows takes the target relative to the root, not to the link's directory (CI run
+    # 42829422107: ENOENT for 'f' -> 'ln' in /a/b), so the link is not made there (see NO_WIN_SYMLINK in test_files.py)
+    win = sys.platform == "win32"
     p = guest.run(
         "import os, errno\n"
         "os.makedirs('/a/b'); os.chdir('/a'); os.chdir('b'); print(os.getcwd())\n"
-        "open('f', 'w').write('x'); os.symlink('f', 'ln'); print(os.readlink('ln'), os.path.exists('/a/b/ln'))\n"
-        "for name, call in (('pipe', os.pipe), ('dup(1)', lambda: os.dup(1))):\n"
+        "open('f', 'w').write('x')\n"
+        + ("" if win else "os.symlink('f', 'ln'); print(os.readlink('ln'), os.path.exists('/a/b/ln'))\n")
+        + "for name, call in (('pipe', os.pipe), ('dup(1)', lambda: os.dup(1))):\n"
         "    try: call()\n    except OSError as e: print(name, errno.errorcode[e.errno])"
     )
     assert p.returncode == 0, p.stderr
-    assert p.stdout.split("\n")[:4] == ["/a/b", "f True", "pipe ENOSYS", "dup(1) ENOSYS"]
+    assert p.stdout.splitlines() == ["/a/b", *([] if win else ["f True"]), "pipe ENOSYS", "dup(1) ENOSYS"]
 
 
 def test_exit_codes(guest: Guest):
