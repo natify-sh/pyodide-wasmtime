@@ -1,0 +1,140 @@
+name: Tests
+
+# build.yml builds the wasm once (wasi-sdk 34's clang for everything; Node only as a build tool), then:
+#   test     the offline tests on every OS and CPython oldest/newest, both builds (fused and dynamic) in each test
+#   network  the checks that go to PyPI and jsDelivr (the host's fetch, the guest's own TLS, micropip, numpy's wheel)
+#   suite    Pyodide's official CPython test suite (python_tests.yaml, libregrtest) on BOTH builds, in 8 shards each
+# A missing build fails a test on CI instead of skipping it (CI=true).
+
+on:
+  push:
+    paths-ignore: &non-code-paths
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+    paths-ignore: *non-code-paths
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.python-version }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.15"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # setuptools_scm needs tags for the package version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: data
+          path: src/pyodide_wasmtime/data
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: testenv
+          path: work/testenv
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: pytest (offline)
+        run: uv run --locked pytest -v -m "not network and not suite"
+
+  network:
+    name: network checks
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: data
+          path: src/pyodide_wasmtime/data
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: testenv
+          path: work/testenv
+
+      - run: uv sync --locked
+
+      - name: pytest -m network
+        run: uv run --locked pytest -v -m network
+
+  suite:
+    name: Pyodide suite / ${{ matrix.flavor }} ${{ matrix.shard }}/8
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [fused, dynamic]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: data
+          path: src/pyodide_wasmtime/data
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: testenv
+          path: work/testenv
+
+      - run: uv sync --locked --group suite
+
+      - name: Pyodide's CPython test suite
+        env:
+          PYODIDE_SUITE_FLAVORS: ${{ matrix.flavor }}
+          PYODIDE_SUITE_SHARD: ${{ matrix.shard }}/8
+        run: >-
+          uv run --locked --group suite pytest -v -m suite
+          --junit-xml=suite-${{ matrix.flavor }}-${{ matrix.shard }}.xml
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: suite-${{ matrix.flavor }}-${{ matrix.shard }}
+          path: suite-*.xml
+          retention-days: 14

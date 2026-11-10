@@ -1,0 +1,24 @@
+**/__pycache__
+**/.ruff_cache/
+**/.pytest_cache/
+**/.idea
+**/*.egg-info
+**/.venv
+**/build
+**/dist
+.vscode
+
+# written by setuptools_scm at build time
+src/pyodide_wasmtime/_version.py
+# coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# built by tools/build_data.sh (not committed; CI builds them, the wheel carries them)
+src/pyodide_wasmtime/data/*
+!src/pyodide_wasmtime/data/.gitkeep
+# compiled-module caches, work directories of the build and of the test runs
+*.cwasm
+/work/

@@ -1,0 +1,12 @@
+pyodide-wasmtime bundles binaries built from other projects. Each keeps its own license:
+
+* pyodide.asm.wasm, python_stdlib.zip, pyodide_fused.wasm (which contains pyodide.asm.wasm): Pyodide 315.0.0-alpha.2,
+  MPL-2.0 (Pyodide-LICENSE-MPL-2.0.txt). Pyodide's CPython is under the PSF license (CPython-LICENSE-PSF.txt); the
+  Emscripten runtime and musl libc compiled into pyodide.asm.wasm are MIT-licensed (Emscripten, musl). The files are
+  Pyodide's own, with only the legacy wasm exceptions converted to exnref (Binaryen 132); fused is also merged with adapter.wasm.
+  Source: https://github.com/pyodide/pyodide (tag 315.0.0a2), https://www.npmjs.com/package/pyodide/v/315.0.0-alpha.2
+* wasm-opt.wasm: Binaryen version_132 built for wasm32-wasip1 with wasi-sdk 34 (tools/build_binaryen.sh), Apache-2.0
+  (Binaryen-LICENSE-Apache-2.0.txt). It statically contains wasi-libc (MIT / Apache-2.0 with LLVM exceptions / CC0),
+  libc++, libc++abi and libunwind of wasi-sdk (Apache-2.0 with LLVM exceptions).
+  Source: https://github.com/WebAssembly/binaryen (tag version_132), https://github.com/WebAssembly/wasi-sdk (tag wasi-sdk-34)
+* adapter.wasm: built from wasm/adapter.c in this repository (MIT, see LICENSE) with wasi-sdk 34.

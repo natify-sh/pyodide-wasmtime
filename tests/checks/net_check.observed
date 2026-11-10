@@ -1,0 +1,5 @@
+pyfetch 200 True attrs
+micropip: six, attrs, requests (+ urllib3, idna, certifi, charset-normalizer) imported
+requests.get 200 application/json micropip
+cffi (binary wheel via micropip) 2.0.0 25 10
+installed ['attrs', 'certifi', 'cffi', 'charset-normalizer', 'idna', 'pycparser', 'requests', 'six', 'urllib3']

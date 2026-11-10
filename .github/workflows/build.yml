@@ -1,0 +1,90 @@
+name: Build wasm
+
+# Builds everything the package carries and the tests run against, once, for tests.yml and publish.yml:
+#   wasm-opt   Binaryen 132 as wasm32-wasip1 with wasi-sdk 34 (about 12 min; cached by the hash of its script)
+#   data       pyodide.asm.wasm (exnref), python_stdlib.zip, adapter.wasm (wasi-sdk's clang), pyodide_fused.wasm, wasm-opt.wasm
+#   testenv    numpy, micropip, openssl, the real _ssl, the `test` wheel and python_tests.yaml (tools/prepare_testenv.sh)
+# Node is a build tool here (Binaryen's wasm-opt and wasm-merge from npm); the package needs none at run time.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-opt:
+    name: wasm-opt.wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache key
+        id: key
+        run: echo "hash=${{ hashFiles('tools/build_binaryen.sh', 'tools/fetch.sh', 'package.json') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore wasm-opt.wasm
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: wasm-opt.wasm
+          key: wasm-opt-${{ steps.key.outputs.hash }}
+
+      - uses: actions/setup-node@v7
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          node-version: "22"
+
+      - name: Build wasm-opt.wasm (wasi-sdk 34, Binaryen version_132)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q cmake ninja-build
+          OUT="$PWD/wasm-opt.wasm" sh tools/build_binaryen.sh work
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wasm-opt
+          path: wasm-opt.wasm
+          retention-days: 14
+
+  data:
+    name: data + testenv
+    needs: wasm-opt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm-opt
+          path: wasm-opt
+
+      - name: Build the package's wasm
+        run: |
+          uv sync --locked
+          PATH="$PWD/.venv/bin:$PATH" WASM_OPT_WASM="$PWD/wasm-opt/wasm-opt.wasm" sh tools/build_data.sh work
+
+      - name: Build the test environment
+        run: PATH="$PWD/.venv/bin:$PATH" sh tools/prepare_testenv.sh work
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: data
+          path: src/pyodide_wasmtime/data
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: testenv
+          path: work/testenv
+          retention-days: 14

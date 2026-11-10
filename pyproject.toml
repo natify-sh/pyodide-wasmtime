@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=84.2.1", "setuptools-scm>=10.3.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyodide-wasmtime"
+dynamic = ["version"]
+description = "Pyodide's CPython (and its wheels) run by wasmtime with no JavaScript: the Emscripten glue is a wasm adapter, the host is Python (alpha)"
+readme = "README.md"
+authors = [{ name = "o-murphy", email = "thehelixpg@gmail.com" }]
+license = "MIT"
+# The wasm in the wheel is Pyodide's, Binaryen's and ours, each under its own license: see licenses/NOTICE.
+license-files = ["LICENSE", "licenses/*"]
+requires-python = ">=3.10"
+keywords = ["pyodide", "wasmtime", "webassembly", "wasm", "emscripten", "cpython"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# No run-time dependencies: the engine is an extra (and a dev dependency), the wasm is in the wheel.
+dependencies = []
+
+[project.scripts]
+pyodide-wasmtime = "pyodide_wasmtime._cli:main"
+
+[project.optional-dependencies]
+wasmtime = ["wasmtime>=50.0.1"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["pyodide_wasmtime", "pyodide_wasmtime.guest"]
+
+[tool.setuptools.package-data]
+pyodide_wasmtime = ["py.typed", "data/*.wasm", "data/*.zip"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+version_file = "src/pyodide_wasmtime/_version.py"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pyright>=1.1.414",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.17.3",
+    "wasmtime>=50.0.1",
+]
+# Pyodide's official test suite (tests/suite): its list of CPython tests is YAML.
+suite = ["pyyaml>=6.0"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-rf -m 'not suite'"
+testpaths = ["tests"]
+markers = [
+    "network: needs the network (PyPI, jsDelivr); deselect with -m 'not network'",
+    "suite: Pyodide's official test suite; needs tools/prepare_testenv.sh output and takes long",
+]
+
+[tool.pyright]
+include = ["src", "tests", "tools"]
+# guest programs run inside Pyodide, where numpy, micropip, cffi... are not this environment's
+exclude = ["tests/checks", "src/pyodide_wasmtime/guest", "**/.venv"]
+# strict is wasmhost's setting; the wasmtime-py calls in _host.py are untyped, so the standard mode is used here
+typeCheckingMode = "standard"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# WAT text in strings
+"src/pyodide_wasmtime/_wasm.py" = ["E501"]
+"tools/fuse.py" = ["E501"]
+# guest programs: they run inside Pyodide's CPython, import after setting things up, and print what the checks read
+"src/pyodide_wasmtime/guest/*.py" = ["E402", "E501"]
+"tests/checks/*.py" = ["E402", "E501"]
