@@ -190,8 +190,10 @@ assert not os.path.exists('x')  # not the root's: the cwd + the name, not the na
 assert os.read(os.dup(os.open(deep + 'f', os.O_RDONLY)), 2) == b'hi'  # dup() keeps a path of any length
 os.chdir('/')
 assert err(os.chdir, '/' + 'a/' * 600) == 'ENOENT'
-e = err(os.stat, '/' + 'a/' * 3000)  # Linux's kernel refuses 6000 bytes before it looks at a name
-assert e == 'ENAMETOOLONG', e
+# 6000 bytes: the HOST answers. Linux's kernel refuses it (ENAMETOOLONG); Windows, macOS and Pyodide's MEMFS (no length
+# limit) say ENOENT; anything else is a wrong answer
+e = err(os.stat, '/' + 'a/' * 3000)
+assert e in ('ENAMETOOLONG', 'ENOENT'), e
 """,
     )
 
