@@ -75,6 +75,8 @@ __attribute__((import_module("aux"), import_name("table_grow"))) u32 table_grow(
 #define MAXFD 1024
 
 static i32 is_sock(i32 fd);  // a socket descriptor (the sockets section, at the end)
+static i32 sock_nb(i32 fd);
+static void sock_set_nb(i32 fd, i32 on);
 
 // ---- state: one malloc'd block, its address in a wasm global (no data section)
 __asm__(".globaltype adapter_state, i32\nadapter_state:\n");
@@ -507,8 +509,11 @@ EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
 }
 
 EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
-    (void)va;
-    if (is_sock(fd) && op == 0x5421) return 0;  // FIONBIO: the host's sockets block; poll() keeps the timeouts
+    if (is_sock(fd) && op == 0x5421) {  // FIONBIO
+        const i32 *argp = va ? *(const i32 **)va : 0;  // va points at the variable arguments; the first is &flag
+        sock_set_nb(fd, argp && *argp != 0);
+        return 0;
+    }
     return -ENOTTY;
 }
 
@@ -523,7 +528,7 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
         case 2:  // F_SETFD
             return 0;
         case 3: {  // F_GETFL
-            if (is_sock(fd)) return 2;  // O_RDWR
+            if (is_sock(fd)) return 2 | (sock_nb(fd) ? 04000 : 0);  // O_RDWR, O_NONBLOCK
             u8 st[24] __attribute__((aligned(8)));
             i32 e = w_fd_fdstat_get(fd, st);
             if (e) return -e;
@@ -536,10 +541,13 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
             return fl;
         }
         case 4: {  // F_SETFL: append and nonblock only
-            if (is_sock(fd)) return 0;
-            i32 ff = 0;
-            if (va & 02000) ff |= 1;
-            if (va & 04000) ff |= 4;
+            if (is_sock(fd)) {
+                sock_set_nb(fd, (*(const i32 *)va & 04000) != 0);  // va points at the variable arguments
+                return 0;
+            }
+            i32 flags = *(const i32 *)va, ff = 0;  // va points at the variable arguments
+            if (flags & 02000) ff |= 1;
+            if (flags & 04000) ff |= 4;
             i32 e = w_fd_fdstat_set_flags(fd, ff);
             return e ? -e : 0;
         }
@@ -1133,7 +1141,7 @@ EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, voi
 
 // ================================================================== sockets: Emscripten's socket calls over the host's
 // WASI preview1 cannot create or connect a socket, so the host gives a few operations; a socket is a guest
-// descriptor SOCKBASE + slot. The main module's fd_read / fd_write / fd_close / fd_fdstat_get come here first
+// descriptor (see the table below). The main module's fd_read / fd_write / fd_close / fd_fdstat_get come here first
 // (OpenSSL reads and writes its socket with read() and write()); other descriptors pass on to WASI.
 #define NET(n) __attribute__((import_module("net"), import_name(n)))
 NET("socket") i32 net_socket(i32 domain, i32 type, i32 proto);  // -> handle, or -errno
@@ -1141,15 +1149,17 @@ NET("connect") i32 net_connect(i32 h, i32 family, i32 port, const u8 *addr);
 NET("send") i32 net_send(i32 h, const u8 *p, i32 n);
 NET("recv") i32 net_recv(i32 h, u8 *p, i32 n, i32 peek);
 NET("poll") i32 net_poll(i32 h, i32 events, i32 timeout_ms);  // -> revents
+NET("pollv") i32 net_pollv(i32 n, const i32 *hs, const i32 *events, i32 timeout_ms, i32 *revents);  // several sockets at once
 NET("close") i32 net_close(i32 h);
 NET("shutdown") i32 net_shutdown(i32 h, i32 how);
 NET("name") i32 net_name(i32 h, i32 peer, u8 *addr4, i32 *port);  // the local or peer IPv4 address and port
 NET("resolve") i32 net_resolve(const char *name, i32 n, u8 *addr4);  // -> 0, or -errno
 
-#define SOCKBASE 4096
-#define MAXSOCK 64
+// A socket takes a real WASI descriptor number (a directory opened as a placeholder), so that numbers stay small
+// (select() takes less than 1024) and never clash with files; the table is indexed by that number.
 typedef struct {
-    i32 h[MAXSOCK];  // handle + 1; 0 is free
+    i32 h[MAXFD];  // the host's handle + 1; 0: not a socket
+    u8 nb[MAXFD];  // O_NONBLOCK: SOCK_NONBLOCK, ioctl(FIONBIO), fcntl(F_SETFL), set by the program
 } Socks;
 __asm__(".globaltype sock_state, i32\nsock_state:\n");
 static Socks *socks(void) {
@@ -1161,38 +1171,61 @@ static Socks *socks(void) {
     }
     return r;
 }
-static i32 is_sock(i32 fd) { return fd >= SOCKBASE && fd < SOCKBASE + MAXSOCK && socks()->h[fd - SOCKBASE]; }
-static i32 hof(i32 fd) { return socks()->h[fd - SOCKBASE] - 1; }
+static i32 is_sock(i32 fd) { return fd >= 0 && fd < MAXFD && socks()->h[fd]; }
+static i32 hof(i32 fd) { return socks()->h[fd] - 1; }
+static i32 sock_nb(i32 fd) { return socks()->nb[fd]; }
+static void sock_set_nb(i32 fd, i32 on) { socks()->nb[fd] = (u8)(on != 0); }
+
+#define EAGAIN_ 6
+#define ENOTSOCK_ 57
+#define MSG_DONTWAIT 0x40
+// a socket that must not block: does it have what is asked (events: 1 read, 4 write)? EAGAIN if not
+static i32 would_block(i32 fd, i32 flags, i32 events) {
+    if (!sock_nb(fd) && !(flags & MSG_DONTWAIT)) return 0;
+    return !(net_poll(hof(fd), events, 0) & events);
+}
 
 EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
-    Socks *S = socks();
-    i32 slot = -1;
-    for (i32 k = 0; k < MAXSOCK; k++)
-        if (!S->h[k]) { slot = k; break; }
-    if (slot < 0) return -33;  // EMFILE
+    u64 all = (1ull << 30) - 1, writes = (1ull << 6) | (1ull << 0) | (1ull << 8) | (1ull << 22);
+    i32 fd = -1;
+    char dot[2];  // "." built on the stack: a string literal would be a data section
+    dot[0] = '.', dot[1] = 0;
+    i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);  // the placeholder
+    if (e) return -33;  // EMFILE
+    if (fd < 0 || fd >= MAXFD) {
+        w_fd_close(fd);
+        return -33;
+    }
     i32 h = net_socket(domain, type & ~(04000 | 02000000), proto);  // without SOCK_NONBLOCK, SOCK_CLOEXEC
-    if (h < 0) return h;
-    S->h[slot] = h + 1;
-    return SOCKBASE + slot;
+    if (h < 0) {
+        w_fd_close(fd);
+        return h;
+    }
+    socks()->h[fd] = h + 1;
+    socks()->nb[fd] = (type & 04000) != 0;  // SOCK_NONBLOCK
+    return fd;
 }
 
 EXPORT("__syscall_connect") i32 sc_connect(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
     (void)len, (void)a, (void)b, (void)c;
-    if (!is_sock(fd)) return -57;  // ENOTSOCK
+    if (!is_sock(fd)) return -ENOTSOCK_;
+    // a non-blocking socket connects at once on the host (it can block there) and reports success, not EINPROGRESS
     i32 family = *(const u16 *)sa, port = (sa[2] << 8) | sa[3];
     return net_connect(hof(fd), family, port, family == 10 ? sa + 8 : sa + 4);
 }
 
 EXPORT("__syscall_sendto") i32 sc_sendto(i32 fd, const u8 *p, i32 n, i32 flags, i32 addr, i32 alen) {
-    (void)flags, (void)addr, (void)alen;
-    if (!is_sock(fd)) return -57;
+    (void)addr, (void)alen;
+    if (!is_sock(fd)) return -ENOTSOCK_;
+    if (would_block(fd, flags, 4)) return -EAGAIN_;
     return net_send(hof(fd), p, n);
 }
 
 EXPORT("__syscall_recvfrom") i32 sc_recvfrom(i32 fd, u8 *p, i32 n, i32 flags, i32 addr, i32 alen) {
     (void)addr, (void)alen;
-    if (!is_sock(fd)) return -57;
+    if (!is_sock(fd)) return -ENOTSOCK_;
+    if (would_block(fd, flags, 1)) return -EAGAIN_;
     return net_recv(hof(fd), p, n, flags & 2);  // MSG_PEEK
 }
 
@@ -1234,19 +1267,40 @@ EXPORT("__syscall_getsockopt") i32 sc_getsockopt(i32 fd, i32 level, i32 opt, i32
     return 0;
 }
 
-// struct pollfd {int fd; short events, revents;}: sockets ask the host, other descriptors are ready
+// struct pollfd {int fd; short events, revents;}. Sockets are polled by the host, all in one call, with the timeout;
+// a file is always ready for what it is asked (POLLIN, POLLOUT); a descriptor that is not open is POLLNVAL; a negative
+// one is ignored. A file that is ready, or an invalid descriptor, makes the sockets answer at once (nothing to wait for).
+#define POLLNVAL 32
 static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
-    i32 ready = 0, socks_n = 0;
-    for (i32 k = 0; k < n; k++)
-        if (is_sock(*(i32 *)(fds + 8 * k))) socks_n++;
+    i32 ready = 0, nsock = 0, immediate = 0;
+    i32 *buf = n > 0 ? (i32 *)malloc((u32)n * 3 * 4) : 0;  // handles, events, revents of the sockets
+    i32 *hs = buf, *evs = buf + n, *revs = buf + 2 * n;
     for (i32 k = 0; k < n; k++) {
         i32 fd = *(i32 *)(fds + 8 * k);
-        i16 ev = *(i16 *)(fds + 8 * k + 4), rev;
-        if (is_sock(fd)) rev = (i16)net_poll(hof(fd), ev, socks_n == 1 ? timeout : 0);
-        else rev = fd >= 0 ? (i16)(ev & 5) : 0;  // POLLIN | POLLOUT
+        i16 ev = *(i16 *)(fds + 8 * k + 4), rev = 0;
+        if (fd >= 0 && is_sock(fd)) {
+            hs[nsock] = hof(fd), evs[nsock] = ev & 5, revs[nsock] = 0;
+            nsock++;
+        } else if (fd >= 0) {
+            u8 st[24] __attribute__((aligned(8)));
+            if (w_fd_fdstat_get(fd, st)) rev = POLLNVAL;
+            else rev = (i16)(ev & 5);
+            if (rev) immediate = 1;
+        }
         *(i16 *)(fds + 8 * k + 6) = rev;
-        if (rev) ready++;
     }
+    if (nsock) net_pollv(nsock, hs, evs, immediate ? 0 : timeout, revs);
+    else if (!immediate && timeout > 0) {  // nothing to wait for but time: the host's clock
+        i32 none = 0;
+        net_pollv(0, &none, &none, timeout, &none);
+    }
+    i32 j = 0;
+    for (i32 k = 0; k < n; k++) {
+        i32 fd = *(i32 *)(fds + 8 * k);
+        if (fd >= 0 && is_sock(fd)) *(i16 *)(fds + 8 * k + 6) = (i16)revs[j++];
+        if (*(i16 *)(fds + 8 * k + 6)) ready++;
+    }
+    if (buf) free(buf);
     return ready;
 }
 EXPORT("__syscall_poll") i32 sc_poll(u8 *fds, i32 n, i32 timeout) { return do_poll(fds, n, timeout); }
@@ -1293,6 +1347,7 @@ EXPORT("getnameinfo") i32 getnameinfo_(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f,
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     if (!is_sock(fd)) return w_fd_read(fd, iov, n, nread);
+    if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
         i32 r = net_recv(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], 0);
@@ -1310,6 +1365,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
 WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     if (!is_sock(fd)) return w_fd_write(fd, iov, n, nw);
+    if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
         i32 r = net_send(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1]);
@@ -1329,8 +1385,9 @@ EXPORT("fd_close") i32 x_fd_close(i32 fd) {
         return w_fd_close(fd);
     }
     net_close(hof(fd));
-    socks()->h[fd - SOCKBASE] = 0;
-    return 0;
+    socks()->h[fd] = 0;
+    socks()->nb[fd] = 0;
+    return w_fd_close(fd);  // the placeholder
 }
 
 WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
@@ -1437,8 +1494,9 @@ EXPORT("__syscall_mknodat") i32 sc_mknodat(i32 dirfd, const char *path, i32 mode
 // sendmsg / recvmsg on a stream socket: the iovec of the message, no addresses and no control data
 // (struct msghdr of wasm32: name, namelen, iov, iovlen, control, controllen, flags)
 EXPORT("__syscall_sendmsg") i32 sc_sendmsg(i32 fd, const u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
-    (void)flags, (void)a, (void)b, (void)c;
-    if (!is_sock(fd)) return -88;  // ENOTSOCK
+    (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return -ENOTSOCK_;
+    if (would_block(fd, flags, 4)) return -EAGAIN_;
     const u32 *iov = (const u32 *)msg[2];
     i32 total = 0;
     for (u32 k = 0; k < msg[3]; k++) {
@@ -1452,8 +1510,11 @@ EXPORT("__syscall_sendmsg") i32 sc_sendmsg(i32 fd, const u32 *msg, i32 flags, i3
 
 EXPORT("__syscall_recvmsg") i32 sc_recvmsg(i32 fd, u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
-    if (!is_sock(fd)) return -88;
+    if (!is_sock(fd)) return -ENOTSOCK_;
+    if (would_block(fd, flags, 1)) return -EAGAIN_;
     const u32 *iov = (const u32 *)msg[2];
+    msg[1] = 0;  // msg_namelen: no source address
+    msg[5] = 0;  // msg_controllen: no control data (CPython parses the buffer by this length)
     msg[6] = 0;  // msg_flags
     for (u32 k = 0; k < msg[3]; k++)
         if (iov[2 * k + 1]) return net_recv(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], flags & 2);  // MSG_PEEK

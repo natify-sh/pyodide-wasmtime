@@ -24,6 +24,7 @@ import ssl
 import struct
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -391,6 +392,28 @@ class Pyodide:
         )
         return (1 if r else 0) | (4 if w else 0)
 
+    def _n_pollv(self, n: int, hp: int, evp: int, timeout_ms: int, revp: int) -> int:
+        """Several sockets at once (poll): handles and events are arrays of i32 in the guest's memory, the revents are
+        written back. With no sockets it is a sleep. Returns how many are ready."""
+        if n == 0:
+            if timeout_ms > 0:
+                time.sleep(timeout_ms / 1000)
+            return 0
+        handles = struct.unpack(f"<{n}i", self._rd(hp, 4 * n))
+        events = struct.unpack(f"<{n}i", self._rd(evp, 4 * n))
+        socks = [self.socks.get(h) for h in handles]
+        r, w, _ = select.select(
+            [s for s, e in zip(socks, events, strict=True) if s and e & 1],
+            [s for s, e in zip(socks, events, strict=True) if s and e & 4],
+            [],
+            None if timeout_ms < 0 else timeout_ms / 1000,
+        )
+        revents = [
+            ((1 if s in r else 0) | (4 if s in w else 0)) if s else 32 for s in socks
+        ]  # a closed handle: POLLNVAL
+        self._wr(revp, struct.pack(f"<{n}i", *revents))
+        return sum(1 for x in revents if x)
+
     def _n_close(self, h: int) -> int:
         s = self.socks.pop(h, None)
         if s:
@@ -453,6 +476,7 @@ class Pyodide:
             "send": (self._n_send, ft(3)),
             "recv": (self._n_recv, ft(4)),
             "poll": (self._n_poll, ft(3)),
+            "pollv": (self._n_pollv, ft(5)),
             "close": (self._n_close, ft(1)),
             "shutdown": (self._n_shutdown, ft(2)),
             "name": (self._n_name, ft(4)),
