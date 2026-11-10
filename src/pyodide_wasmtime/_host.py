@@ -892,6 +892,42 @@ class Pyodide:
         self._wr(ap, socket.inet_aton(ip))
         return 0
 
+    # ------------------------------------------------------------------ the host's view of the files
+    def _preopen_dir(self, pfd: int) -> str | None:
+        """The host folder of a preopen, named by its WASI descriptor (3 + its place in the order they are opened here:
+        the guest's root, the mounts, /dev). The guest never gives the host a path: the adapter has proved that the
+        guest's path exists through WASI and names only the preopen it belongs to."""
+        assert self.root is not None
+        dirs = [str(self.root), *self.mounts.values()]
+        if self.preopen_dev:
+            dirs.append("/dev")
+        return dirs[pfd - 3] if 3 <= pfd < 3 + len(dirs) else None
+
+    def _fs_statvfs(self, pfd: int, buf: int) -> int:
+        """statfs of a preopen's folder -> Emscripten's struct statfs64 (88 bytes) at ``buf``; -errno on failure.
+        Without os.statvfs (Windows) the numbers come from shutil.disk_usage: the files and ffree counts are 0."""
+        try:
+            host = self._preopen_dir(pfd)
+            if host is None:
+                return -WASI_ERRNO["BADF"]
+            b = bytearray(88)
+            if hasattr(os, "statvfs"):
+                st = os.statvfs(host)
+                struct.pack_into("<I", b, 4, st.f_bsize)
+                struct.pack_into("<5Q", b, 8, st.f_blocks, st.f_bfree, st.f_bavail, st.f_files, st.f_ffree)
+                struct.pack_into("<III", b, 56, st.f_namemax, st.f_frsize, st.f_flag)
+            else:
+                du = shutil.disk_usage(host)
+                struct.pack_into("<I", b, 4, 4096)
+                struct.pack_into("<5Q", b, 8, du.total // 4096, du.free // 4096, du.free // 4096, 0, 0)
+                struct.pack_into("<III", b, 56, 255, 4096, 0)
+            self._wr(buf, bytes(b))
+            return 0
+        except OSError as e:
+            return self._werr(e)
+        except Exception:  # never a trap in the guest
+            return -WASI_ERRNO["IO"]
+
     def _malloc(self, n: int) -> int:
         """The guest's malloc: its address as an unsigned number (0: no memory)."""
         return self.ex["malloc"](self.cur[-1], n) & 0xFFFFFFFF
@@ -1055,7 +1091,7 @@ class Pyodide:
 
         return f
 
-    def _ops(self) -> tuple[dict, dict]:
+    def _ops(self) -> tuple[dict, dict, dict]:
         wt = self._wt
         i32 = wt.ValType.i32()
 
@@ -1091,7 +1127,8 @@ class Pyodide:
             "getnameinfo": (self._n_getnameinfo, ft(7)),
             "protobyname": (self._n_protobyname, ft(1)),
         }
-        return loader, net
+        fs = {"statvfs": (self._fs_statvfs, ft(2))}
+        return loader, net, fs
 
     # ------------------------------------------------------------------ start
     def _start(self) -> None:
@@ -1115,7 +1152,7 @@ class Pyodide:
         wasi.inherit_stdout()
         wasi.inherit_stderr()
         store.set_wasi(wasi)
-        loader_ops, net_ops = self._ops()
+        loader_ops, net_ops, fs_ops = self._ops()
         I32 = wt.ValType.i32()  # noqa: N806
 
         def define_ops(linker):
@@ -1123,6 +1160,8 @@ class Pyodide:
                 linker.define_func("loader", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
             for name, (fn, ty) in net_ops.items():
                 linker.define_func("net", name, ty, self._wrap_net(name, fn), access_caller=True)
+            for name, (fn, ty) in fs_ops.items():
+                linker.define_func("fs", name, ty, self._wrap_net(name, fn), access_caller=True)
 
         if self.flavor == "fused":
             main_mod = _engine.load_module(self.data / "pyodide_fused.wasm")
@@ -1152,7 +1191,7 @@ class Pyodide:
                 "free",
             }
             for i in adapter_mod.imports:
-                assert i.module in ("wasi_snapshot_preview1", "loader", "aux", "net") or (
+                assert i.module in ("wasi_snapshot_preview1", "loader", "aux", "net", "fs") or (
                     i.module == "env" and i.name in allowed
                 ), (i.module, i.name)
             adapter_names = [

@@ -2,7 +2,7 @@
 
     python fuse.py PYODIDE_WASM ADAPTER_WASM OUT_WASM        # WASM_MERGE="node .../wasm-merge" (default: on PATH)
 
-The result imports only `wasi_snapshot_preview1.*`, `loader.*` (instantiate, got_set, sym, call) and `net.*`
+The result imports only `wasi_snapshot_preview1.*`, `loader.*` (instantiate, got_set, sym, call), `fs.*` (statvfs) and `net.*`
 (the host's sockets): the
 shim's job (the `env` imports, the 280 `GOT.func` globals) is done by merging, so no table of forwarders and
 no fixup at run time. Steps:
