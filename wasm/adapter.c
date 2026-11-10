@@ -356,6 +356,11 @@ EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
     return 0;
 }
 
+EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
+    const char *p = fd_base_path(fd);  // a directory opened by openat, or a preopen
+    return p ? sc_chdir(p) : -EBADF;
+}
+
 EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
     (void)va;
     char dot[2];
@@ -1355,4 +1360,98 @@ EXPORT("_tzset_js") void tzset_js(i32 *timezone, i32 *daylight, char *std_name, 
     *timezone = 0, *daylight = 0;
     std_name[0] = 'U', std_name[1] = 'T', std_name[2] = 'C', std_name[3] = 0;
     dst_name[0] = 'U', dst_name[1] = 'T', dst_name[2] = 'C', dst_name[3] = 0;
+}
+
+// ================================================================== owners, nodes, messages, failures
+// Every file belongs to uid/gid 0 in this world, so chown to 0 (or -1: unchanged) changes nothing and succeeds,
+// and to anyone else is not permitted.
+static i32 chown_result(i32 uid, i32 gid) { return (uid == -1 || uid == 0) && (gid == -1 || gid == 0) ? 0 : -63; }  // EPERM
+
+EXPORT("__syscall_fchownat") i32 sc_fchownat(i32 dirfd, const char *path, i32 uid, i32 gid, i32 flags) {
+    u64 fs[8];
+    char dot[2];
+    const char *p;
+    i32 n, fd = resolve(dirfd, path, &p, &n, dot);
+    i32 e = w_path_filestat_get(fd, (flags & 0x100) ? 0 : 1, p, n, fs);  // AT_SYMLINK_NOFOLLOW; it must exist
+    return e ? -e : chown_result(uid, gid);
+}
+
+EXPORT("__syscall_fchown32") i32 sc_fchown32(i32 fd, i32 uid, i32 gid) {
+    u64 fs[8];
+    i32 e = w_fd_filestat_get(fd, fs);
+    return e ? -e : chown_result(uid, gid);
+}
+
+// mknod: a regular file only; devices and FIFOs do not exist here
+EXPORT("__syscall_mknodat") i32 sc_mknodat(i32 dirfd, const char *path, i32 mode, i32 dev) {
+    (void)dev;
+    i32 type = mode & 0170000;
+    if (type != 0 && type != 0100000) return -52;  // ENOSYS
+    i32 fd = sc_openat(dirfd, path, 0100 | 0200 | 1, 0);  // O_CREAT | O_EXCL | O_WRONLY
+    if (fd < 0) return fd;
+    x_fd_close(fd);
+    return 0;
+}
+
+// sendmsg / recvmsg on a stream socket: the iovec of the message, no addresses and no control data
+// (struct msghdr of wasm32: name, namelen, iov, iovlen, control, controllen, flags)
+EXPORT("__syscall_sendmsg") i32 sc_sendmsg(i32 fd, const u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
+    (void)flags, (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return -88;  // ENOTSOCK
+    const u32 *iov = (const u32 *)msg[2];
+    i32 total = 0;
+    for (u32 k = 0; k < msg[3]; k++) {
+        i32 r = net_send(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1]);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if (r < (i32)iov[2 * k + 1]) break;
+    }
+    return total;
+}
+
+EXPORT("__syscall_recvmsg") i32 sc_recvmsg(i32 fd, u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
+    (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return -88;
+    const u32 *iov = (const u32 *)msg[2];
+    msg[6] = 0;  // msg_flags
+    for (u32 k = 0; k < msg[3]; k++)
+        if (iov[2 * k + 1]) return net_recv(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], flags & 2);  // MSG_PEEK
+    return 0;
+}
+
+// system(): there are no processes (and system(NULL) says there is no shell)
+EXPORT("_emscripten_system") i32 sc_system(const char *cmd) { return cmd ? -1 : 0; }
+
+// abort() and a failed assert() end the program: they were stubs that returned, so the program went on. The
+// messages are built from integer constants (no data section).
+static void err_write(const char *s) {
+    u32 iov[2];
+    iov[0] = (u32)s, iov[1] = (u32)slen(s);
+    i32 n;
+    w_fd_write(2, iov, 1, &n);
+}
+EXPORT("__assert_fail") void sc_assert_fail(const char *cond, const char *file, i32 line, const char *func) {
+    (void)line, (void)func;
+    u64 m[3];
+    m[0] = 0x6f69747265737341ull, m[1] = 0x64656c696166206eull, m[2] = 0x000000000000203aull;  // "Assertion failed: " (the last chunk ends with the NUL of the string)
+    u8 head[24];
+    for (i32 k = 0; k < 3; k++)
+        for (i32 j = 0; j < 8; j++) head[k * 8 + j] = (u8)(m[k] >> (8 * j));
+    head[18] = 0;
+    err_write((const char *)head);
+    err_write(cond ? cond : (const char *)head + 18);
+    u8 sp[2];
+    sp[0] = ' ', sp[1] = 0;
+    err_write((const char *)sp);
+    err_write(file ? file : (const char *)sp + 1);
+    u8 nl[2];
+    nl[0] = '\n', nl[1] = 0;
+    err_write((const char *)nl);
+    __builtin_trap();
+}
+EXPORT("_abort_js") void sc_abort_js(void) {
+    u64 m[2];
+    m[0] = 0x0a292874726f6261ull, m[1] = 0;  // "abort()\n"
+    err_write((const char *)m);
+    __builtin_trap();
 }

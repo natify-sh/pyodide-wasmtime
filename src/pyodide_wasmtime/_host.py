@@ -611,6 +611,11 @@ class Pyodide:
         except self._wt.ExitTrap as e:  # the process ended (exit(), os._exit()): this interpreter is gone
             self._exited = e.code
             rc = e.code
+        except self._wt.Trap as e:  # abort(), a failed assert, an unreachable: the guest is dead
+            first = str(e).strip().splitlines()[0] if str(e).strip() else "trap"
+            print(f"pyodide-wasmtime: the guest trapped: {first}", file=sys.stderr)
+            self._exited = 134  # 128 + SIGABRT, as a process that aborts
+            rc = 134
         rc_path = self.root / rc_file.lstrip("/")
         if self._exited is not None:
             self.close()  # a next run() starts a new interpreter
