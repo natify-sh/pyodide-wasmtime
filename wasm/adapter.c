@@ -788,7 +788,11 @@ EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, voi
 // WASI preview1 cannot create or connect a socket, so the host gives a few operations; a socket is a guest
 // descriptor SOCKBASE + slot. The main module's fd_read / fd_write / fd_close / fd_fdstat_get come here first
 // (OpenSSL reads and writes its socket with read() and write()); other descriptors pass on to WASI.
+#ifdef NET_P2
+#define NET(n)  // the component build: these are defined by net_p2.c over WASI 0.2 sockets
+#else
 #define NET(n) __attribute__((import_module("net"), import_name(n)))
+#endif
 NET("socket") i32 net_socket(i32 domain, i32 type, i32 proto);  // -> handle, or -errno
 NET("connect") i32 net_connect(i32 h, i32 family, i32 port, const u8 *addr);
 NET("send") i32 net_send(i32 h, const u8 *p, i32 n);

@@ -1,0 +1,13 @@
+package pw:net;
+
+// What the component imports on top of the preview1 adapter's own: the sockets of wasm/net_p2.c. The signatures of the
+// canonical-ABI lowering were read from `wit-bindgen c` output for exactly these interfaces.
+world net {
+  import wasi:sockets/tcp@0.2.12;
+  import wasi:sockets/tcp-create-socket@0.2.12;
+  import wasi:sockets/instance-network@0.2.12;
+  import wasi:sockets/ip-name-lookup@0.2.12;
+  import wasi:io/poll@0.2.12;
+  import wasi:io/streams@0.2.12;
+  import wasi:clocks/monotonic-clock@0.2.12;
+}
