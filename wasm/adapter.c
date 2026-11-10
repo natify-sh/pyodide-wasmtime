@@ -1090,7 +1090,8 @@ EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, voi
             }
             u32 base = n == 0 ? 0 : n == 1 ? 1 : n == 2 ? 5 : n == 3 ? 21 : 85;
             ffi_dispatch(fn, (base + pid) * 5 + (u32)(rcls == -2 ? 0 : rcls + 1), args, &ret);
-            if (rcls == 1) *(u64 *)rvalue = ret.l;
+            if (rcls == 0) *(u32 *)rvalue = ret.i;
+            else if (rcls == 1) *(u64 *)rvalue = ret.l;
             else if (rcls == 2) *(float *)rvalue = ret.f;
             else if (rcls == 3) *(double *)rvalue = ret.d;
             return;
