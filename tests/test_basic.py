@@ -96,7 +96,8 @@ def test_ctypes_calls_with_floats_and_64_bit_values(guest: Guest):
         "print(f('pow', d, d, d)(2.0, 10.0), f('fabsf', fl, fl)(-1.5), f('ldexp', d, d, ctypes.c_int)(3.0, 4),\n"
         "      f('llabs', ll, ll)(-2**40), f('atof', d, ctypes.c_char_p)(b'2.5'),\n"
         "      f('fma', d, d, d, d)(2.0, 3.0, 4.0),\n"
-        "      f('lround', ctypes.c_long, d)(2.6), f('ilogb', ctypes.c_int, d)(8.0))"  # a double argument, an int result
+        # a double argument and an int result:
+        "      f('lround', ctypes.c_long, d)(2.6), f('ilogb', ctypes.c_int, d)(8.0))"
     )
     assert p.returncode == 0, p.stderr
     assert p.stdout.split() == ["1024.0", "1.5", "48.0", "1099511627776", "2.5", "10.0", "3", "3"]
