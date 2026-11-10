@@ -549,9 +549,9 @@ class Pyodide:
             linker = wt.Linker(engine)
             linker.define_wasi()
             define_ops(linker)
-            self.ex = linker.instantiate(store, main_mod).exports(store)
+            self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
             self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
-            self.instances[0] = {"exports": {e.name: self.ex[e.name] for e in main_mod.exports}, "got": []}
+            self.instances[0] = {"exports": self.ex, "got": []}
             mods: dict[str, int] = {}
             for i in main_mod.imports:
                 mods[i.module] = mods.get(i.module, 0) + 1
@@ -600,9 +600,9 @@ class Pyodide:
                     n_env["adapter" if n in fwd else "stub"] += 1
             for g in got:
                 linker.define(store, "GOT.func", g, shim["got:" + g])
-            self.ex = linker.instantiate(store, main_mod).exports(store)
+            self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
             self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
-            self.instances[0] = {"exports": {e.name: self.ex[e.name] for e in main_mod.exports}, "got": []}
+            self.instances[0] = {"exports": self.ex, "got": []}
 
             tl = wt.Linker(engine)
             tl.define(store, "env", "__indirect_function_table", self.table)

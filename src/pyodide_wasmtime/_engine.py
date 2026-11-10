@@ -8,9 +8,11 @@ wasmtime version and the file's size and mtime, so a second start costs a deseri
 from __future__ import annotations
 
 import atexit
+import ctypes
 import hashlib
 import os
 import sys
+from collections.abc import Iterator, Mapping
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,43 @@ def cache_dir() -> Path:
         return Path(base)
     xdg = os.environ.get("XDG_CACHE_HOME")
     return (Path(xdg) if xdg else Path.home() / ".cache") / "pyodide-wasmtime"
+
+
+class LazyExports(Mapping):
+    """The exports of an instance, by name, each wrapped when first asked for, in the module's export order.
+
+    wasmtime-py's `Instance.exports` walks all of them with `wasmtime_instance_export_nth`, which costs ~3 s for the
+    ~9300 exports of Pyodide (measured: cProfile, `Pyodide("fused").run("pass")`); the host needs a dozen at start.
+    """
+
+    def __init__(self, store: Any, instance: Any, module: Any) -> None:
+        self._store, self._instance = store, instance
+        self._names = [e.name for e in module.exports]
+        self._known = frozenset(self._names)
+        self._got: dict[str, Any] = {}
+
+    def __getitem__(self, name: str) -> Any:
+        if name in self._got:
+            return self._got[name]
+        if name not in self._known:
+            raise KeyError(name)
+        from wasmtime import _ffi as ffi
+        from wasmtime._extern import wrap_extern
+
+        raw = name.encode()
+        item = ffi.wasmtime_extern_t()
+        if not ffi.wasmtime_instance_export_get(
+            self._store._context(), ctypes.byref(self._instance._instance), raw, len(raw), ctypes.byref(item)
+        ):
+            raise KeyError(name)
+        self._got[name] = ext = wrap_extern(item)
+        return ext
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._names)
+
+    def __len__(self) -> int:
+        return len(self._names)
 
 
 def engine() -> Any:

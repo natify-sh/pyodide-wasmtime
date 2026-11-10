@@ -16,12 +16,17 @@ W=$(cd "${1:-work}" && pwd)
 DATA=${DATA:-$H/src/pyodide_wasmtime/data}
 mkdir -p "$DATA"
 sh "$H/tools/fetch.sh" "$W" >/dev/null
+# wasm-opt.wasm (the slow, mostly serial-link build) needs only the fetched sources: it runs beside the steps below
+BG=
+if [ -z "$WASM_OPT_WASM" ] && [ ! -f "$DATA/wasm-opt.wasm" ]; then
+  OUT="$DATA/wasm-opt.wasm" sh "$H/tools/build_binaryen.sh" "$W" & BG=$!
+fi
 OPT="node $W/dl/binaryen/package/bin/wasm-opt"
 $OPT "$W/dl/pyodide/package/pyodide.asm.wasm" --all-features --disable-compact-imports --translate-to-exnref -o "$DATA/pyodide.asm.wasm"
 cp "$W/dl/pyodide/package/python_stdlib.zip" "$DATA/"
 sh "$H/tools/build_adapter.sh" "$W" "$DATA/adapter.wasm"
-if [ -n "$WASM_OPT_WASM" ]; then cp "$WASM_OPT_WASM" "$DATA/wasm-opt.wasm"
-elif [ ! -f "$DATA/wasm-opt.wasm" ]; then OUT="$DATA/wasm-opt.wasm" sh "$H/tools/build_binaryen.sh" "$W"; fi
+if [ -n "$WASM_OPT_WASM" ]; then cp "$WASM_OPT_WASM" "$DATA/wasm-opt.wasm"; fi
+if [ -n "$BG" ]; then wait "$BG"; fi
 WASM_MERGE="node $W/dl/binaryen/package/bin/wasm-merge" PYTHONPATH="$H/src" \
   python3 "$H/tools/fuse.py" "$DATA/pyodide.asm.wasm" "$DATA/adapter.wasm" "$DATA/pyodide_fused.wasm"
 ls -l "$DATA"
