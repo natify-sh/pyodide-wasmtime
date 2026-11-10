@@ -10,7 +10,7 @@ adapter). On top of it:
   `bytes()`, `string()`, `text()`, `json()`, `memoryview()`, `raise_for_status()`), and `open_url`;
 * a urllib handler for http and https, installed globally, so `urllib.request.urlopen` works (micropip
   outside the browser fetches with it);
-* `run(coro)`: an asyncio loop with no I/O (the default loop needs a socketpair, which the guest has not).
+* `run(coro)`: an asyncio loop with no I/O (from before the guest had socketpair; `asyncio.run` works now).
 
 `install()` puts the first three in place; `fetch` and `run` work without it.
 """
