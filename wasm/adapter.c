@@ -39,6 +39,9 @@ WASI("fd_filestat_set_size") i32 w_fd_set_size(i32 fd, u64 size);
 WASI("path_symlink") i32 w_symlink(const char *old, i32 oldn, i32 fd, const char *new_, i32 newn);
 WASI("path_link") i32 w_link(i32 ofd, i32 oflags, const char *op, i32 on, i32 nfd, const char *np, i32 nn);
 WASI("fd_allocate") i32 w_fd_allocate(i32 fd, u64 offset, u64 len);
+WASI("fd_tell") i32 w_fd_tell(i32 fd, u64 *offset);
+WASI("fd_seek") i32 w_fd_seek(i32 fd, i64 offset, i32 whence, u64 *newoffset);
+WASI("fd_renumber") i32 w_fd_renumber(i32 from, i32 to);
 WASI("fd_datasync") i32 w_fd_datasync(i32 fd);
 WASI("proc_exit") __attribute__((noreturn)) void w_proc_exit(i32 code);
 
@@ -149,6 +152,59 @@ static Cwd *cwdst(void) {
         __asm__ volatile("local.get %0\n\tglobal.set cwd_state" : : "r"(r));
     }
     return r;
+}
+
+// ---- the open files: the absolute guest path and the open flags of each descriptor opened by openat, so that dup()
+// (which WASI 0.1 lacks) can open the same file again: a directory (fdopendir, fwalk, rmtree) or a file. Standard
+// streams, sockets and pipes have no path: they are not duplicated.
+typedef struct {
+    char *path[MAXFD];
+    i32 flags[MAXFD];
+} Fds;
+__asm__(".globaltype fds_state, i32\nfds_state:\n");
+static Fds *fds(void) {
+    Fds *r;
+    __asm__ volatile("global.get fds_state\n\tlocal.set %0" : "=r"(r));
+    if (!r) {
+        r = (Fds *)calloc(1, sizeof(Fds));
+        __asm__ volatile("local.get %0\n\tglobal.set fds_state" : : "r"(r));
+    }
+    return r;
+}
+static const char *fd_base_path(i32 fd) {  // the path of a directory descriptor, including the preopens
+    if (fd >= 0 && fd < MAXFD && fds()->path[fd]) return fds()->path[fd];
+    Pre *P = preopens();
+    for (i32 k = 0; k < P->n; k++)
+        if (P->fd[k] == fd) return P->name[k];
+    return 0;
+}
+// dirfd + path -> an absolute guest path in out (PATHMAX bytes); 0 if it can not be made
+static i32 abs_path(i32 dirfd, const char *path, char *out) {
+    const char *base = 0;
+    if (path[0] != '/') {
+        base = dirfd == AT_FDCWD ? cwdst()->cwd : fd_base_path(dirfd);
+        if (!base) return 0;
+    }
+    i32 k = 0;
+    if (base) {
+        for (const char *q = base; *q; q++) {
+            if (k >= PATHMAX - 2) return 0;
+            out[k++] = *q;
+        }
+        if (k == 0 || out[k - 1] != '/') out[k++] = '/';
+    }
+    for (const char *q = path; *q; q++) {
+        if (k >= PATHMAX - 1) return 0;
+        out[k++] = *q;
+    }
+    out[k] = 0;
+    return 1;
+}
+static void fd_forget(i32 fd) {
+    if (fd >= 0 && fd < MAXFD && fds()->path[fd]) {
+        free(fds()->path[fd]);
+        fds()->path[fd] = 0;
+    }
 }
 
 // A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
@@ -318,8 +374,53 @@ EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags,
     i32 out = -1;
     i32 e = w_path_open(fd, (flags & 0400000) ? 0 : 1, p, n, oflags, rights, all, fdflags, &out);
     if (e) return -e;
-    if (out >= 0 && out < MAXFD) cookies()[out] = 0;  // a new descriptor lists its directory from the start
+    if (out >= 0 && out < MAXFD) {
+        cookies()[out] = 0;  // a new descriptor lists its directory from the start
+        char ap[PATHMAX];
+        fd_forget(out);
+        if (abs_path(dirfd, path, ap)) {
+            i32 n2 = slen(ap) + 1;
+            char *copy = (char *)malloc(n2);
+            for (i32 j = 0; j < n2; j++) copy[j] = ap[j];
+            fds()->path[out] = copy;
+            fds()->flags[out] = flags;
+        }
+    }
     return out;
+}
+
+// dup(): the same file opened again, at the same position (a copy of it: WASI 0.1 can not share the offset)
+EXPORT("__syscall_dup") i32 sc_dup(i32 fd) {
+    if (fd < 0 || fd >= MAXFD || !fds()->path[fd]) return -52;  // ENOSYS: a stream, a socket or a pipe
+    i32 flags = fds()->flags[fd] & ~(0100 | 0200 | 01000);       // not O_CREAT, O_EXCL, O_TRUNC again
+    char ap[PATHMAX];
+    i32 n = slen(fds()->path[fd]);
+    for (i32 j = 0; j <= n; j++) ap[j] = fds()->path[fd][j];
+    i32 nfd = sc_openat(AT_FDCWD, ap, flags, 0);
+    if (nfd < 0) return nfd;
+    u64 pos = 0;
+    if (!(flags & 0200000) && !w_fd_tell(fd, &pos)) w_fd_seek(nfd, (i64)pos, 0, &pos);
+    return nfd;
+}
+
+EXPORT("__syscall_dup3") i32 sc_dup3(i32 oldfd, i32 newfd, i32 flags) {
+    (void)flags;
+    if (oldfd == newfd) return -28;  // EINVAL
+    i32 d = sc_dup(oldfd);
+    if (d < 0) return d;
+    i32 e = w_fd_renumber(d, newfd);  // closes newfd
+    if (e) {
+        w_fd_close(d);
+        fd_forget(d);
+        return -e;
+    }
+    fd_forget(newfd);
+    if (d < MAXFD && newfd >= 0 && newfd < MAXFD) {  // the record follows the number
+        fds()->path[newfd] = fds()->path[d];
+        fds()->flags[newfd] = fds()->flags[d];
+        fds()->path[d] = 0;
+    }
+    return newfd;
 }
 
 EXPORT("__syscall_stat64") i32 sc_stat64(const char *path, void *buf) { return stat_path(AT_FDCWD, path, buf, 1); }
@@ -440,9 +541,9 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
         case 6:  // F_SETLK
         case 7:  // F_SETLKW: one process, so a lock is always granted
             return 0;
-        case 0:     // F_DUPFD
+        case 0:     // F_DUPFD (the minimum number is not honoured)
         case 1030:  // F_DUPFD_CLOEXEC
-            return -52;  // ENOSYS
+            return sc_dup(fd);
         default:
             return -28;  // EINVAL
     }
@@ -1163,7 +1264,10 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
 }
 
 EXPORT("fd_close") i32 x_fd_close(i32 fd) {
-    if (!is_sock(fd)) return w_fd_close(fd);
+    if (!is_sock(fd)) {
+        fd_forget(fd);
+        return w_fd_close(fd);
+    }
     net_close(hof(fd));
     socks()->h[fd - SOCKBASE] = 0;
     return 0;
