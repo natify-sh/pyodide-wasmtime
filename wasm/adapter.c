@@ -36,11 +36,6 @@ WASI("path_unlink_file") i32 w_unlink(i32 fd, const char *p, i32 n);
 WASI("path_remove_directory") i32 w_rmdir(i32 fd, const char *p, i32 n);
 WASI("path_rename") i32 w_rename(i32 fd, const char *p, i32 n, i32 fd2, const char *p2, i32 n2);
 WASI("fd_filestat_set_size") i32 w_fd_set_size(i32 fd, u64 size);
-WASI("path_symlink") i32 w_symlink(const char *old, i32 oldn, i32 fd, const char *new_, i32 newn);
-WASI("path_link") i32 w_link(i32 ofd, i32 oflags, const char *op, i32 on, i32 nfd, const char *np, i32 nn);
-WASI("fd_allocate") i32 w_fd_allocate(i32 fd, u64 offset, u64 len);
-WASI("fd_datasync") i32 w_fd_datasync(i32 fd);
-WASI("proc_exit") __attribute__((noreturn)) void w_proc_exit(i32 code);
 
 // the main module's allocator (resolved from its exports, like any side module's import)
 void *malloc(u32 n);
@@ -131,52 +126,9 @@ static Pre *preopens(void) {
     return r;
 }
 
-// ---- the current directory (chdir): kept as an absolute path in one malloc'd block, its address in a wasm global.
-// A relative path against AT_FDCWD is joined to it into one of two buffers (rename and link resolve two at once).
-#define PATHMAX 1024
-typedef struct {
-    char cwd[PATHMAX];
-    char buf[2][PATHMAX];
-    i32 flip;
-} Cwd;
-__asm__(".globaltype cwd_state, i32\ncwd_state:\n");
-static Cwd *cwdst(void) {
-    Cwd *r;
-    __asm__ volatile("global.get cwd_state\n\tlocal.set %0" : "=r"(r));
-    if (!r) {
-        r = (Cwd *)calloc(1, sizeof(Cwd));
-        r->cwd[0] = '/';
-        __asm__ volatile("local.get %0\n\tglobal.set cwd_state" : : "r"(r));
-    }
-    return r;
-}
-
-// A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
+// A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is "/".
 static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot) {
     i32 fd = dirfd;
-    if (path[0] != '/' && dirfd == AT_FDCWD) {  // relative to the cwd: make it absolute
-        Cwd *C = cwdst();
-        if (!(C->cwd[0] == '/' && C->cwd[1] == 0)) {
-            char *o = C->buf[C->flip];
-            i32 k = 0, ok = 1;
-            for (const char *q = C->cwd; *q; q++) {
-                if (k >= PATHMAX - 2) { ok = 0; break; }
-                o[k++] = *q;
-            }
-            if (ok) {
-                o[k++] = '/';
-                for (const char *q = path; *q; q++) {
-                    if (k >= PATHMAX - 1) { ok = 0; break; }
-                    o[k++] = *q;
-                }
-            }
-            if (ok) {
-                o[k] = 0;
-                C->flip ^= 1;
-                path = o;
-            }
-        }
-    }
     if (path[0] == '/' || dirfd == AT_FDCWD) {
         Pre *P = preopens();
         i32 best = -1, bl = -1;
@@ -247,57 +199,10 @@ static i32 stat_path(i32 dirfd, const char *path, void *buf, i32 follow) {
 }
 
 EXPORT("__syscall_getcwd") i32 sc_getcwd(char *buf, i32 size) {
-    Cwd *C = cwdst();
-    i32 n = slen(C->cwd);
-    if (n + 1 > size) return -ERANGE;
-    for (i32 k = 0; k <= n; k++) buf[k] = C->cwd[k];
-    return n + 1;
-}
-
-// chdir: the absolute path, lexically normalized ('.' and '..'), must name a directory
-EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
-    Cwd *C = cwdst();
-    char full[PATHMAX], out[PATHMAX];
-    i32 k = 0;
-    if (path[0] != '/') {
-        for (const char *q = C->cwd; *q; q++) {
-            if (k >= PATHMAX - 2) return -36;  // ENAMETOOLONG
-            full[k++] = *q;
-        }
-        full[k++] = '/';
-    }
-    for (const char *q = path; *q; q++) {
-        if (k >= PATHMAX - 1) return -36;
-        full[k++] = *q;
-    }
-    full[k] = 0;
-    i32 len = 1;
-    out[0] = '/';
-    for (i32 i = 0; full[i];) {
-        while (full[i] == '/') i++;
-        i32 st = i;
-        while (full[i] && full[i] != '/') i++;
-        i32 cl = i - st;
-        if (cl == 0 || (cl == 1 && full[st] == '.')) continue;
-        if (cl == 2 && full[st] == '.' && full[st + 1] == '.') {
-            while (len > 1 && out[len - 1] != '/') len--;
-            if (len > 1) len--;  // drop the '/' before it
-            continue;
-        }
-        if (len + cl + 1 >= PATHMAX) return -36;
-        if (len > 1) out[len++] = '/';
-        for (i32 j = 0; j < cl; j++) out[len++] = full[st + j];
-    }
-    out[len] = 0;
-    u64 fs[8];
-    char dot[2];
-    const char *p;
-    i32 n, fd = resolve(AT_FDCWD, out, &p, &n, dot);
-    i32 e = w_path_filestat_get(fd, 1, p, n, fs);
-    if (e) return -e;
-    if (*((u8 *)fs + 16) != 3) return -54;  // ENOTDIR: the filetype is not "directory"
-    for (i32 j = 0; j <= len; j++) C->cwd[j] = out[j];
-    return 0;
+    if (size < 2) return -ERANGE;
+    buf[0] = '/';
+    buf[1] = 0;
+    return 2;
 }
 
 EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
@@ -406,46 +311,9 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     return -ENOTTY;
 }
 
-static i32 is_sock(i32 fd);
-WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
-WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
-
-// fcntl: the flags are WASI's fdflags (append, nonblock) and rights; descriptors can not be duplicated in WASI 0.1 (ENOSYS).
 EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
-    switch (cmd) {
-        case 1:  // F_GETFD: FD_CLOEXEC is not kept (there is no exec)
-        case 2:  // F_SETFD
-            return 0;
-        case 3: {  // F_GETFL
-            if (is_sock(fd)) return 2;  // O_RDWR
-            u8 st[24] __attribute__((aligned(8)));
-            i32 e = w_fd_fdstat_get(fd, st);
-            if (e) return -e;
-            u16 ff = *(u16 *)(st + 2);
-            u64 rights = *(u64 *)(st + 8);
-            i32 r = (rights & (1ull << 1)) != 0, w = (rights & (1ull << 6)) != 0;
-            i32 fl = r && w ? 2 : w ? 1 : 0;  // O_RDWR, O_WRONLY, O_RDONLY
-            if (ff & 1) fl |= 02000;          // O_APPEND
-            if (ff & 4) fl |= 04000;          // O_NONBLOCK
-            return fl;
-        }
-        case 4: {  // F_SETFL: append and nonblock only
-            if (is_sock(fd)) return 0;
-            i32 ff = 0;
-            if (va & 02000) ff |= 1;
-            if (va & 04000) ff |= 4;
-            i32 e = w_fd_fdstat_set_flags(fd, ff);
-            return e ? -e : 0;
-        }
-        case 6:  // F_SETLK
-        case 7:  // F_SETLKW: one process, so a lock is always granted
-            return 0;
-        case 0:     // F_DUPFD
-        case 1030:  // F_DUPFD_CLOEXEC
-            return -52;  // ENOSYS
-        default:
-            return -28;  // EINVAL
-    }
+    (void)fd, (void)cmd, (void)va;
+    return 0;
 }
 
 EXPORT("_emscripten_get_progname") void get_progname(char *buf, i32 len) {
@@ -829,60 +697,6 @@ EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
     i32 e = w_fd_set_size(fd, (u64)len);
     return e ? -e : 0;
 }
-
-EXPORT("__syscall_truncate64") i32 sc_truncate64(const char *path, i64 len) {
-    char dot[2];
-    const char *p;
-    i32 n, fd = resolve(AT_FDCWD, path, &p, &n, dot), out = -1;
-    i32 e = w_path_open(fd, 1, p, n, 0, (1ull << 6) | (1ull << 22), 0, 0, &out);  // rights: FD_WRITE (opens it for writing), FD_FILESTAT_SET_SIZE
-    if (e) return -e;
-    e = w_fd_set_size(out, (u64)len);
-    w_fd_close(out);
-    return e ? -e : 0;
-}
-
-EXPORT("__syscall_fallocate") i32 sc_fallocate(i32 fd, i32 mode, i64 offset, i64 len) {
-    (void)mode;
-    i32 e = w_fd_allocate(fd, (u64)offset, (u64)len);
-    return e ? -e : 0;
-}
-
-EXPORT("__syscall_fdatasync") i32 sc_fdatasync(i32 fd) {
-    i32 e = w_fd_datasync(fd);
-    return e ? -e : 0;
-}
-
-// advice only: nothing to do (the answer of every libc when the kernel ignores it)
-EXPORT("__syscall_fadvise64") i32 sc_fadvise64(i32 fd, i64 offset, i64 len, i32 advice) {
-    (void)fd, (void)offset, (void)len, (void)advice;
-    return 0;
-}
-
-EXPORT("__syscall_symlinkat") i32 sc_symlinkat(const char *target, i32 newdirfd, const char *linkpath) {
-    char dot[2];
-    const char *p;
-    i32 n, fd = resolve(newdirfd, linkpath, &p, &n, dot);
-    i32 e = w_symlink(target, slen(target), fd, p, n);  // the target is stored as it is
-    return e ? -e : 0;
-}
-
-EXPORT("__syscall_linkat") i32 sc_linkat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath, i32 flags) {
-    char d1[2], d2[2];
-    const char *p1, *p2;
-    i32 n1, n2, f1 = resolve(olddirfd, oldpath, &p1, &n1, d1), f2 = resolve(newdirfd, newpath, &p2, &n2, d2);
-    i32 e = w_link(f1, (flags & 0x400) ? 1 : 0, p1, n1, f2, p2, n2);  // AT_SYMLINK_FOLLOW
-    return e ? -e : 0;
-}
-
-// the process runs as root of a single-user world (as Pyodide's JavaScript glue answers)
-EXPORT("__syscall_getuid32_js") i32 sc_getuid(void) { return 0; }
-EXPORT("__syscall_geteuid32") i32 sc_geteuid(void) { return 0; }
-EXPORT("__syscall_getgid32") i32 sc_getgid(void) { return 0; }
-EXPORT("__syscall_getegid32") i32 sc_getegid(void) { return 0; }
-EXPORT("__syscall_umask_js") i32 sc_umask(i32 mask) { (void)mask; return 022; }  // the previous mask; WASI has none
-
-// exit(): the process ends, with the code (Emscripten's JavaScript glue throws; here WASI says it)
-EXPORT("exit") void sc_exit(i32 code) { w_proc_exit(code); }
 
 // permissions and times: accepted and ignored (WASI preview1 has no modes; times are not needed here)
 EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 a, i32 b, i32 c, i32 d) { (void)a, (void)b, (void)c, (void)d; return 0; }

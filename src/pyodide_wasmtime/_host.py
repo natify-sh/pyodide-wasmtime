@@ -168,7 +168,6 @@ class Pyodide:
         self.summary = ""
         self._started = False
         self._runs = 0
-        self._exited: int | None = None
         self.ex: Any = None
         self.table: Any = None
         self.memory: Any = None
@@ -606,16 +605,9 @@ class Pyodide:
         store = self.store
         p = self.ex["PyMem_Malloc"](store, len(src))
         self._wr(p, src)
-        try:
-            rc = self.ex["PyRun_SimpleString"](store, p)
-        except self._wt.ExitTrap as e:  # the process ended (exit(), os._exit()): this interpreter is gone
-            self._exited = e.code
-            rc = e.code
+        rc = self.ex["PyRun_SimpleString"](store, p)
         rc_path = self.root / rc_file.lstrip("/")
-        if self._exited is not None:
-            self.close()  # a next run() starts a new interpreter
-            self._exited = None
-        elif rc_path.exists():
+        if rc_path.exists():
             rc = int(rc_path.read_text())
         if self.lazy:
             log.info("[loader] imports bound lazily (no definition at load): %s", ", ".join(sorted(set(self.lazy))))

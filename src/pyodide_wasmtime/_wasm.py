@@ -48,14 +48,6 @@ def zero(t):
     )
 
 
-def stub_results(name, rs):
-    """What an unanswered import returns: zero/null for the JavaScript bridge and the like, but ENOSYS (-52) for a
-    system call: 0 would mean "it worked", and the callers (symlink, pipe, dup...) would go on with nothing made."""
-    if name.startswith("__syscall_") and list(rs) == ["i32"]:
-        return "(i32.const -52)"
-    return " ".join(zero(r) for r in rs)
-
-
 def shim_wat(imports, forwarded, got_names):
     lines, types = ["(module"], {}
     for _m, _n, ps, rs in imports:
@@ -83,7 +75,7 @@ def shim_wat(imports, forwarded, got_names):
             args = " ".join(f"(local.get {k})" for k in range(len(ps)))
             body = f"(call_indirect (type {types[(tuple(ps), tuple(rs))]}) {args} (i32.const {forwarded[n]}))"
         else:
-            body = stub_results(n, rs)
+            body = " ".join(zero(r) for r in rs)
         lines.append(f'  (func (export "{n}") {sig} {body})')
     for g in got_names:
         lines.append(f'  (global (export "got:{g}") (mut i32) (i32.const 0))')
