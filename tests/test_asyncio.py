@@ -116,3 +116,31 @@ print(got, type(sel).__name__)
 """,
     )
     assert out == ["b'ping!' PollSelector"]
+
+
+def test_an_asyncio_write_larger_than_the_socket_buffer(guest: Guest):
+    """The writer's send must not block the interpreter while the reader (in the same guest) is not running."""
+    out = run(
+        guest,
+        """
+N = 8_000_000
+
+async def handle(r, w):
+    data = await r.readexactly(N)
+    w.write(b'got %d' % len(data))
+    await w.drain()
+    w.close()
+
+async def main():
+    srv = await asyncio.start_server(handle, '127.0.0.1', 0)
+    port = srv.sockets[0].getsockname()[1]
+    r, w = await asyncio.open_connection('127.0.0.1', port)
+    w.write(b'x' * N)
+    await w.drain()
+    print((await r.read(100)).decode())
+    w.close()
+    srv.close()
+asyncio.run(main())
+""",
+    )
+    assert out == ["got 8000000"]

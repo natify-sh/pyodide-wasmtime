@@ -13,6 +13,7 @@ Two builds of the same sources, one `Pyodide` class:
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
@@ -60,7 +61,46 @@ WASI_ERRNO = {
 }
 
 # musl's (Linux's) numbers, which the guest uses, by the NAME of the host's constant; the host's own numbers differ
-ESOCKTNOSUPPORT, EOPNOTSUPP = 137, 138  # Emscripten's errno.h; not in WASI's list
+# The guest's errno numbers are Emscripten's (system/lib/libc/musl/arch/emscripten/bits/errno.h): WASI's for the
+# names WASI has, and its own 137.. for the rest; ENOTSUP is EOPNOTSUPP = 138 (not WASI's NOTSUP, 58).
+GUEST_ERRNO = {
+    **WASI_ERRNO,
+    "NOTSUP": 138,
+    "OPNOTSUPP": 138,
+    "SOCKTNOSUPPORT": 137,
+    "PFNOSUPPORT": 139,
+    "SHUTDOWN": 140,
+    "HOSTDOWN": 142,
+    "WOULDBLOCK": WASI_ERRNO["AGAIN"],
+    "DEADLOCK": WASI_ERRNO["DEADLK"],
+}
+ESOCKTNOSUPPORT, EOPNOTSUPP = GUEST_ERRNO["SOCKTNOSUPPORT"], GUEST_ERRNO["OPNOTSUPP"]
+# Windows reports socket errors as WSAE* numbers (and its errno.errorcode has them only there): by number, so that the
+# translation is the same on every OS
+WSA_ERRNO = {
+    10004: "INTR", 10009: "BADF", 10013: "ACCES", 10014: "FAULT", 10022: "INVAL", 10024: "MFILE",
+    10035: "AGAIN", 10036: "INPROGRESS", 10037: "ALREADY", 10038: "NOTSOCK", 10039: "DESTADDRREQ",
+    10040: "MSGSIZE", 10041: "PROTOTYPE", 10042: "NOPROTOOPT", 10043: "PROTONOSUPPORT",
+    10044: "SOCKTNOSUPPORT", 10045: "OPNOTSUPP", 10046: "PFNOSUPPORT", 10047: "AFNOSUPPORT",
+    10048: "ADDRINUSE", 10049: "ADDRNOTAVAIL", 10050: "NETDOWN", 10051: "NETUNREACH", 10052: "NETRESET",
+    10053: "CONNABORTED", 10054: "CONNRESET", 10055: "NOBUFS", 10056: "ISCONN", 10057: "NOTCONN",
+    10058: "SHUTDOWN", 10060: "TIMEDOUT", 10061: "CONNREFUSED", 10064: "HOSTDOWN", 10065: "HOSTUNREACH",
+}  # fmt: skip
+
+
+def guest_errno(code: int | None) -> int:
+    """A host errno (any OS: by its name, or the WSAE number) -> the guest's positive errno; EIO, logged, if unknown."""
+    name = WSA_ERRNO.get(code or 0) or errno.errorcode.get(code or 0, "EIO")[1:]
+    if name not in GUEST_ERRNO:
+        log.warning("[net] host error %r has no guest errno: EIO", code)
+        return GUEST_ERRNO["IO"]
+    return GUEST_ERRNO[name]
+
+
+class GuestFault(Exception):
+    """A guest pointer or length outside its memory: EFAULT, never a trap of the host."""
+
+
 MSG_FLAGS = {
     1: "MSG_OOB",
     2: "MSG_PEEK",
@@ -284,7 +324,8 @@ class Pyodide:
         shutil.copy(Path(__file__).with_name("guest") / "hostnet.py", sp)
         # the frozen `encodings` package looks in /lib/python3.15/encodings, which does not exist: the stdlib is the
         # zip (Pyodide's JavaScript sets this up); without it every codec but the frozen ones is missing
-        # Pyodide's _socket was built without SO_REUSEADDR (musl's value is 2), which asyncio and socketserver look up
+        # Pyodide's _socket was built without the constant SO_REUSEADDR (musl's value is 2), which asyncio and
+        # socketserver look up; setsockopt itself is real (tools/patch_main.mjs)
         (sp / "sitecustomize.py").write_text(
             f"import encodings\nencodings.__path__.append('/lib/python{PYVER.replace('.', '')}.zip/encodings')\n"
             "import _socket\n_socket.SO_REUSEADDR = 2\n"
@@ -294,11 +335,22 @@ class Pyodide:
     # Four operations a wasm module cannot do itself, because the host holds the instances and their exports by
     # name: instantiate, sym, got_set, call. The rest of `_dlopen_js` (the file, dylink.0, memory from calloc, the
     # GOT, relocations, constructors) runs in the adapter.
+    def _span(self, a: int, n: int) -> int:
+        """The guest address a (wasmtime passes i32 as SIGNED: -1 is 0xFFFFFFFF) after checking that [a, a+n) lies in
+        the memory; n is a size_t, so a negative one is a huge one. GuestFault (EFAULT) otherwise."""
+        a = a + (1 << 32) if a < 0 else a
+        n = n + (1 << 32) if n < 0 else n
+        if a >> 32 or n >> 32 or a + n > self.memory.data_len(self.cur[-1]):
+            raise GuestFault(f"{a:#x}+{n:#x} is outside the memory")
+        return a
+
     def _rd(self, a: int, n: int) -> bytes:
-        return bytes(self.memory.read(self.cur[-1], a, a + n))
+        a = self._span(a, n)
+        return bytes(self.memory.read(self.cur[-1], a, a + (n + (1 << 32) if n < 0 else n)))
 
     def _wr(self, a: int, data: bytes) -> None:
-        self.memory.write(self.cur[-1], bytes(data), a)
+        data = bytes(data)
+        self.memory.write(self.cur[-1], data, self._span(a, len(data)))
 
     def _env_func(self, name: str) -> Any:
         wt = self._wt
@@ -442,17 +494,20 @@ class Pyodide:
     # Windows), so options, flags and error codes are translated by NAME.
     @staticmethod
     def _werr(exc: OSError) -> int:
-        """A host OSError -> -errno in WASI's (= Emscripten's) numbering."""
-        name = errno.errorcode.get(getattr(exc, "errno", None) or 0, "EIO")[1:]
-        return -WASI_ERRNO.get(name, WASI_ERRNO["IO"])
+        """A host OSError -> -errno in the guest's (Emscripten's) numbering."""
+        return -guest_errno(getattr(exc, "errno", None))
 
     def _cstr(self, p: int) -> str | None:
+        """The NUL-terminated string at p (at most 4096 bytes: GuestFault if there is no end inside the memory)."""
         if not p:
             return None
         out = bytearray()
-        while (b := self._rd(p + len(out), 1)) != b"\0":
+        for i in range(4096):
+            b = self._rd(p + i, 1)  # GuestFault past the end of memory
+            if b == b"\0":
+                return out.decode("utf-8", "replace")
             out += b
-        return out.decode("utf-8", "replace")
+        raise GuestFault("string too long")
 
     def _sockaddr(self, s: socket.socket, p: int, n: int) -> tuple:
         """The sockaddr at p (n bytes) as the host's address tuple for socket s."""
@@ -474,24 +529,31 @@ class Pyodide:
         return (
             socket.inet_ntop(socket.AF_INET6, raw[8:24]),
             port,
-            int.from_bytes(raw[4:8], "big"),
+            int.from_bytes(raw[4:8], "big") & 0xFFFFF,  # the flow label is 20 bits
             int.from_bytes(raw[24:28], "little"),
         )
 
     @staticmethod
     def _sockaddr_bytes(addr: tuple) -> bytes:
-        """The host's address tuple as a sockaddr_in (2 items) or sockaddr_in6 (4)."""
+        """The host's address tuple as a sockaddr_in (an IPv4 address) or sockaddr_in6 (an IPv6 one, with the flow
+        label and scope id if the tuple has them); ValueError for any other shape."""
+        if not isinstance(addr, tuple) or len(addr) not in (2, 4) or not isinstance(addr[0], str):
+            raise ValueError(f"not an internet address: {addr!r}")
         port = int(addr[1]).to_bytes(2, "big")
-        if len(addr) == 2:
+        if len(addr) == 2 and ":" not in addr[0]:
             return b"\2\0" + port + socket.inet_aton(addr[0]) + bytes(8)
-        flow, scope = int(addr[2]).to_bytes(4, "big"), int(addr[3]).to_bytes(4, "little")
-        return b"\x0a\0" + port + flow + socket.inet_pton(socket.AF_INET6, addr[0]) + scope
+        flow, scope = (int(addr[2]), int(addr[3])) if len(addr) == 4 else (0, 0)
+        ip = socket.inet_pton(socket.AF_INET6, addr[0].split("%")[0])
+        return b"\x0a\0" + port + (flow & 0xFFFFF).to_bytes(4, "big") + ip + (scope & 0xFFFFFFFF).to_bytes(4, "little")
 
     def _sockaddr_out(self, sa: int, lenp: int, addr: tuple | None) -> None:
         """Write an address to the caller's buffer (sa, *lenp = its size); *lenp becomes the real size (0: none)."""
         if not sa or not lenp:
             return
-        raw = self._sockaddr_bytes(addr) if addr else b""
+        try:
+            raw = self._sockaddr_bytes(addr) if addr else b""
+        except (ValueError, OSError):  # a shape no internet address has (a host that answers oddly): no address
+            raw = b""
         cap = int.from_bytes(self._rd(lenp, 4), "little")
         self._wr(sa, raw[:cap])
         self._wr(lenp, len(raw).to_bytes(4, "little"))
@@ -502,8 +564,11 @@ class Pyodide:
         out = 0
         for bit, name in MSG_FLAGS.items():
             if flags & bit:
+                if name == "MSG_DONTWAIT":  # the call is made non-blocking instead (_nonblocking)
+                    flags &= ~bit
+                    continue
                 v = getattr(socket, name, None)
-                if v is None and name not in ("MSG_DONTWAIT", "MSG_NOSIGNAL"):
+                if v is None and name != "MSG_NOSIGNAL":
                     raise OSError(errno.EOPNOTSUPP, name)
                 out |= v or 0
                 flags &= ~bit
@@ -518,11 +583,11 @@ class Pyodide:
 
     def _n_socket(self, domain: int, type_: int, proto: int) -> int:
         if domain not in (2, 10):
-            return -WASI_ERRNO["AFNOSUPPORT"]
+            return -GUEST_ERRNO["AFNOSUPPORT"]
         if type_ not in (1, 2):
             return -ESOCKTNOSUPPORT
         if proto not in (0, 6 if type_ == 1 else 17):
-            return -WASI_ERRNO["PROTONOSUPPORT"]
+            return -GUEST_ERRNO["PROTONOSUPPORT"]
         try:
             s = socket.socket(
                 socket.AF_INET if domain == 2 else socket.AF_INET6,
@@ -535,10 +600,6 @@ class Pyodide:
     def _n_bind(self, h: int, sa: int, n: int) -> int:
         s = self.socks[h]
         try:
-            if s.type == socket.SOCK_STREAM and os.name == "posix":
-                # the guest's setsockopt is a no-op inside the wasm (libc's stub), so SO_REUSEADDR, which every server
-                # sets, is applied here: a restarted server can bind its port while old connections wait
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(self._sockaddr(s, sa, n))
         except OSError as e:
             return self._werr(e)
@@ -551,9 +612,23 @@ class Pyodide:
             return self._werr(e)
         return 0
 
-    def _n_accept(self, h: int, sa: int, lenp: int) -> int:
+    @staticmethod
+    @contextlib.contextmanager
+    def _nonblocking(s: socket.socket, on: int):
+        """The guest asked for a call that must not wait (a non-blocking socket, MSG_DONTWAIT): the host socket, which
+        is blocking otherwise, is not for the length of the call."""
+        if on:
+            s.setblocking(False)
         try:
-            conn, addr = self.socks[h].accept()
+            yield
+        finally:
+            if on:
+                s.setblocking(True)
+
+    def _n_accept(self, h: int, sa: int, lenp: int, nb: int) -> int:
+        try:
+            with self._nonblocking(self.socks[h], nb):
+                conn, addr = self.socks[h].accept()
             conn.setblocking(True)
         except OSError as e:
             return self._werr(e)
@@ -573,7 +648,7 @@ class Pyodide:
                 finally:
                     s.setblocking(True)
                 if err:
-                    raise OSError(err, "connect")
+                    raise OSError(errno.EINPROGRESS if err == 10035 else err, "connect")  # Windows: WSAEWOULDBLOCK
             else:
                 s.connect(addr)
         except OSError as e:
@@ -587,9 +662,10 @@ class Pyodide:
         try:
             hf = self._msg_flags(flags)
             data = self._rd(p, n)
-            if sa:
-                return s.sendto(data, hf, self._sockaddr(s, sa, salen))
-            return s.send(data, hf)
+            with self._nonblocking(s, flags & 0x40):  # a partial count, or EAGAIN when nothing fits
+                if sa:
+                    return s.sendto(data, hf, self._sockaddr(s, sa, salen))
+                return s.send(data, hf)
         except OSError as e:
             return self._werr(e)
 
@@ -598,10 +674,12 @@ class Pyodide:
         """-> (data cut to n, source address, the size to return, msg_flags). A datagram is read whole, so that a
         short buffer truncates it (MSG_TRUNC in the flags, and in the result if asked) as the kernel does."""
         hf = Pyodide._msg_flags(flags & ~0x20)  # MSG_TRUNC is applied here
-        if s.type == socket.SOCK_DGRAM:
-            data, addr = s.recvfrom(65536, hf)
-            return data[:n], addr, (len(data) if flags & 0x20 else min(n, len(data))), 0x20 if len(data) > n else 0
-        data, addr = s.recvfrom(n, hf)
+        n = min(n + (1 << 32) if n < 0 else n, 1 << 20)  # a size_t; a stream read may return less than asked
+        with Pyodide._nonblocking(s, flags & 0x40):
+            if s.type == socket.SOCK_DGRAM:
+                data, addr = s.recvfrom(65536, hf)
+                return data[:n], addr, (len(data) if flags & 0x20 else min(n, len(data))), 0x20 if len(data) > n else 0
+            data, addr = s.recvfrom(n, hf)
         return data, addr, len(data), 0
 
     def _n_recvfrom(self, h: int, p: int, n: int, flags: int, sa: int, lenp: int) -> int:
@@ -617,19 +695,22 @@ class Pyodide:
         """struct msghdr of wasm32 (name, namelen, iov, iovlen, control, controllen, flags) -> name, namelen, the
         iovecs as (base, len), controllen"""
         name, namelen, iov, iovlen, _ctl, ctllen, _fl = struct.unpack("<7I", self._rd(msg, 28))
+        if iovlen > 1024:  # IOV_MAX: refused before anything is read
+            raise OSError(errno.EMSGSIZE, "iovlen")
         return name, namelen, list(struct.iter_unpack("<II", self._rd(iov, 8 * iovlen))), ctllen
 
     def _n_sendmsg(self, h: int, msg: int, flags: int) -> int:
         s = self.socks[h]
-        name, namelen, iovs, ctllen = self._msghdr(msg)
-        if ctllen:  # SCM_RIGHTS, SCM_CREDENTIALS...: nothing can carry them to the host
-            return -EOPNOTSUPP
         try:
+            name, namelen, iovs, ctllen = self._msghdr(msg)
+            if ctllen:  # SCM_RIGHTS, SCM_CREDENTIALS...: nothing can carry them to the host
+                return -EOPNOTSUPP
             hf = self._msg_flags(flags)
             data = b"".join(self._rd(b, n) for b, n in iovs)
-            if name:
-                return s.sendto(data, hf, self._sockaddr(s, name, namelen))
-            return s.send(data, hf)
+            with self._nonblocking(s, flags & 0x40):
+                if name:
+                    return s.sendto(data, hf, self._sockaddr(s, name, namelen))
+                return s.send(data, hf)
         except OSError as e:
             return self._werr(e)
 
@@ -649,12 +730,6 @@ class Pyodide:
             self._wr(msg + 4, bytes(4))
         self._wr(msg + 20, struct.pack("<II", 0, mflags))  # msg_controllen: no ancillary data; msg_flags
         return ret
-
-    def _n_send(self, h: int, p: int, n: int) -> int:
-        return self._n_sendto(h, p, n, 0, 0, 0)
-
-    def _n_recv(self, h: int, p: int, n: int, peek: int) -> int:
-        return self._n_recvfrom(h, p, n, 2 if peek else 0, 0, 0)
 
     def _poll(self, socks: list, events: list[int], timeout_ms: int) -> list[int]:
         """revents (POLLIN 1, PRI 2, OUT 4, ERR 8, HUP 16, NVAL 32) of the sockets (None: a closed handle)."""
@@ -729,6 +804,31 @@ class Pyodide:
         self._sockaddr_out(sa, lenp, addr)
         return 0
 
+    @staticmethod
+    def _option(level: int, opt: int) -> tuple[int | None, int | None]:
+        """musl's (level, option) numbers -> the host's, found by the NAME of the constant; None: the host has none."""
+        return (
+            getattr(socket, SOCK_LEVELS.get(level, ""), None),
+            getattr(socket, SOCK_OPTIONS.get((level, opt), ""), None),
+        )
+
+    def _n_setopt(self, h: int, level: int, opt: int, valp: int, ln: int) -> int:
+        """setsockopt (the import patched into the main module, tools/patch_main.mjs): applied to the host's socket."""
+        s = self.socks[h]
+        hl, ho = self._option(level, opt)
+        if hl is None or ho is None:
+            return -GUEST_ERRNO["NOPROTOOPT"]
+        if not 0 <= ln <= 1024:
+            return -GUEST_ERRNO["INVAL"]
+        raw = self._rd(valp, ln)
+        if (level, opt) == (1, 2) and os.name != "posix":
+            return 0  # SO_REUSEADDR means "steal the port" on Windows: not what a POSIX program asks
+        try:
+            s.setsockopt(hl, ho, raw)
+        except OSError as e:
+            return self._werr(e)
+        return 0
+
     def _n_getopt(self, h: int, level: int, opt: int, valp: int, lenp: int) -> int:
         """getsockopt: the option is found by name in the host's socket module; an unknown one is ENOPROTOOPT."""
         s = self.socks[h]
@@ -742,10 +842,9 @@ class Pyodide:
             }
             raw = val[opt].to_bytes(4, "little")
         else:
-            lname, oname = SOCK_LEVELS.get(level), SOCK_OPTIONS.get((level, opt))
-            hl, ho = getattr(socket, lname or "", None), getattr(socket, oname or "", None)
+            hl, ho = self._option(level, opt)
             if hl is None or ho is None:
-                return -WASI_ERRNO["NOPROTOOPT"]
+                return -GUEST_ERRNO["NOPROTOOPT"]
             try:
                 raw = s.getsockopt(hl, ho, min(max(cap, 4), 1024))
             except OSError as e:
@@ -786,10 +885,14 @@ class Pyodide:
         try:
             ip = socket.gethostbyname(name)
         except OSError:
-            return -WASI_ERRNO["NOENT"]
+            return -GUEST_ERRNO["NOENT"]
         self.netlog.append(f"resolve {name} -> {ip}")
         self._wr(ap, socket.inet_aton(ip))
         return 0
+
+    def _malloc(self, n: int) -> int:
+        """The guest's malloc: its address as an unsigned number (0: no memory)."""
+        return self.ex["malloc"](self.cur[-1], n) & 0xFFFFFFFF
 
     def _n_getaddrinfo(self, node_p: int, service_p: int, hint_p: int, out_p: int) -> int:
         """getaddrinfo: Pyodide's JavaScript validates the input (EAI codes; the defaults stream/6, dgram/17), the
@@ -852,8 +955,13 @@ class Pyodide:
             return -2
         canon = ((entries[0][1] or node or "").encode() + b"\0") if flags & 2 else b""
         c = self.cur[-1]
-        block = self.ex["malloc"](c, 32 * len(entries) + len(canon) + sum(len(sa) for _f, _c, sa in entries[1:]))
-        head_sa = self.ex["malloc"](c, len(entries[0][2]))
+        block = self._malloc(32 * len(entries) + len(canon) + sum(len(sa) for _f, _c, sa in entries[1:]))
+        head_sa = self._malloc(len(entries[0][2]))
+        if not block or not head_sa:
+            for q in (block, head_sa):
+                if q:
+                    self.ex["free"](c, q)
+            return -10  # EAI_MEMORY
         at = block + 32 * len(entries)
         self._wr(at, canon)
         canon_p, at = (at if canon else 0), at + len(canon)
@@ -901,10 +1009,38 @@ class Pyodide:
                 num = {"tcp": 6, "udp": 17}.get(name, -1)
             if num < 0:
                 return 0
-            p = self.ex["malloc"](self.cur[-1], 16 + len(name) + 1)
-            self._wr(p, struct.pack("<4I", p + 16, p + 12, num, 0) + name.encode() + b"\0")  # aliases: [NULL]
+            b = name.encode() + b"\0"
+            p = self._malloc(16 + len(b))
+            if not p:
+                return 0
+            self._wr(p, struct.pack("<4I", p + 16, p + 12, num, 0) + b)  # aliases: [NULL]
             self.protoents[name] = p
         return self.protoents[name]
+
+    # what a net operation answers when the guest gave it a pointer outside its memory, or the host failed in a way
+    # nobody foresaw: -EFAULT and -EIO, but the name functions answer in EAI_* (or a NULL pointer)
+    NET_FAILS = {"getaddrinfo": (-11, -4), "getnameinfo": (-11, -4), "protobyname": (0, 0)}
+
+    def _wrap_net(self, name: str, fn):
+        """No exception of a net operation reaches the wasm (it would be a trap that ends the interpreter): a pointer
+        outside the memory is EFAULT, a host error is its errno, anything else is logged and EIO."""
+        fault, other = self.NET_FAILS.get(name, (-GUEST_ERRNO["FAULT"], -GUEST_ERRNO["IO"]))
+
+        def f(caller, *args):
+            self.cur.append(caller)
+            try:
+                return fn(*args)
+            except GuestFault:
+                return fault
+            except OSError as e:
+                return other if name in self.NET_FAILS else self._werr(e)
+            except Exception:
+                log.exception("[net] %s failed", name)
+                return other
+            finally:
+                self.cur.pop()
+
+        return f
 
     def _wrap(self, fn, nres: int):
         def f(caller, *args):
@@ -934,10 +1070,8 @@ class Pyodide:
             "socket": (self._n_socket, ft(3)),
             "bind": (self._n_bind, ft(3)),
             "listen": (self._n_listen, ft(2)),
-            "accept": (self._n_accept, ft(3)),
+            "accept": (self._n_accept, ft(4)),
             "connect": (self._n_connect, ft(4)),
-            "send": (self._n_send, ft(3)),
-            "recv": (self._n_recv, ft(4)),
             "sendto": (self._n_sendto, ft(6)),
             "recvfrom": (self._n_recvfrom, ft(6)),
             "sendmsg": (self._n_sendmsg, ft(3)),
@@ -948,6 +1082,7 @@ class Pyodide:
             "shutdown": (self._n_shutdown, ft(2)),
             "name": (self._n_name, ft(4)),
             "getopt": (self._n_getopt, ft(5)),
+            "setopt": (self._n_setopt, ft(5)),
             "ioctl": (self._n_ioctl, ft(3)),
             "resolve": (self._n_resolve, ft(3)),
             "getaddrinfo": (self._n_getaddrinfo, ft(4)),
@@ -985,7 +1120,7 @@ class Pyodide:
             for name, (fn, ty) in loader_ops.items():
                 linker.define_func("loader", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
             for name, (fn, ty) in net_ops.items():
-                linker.define_func("net", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
+                linker.define_func("net", name, ty, self._wrap_net(name, fn), access_caller=True)
 
         if self.flavor == "fused":
             main_mod = _engine.load_module(self.data / "pyodide_fused.wasm")
@@ -1129,6 +1264,9 @@ class Pyodide:
         for s in self.socks.values():
             s.close()
         self.socks.clear()
+        self.protoents.clear()  # guest addresses, and the guest is gone: so are the table slots and instances
+        self.slots.clear()
+        self.instances = [None]
         if self.root is not None:
             shutil.rmtree(self.root, ignore_errors=True)
             self.root = None

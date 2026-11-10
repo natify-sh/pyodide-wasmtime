@@ -1139,10 +1139,9 @@ EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, voi
 NET("socket") i32 net_socket(i32 domain, i32 type, i32 proto);  // -> handle, or -errno
 NET("bind") i32 net_bind(i32 h, const u8 *sa, i32 len);
 NET("listen") i32 net_listen(i32 h, i32 backlog);
-NET("accept") i32 net_accept(i32 h, u8 *sa, u32 *lenp);  // -> the new handle; the peer's address into sa, *lenp
+NET("accept") i32 net_accept(i32 h, u8 *sa, u32 *lenp, i32 nb);  // -> the new handle; the peer's address into sa, *lenp
 NET("connect") i32 net_connect(i32 h, const u8 *sa, i32 len, i32 nb);  // nb: EINPROGRESS, the connection goes on
-NET("send") i32 net_send(i32 h, const u8 *p, i32 n);
-NET("recv") i32 net_recv(i32 h, u8 *p, i32 n, i32 peek);
+// flags are musl's MSG_*; the adapter adds MSG_DONTWAIT for a non-blocking socket, and the host then never waits
 NET("sendto") i32 net_sendto(i32 h, const u8 *p, i32 n, i32 flags, const u8 *sa, i32 salen);
 NET("recvfrom") i32 net_recvfrom(i32 h, u8 *p, i32 n, i32 flags, u8 *sa, u32 *lenp);
 NET("sendmsg") i32 net_sendmsg(i32 h, const u32 *msg, i32 flags);
@@ -1153,6 +1152,7 @@ NET("close") i32 net_close(i32 h);
 NET("shutdown") i32 net_shutdown(i32 h, i32 how);
 NET("name") i32 net_name(i32 h, i32 peer, u8 *sa, u32 *lenp);  // the local or peer address
 NET("getopt") i32 net_getopt(i32 h, i32 level, i32 opt, u8 *val, u32 *lenp);
+NET("setopt") i32 net_setopt(i32 h, i32 level, i32 opt, const u8 *val, u32 len);
 NET("ioctl") i32 net_ioctl(i32 h, i32 op, i32 *argp);  // FIONREAD
 NET("resolve") i32 net_resolve(const char *name, i32 n, u8 *addr4);  // -> 0, or -errno
 NET("getaddrinfo") i32 net_getaddrinfo(const char *node, const char *service, const i32 *hint, u32 *out);
@@ -1190,6 +1190,7 @@ static i32 notsock(i32 fd) {
     u8 st[24] __attribute__((aligned(8)));
     return w_fd_fdstat_get(fd, st) ? -EBADF : -ENOTSOCK_;
 }
+static i32 nbflag(i32 fd) { return sock_nb(fd) ? MSG_DONTWAIT : 0; }
 // does the socket have what is asked (events: 1 read, 4 write)? An error or a hang-up is an answer too. EAGAIN if not
 static i32 would_block(i32 fd, i32 flags, i32 events) {
     if (!sock_nb(fd) && !(flags & MSG_DONTWAIT)) return 0;
@@ -1244,7 +1245,7 @@ EXPORT("__syscall_accept4") i32 sc_accept4(i32 fd, u8 *sa, u32 *lenp, i32 flags,
     if (would_block(fd, 0, 1)) return -EAGAIN_;
     i32 nfd = sock_fd();  // before the accept: no descriptor, the connection stays queued
     if (nfd < 0) return nfd;
-    i32 h = net_accept(hof(fd), sa, lenp);
+    i32 h = net_accept(hof(fd), sa, lenp, sock_nb(fd));
     if (h < 0) {
         w_fd_close(nfd);
         return h;
@@ -1263,13 +1264,13 @@ EXPORT("__syscall_connect") i32 sc_connect(i32 fd, const u8 *sa, i32 len, i32 a,
 EXPORT("__syscall_sendto") i32 sc_sendto(i32 fd, const u8 *p, i32 n, i32 flags, const u8 *addr, i32 alen) {
     if (!is_sock(fd)) return notsock(fd);
     if (would_block(fd, flags, 4)) return -EAGAIN_;
-    return net_sendto(hof(fd), p, n, flags, addr, alen);
+    return net_sendto(hof(fd), p, n, flags | nbflag(fd), addr, alen);
 }
 
 EXPORT("__syscall_recvfrom") i32 sc_recvfrom(i32 fd, u8 *p, i32 n, i32 flags, u8 *addr, u32 *alen) {
     if (!is_sock(fd)) return notsock(fd);
     if (would_block(fd, flags, 1)) return -EAGAIN_;
-    return net_recvfrom(hof(fd), p, n, flags, addr, alen);
+    return net_recvfrom(hof(fd), p, n, flags | nbflag(fd), addr, alen);
 }
 
 // sendmsg / recvmsg: the iovecs and msg_name are the host's to read and write; no control data (msg_controllen stays 0,
@@ -1278,14 +1279,14 @@ EXPORT("__syscall_sendmsg") i32 sc_sendmsg(i32 fd, const u32 *msg, i32 flags, i3
     (void)a, (void)b, (void)c;
     if (!is_sock(fd)) return notsock(fd);
     if (would_block(fd, flags, 4)) return -EAGAIN_;
-    return net_sendmsg(hof(fd), msg, flags);
+    return net_sendmsg(hof(fd), msg, flags | nbflag(fd));
 }
 
 EXPORT("__syscall_recvmsg") i32 sc_recvmsg(i32 fd, u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
     if (!is_sock(fd)) return notsock(fd);
     if (would_block(fd, flags, 1)) return -EAGAIN_;
-    return net_recvmsg(hof(fd), msg, flags);
+    return net_recvmsg(hof(fd), msg, flags | nbflag(fd));
 }
 
 EXPORT("__syscall_shutdown") i32 sc_shutdown(i32 fd, i32 how, i32 a, i32 b, i32 c, i32 d) {
@@ -1312,6 +1313,13 @@ EXPORT("__syscall_getsockopt") i32 sc_getsockopt(i32 fd, i32 level, i32 opt, u8 
     if (!is_sock(fd)) return notsock(fd);
     if (!val || !lenp) return -EFAULT_;
     return net_getopt(hof(fd), level, opt, val, lenp);  // the host's real value; ENOPROTOOPT for an option it has not
+}
+
+// setsockopt is a stub INSIDE pyodide.asm.wasm (it returns 0); the build (tools/patch_main.mjs) turns it into this import
+EXPORT("__syscall_setsockopt_host") i32 sc_setsockopt(i32 fd, i32 level, i32 opt, const u8 *val, u32 len, i32 a) {
+    (void)a;
+    if (!is_sock(fd)) return notsock(fd);
+    return net_setopt(hof(fd), level, opt, val, len);
 }
 
 // struct pollfd {int fd; short events, revents;}. Sockets are polled by the host, all in one call, with the timeout;
@@ -1398,7 +1406,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
-        i32 r = net_recv(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], 0);
+        i32 r = net_recvfrom(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], nbflag(fd), 0, 0);
         if (r < 0) {
             if (tot) break;
             return -r;
@@ -1416,12 +1424,13 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
-        i32 r = net_send(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1]);
+        i32 r = net_sendto(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1], nbflag(fd), 0, 0);
         if (r < 0) {
             if (tot) break;
             return -r;
         }
         tot += r;
+        if (r < (i32)iov[2 * k + 1]) break;
     }
     *nw = tot;
     return 0;

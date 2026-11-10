@@ -4,6 +4,7 @@ with `X` at once, so a test can tell "nothing yet" from "data" without sleeping 
 
 from __future__ import annotations
 
+import errno
 import socket
 import socketserver
 import threading
@@ -335,38 +336,51 @@ def test_getaddrinfo_lists_the_hosts_addresses(guest: Guest, port: int):
         "for kw in ({'flags': 0x4000}, {'type': socket.SOCK_RAW}, {'family': 99}, {'flags': socket.AI_NUMERICHOST}):\n"
         "    try: socket.getaddrinfo('localhost', 80, **kw)\n"
         "    except socket.gaierror as e: print(e.errno, end=' ')\n"
-        "for a in (('nosuch.invalid', 80), (None, None), ('127.0.0.1', 'nosuchservice')):\n"
+        "for a in ((None, None), ('127.0.0.1', 'nosuchservice')):\n"
         "    try: socket.getaddrinfo(*a)\n"
         "    except socket.gaierror as e: print(e.errno, end=' ')\n"
         "print()\n",
     )
     assert out[0] == f"{sorted(families)} {{(1, 6)}}"  # the host's families, stream, protocol 6
     assert out[1] == "(17, '', ('127.0.0.1', 53)) localhost [('0.0.0.0', 8080)]"
-    assert out[2] == "-1 -7 -6 -2 -2 -2 -8 "
+    assert out[2] == "-1 -7 -6 -2 -2 -8 "
 
 
-def test_names_services_protocols_and_reverse_lookups(guest: Guest, port: int):
+@pytest.mark.network  # a sandbox without DNS answers EAI_AGAIN
+def test_an_unknown_host_name_is_not_found(guest: Guest, port: int):
+    out = run(
+        guest,
+        port,
+        "try: socket.getaddrinfo('nosuch.invalid', 80)\nexcept socket.gaierror as e: print(e.errno)\n",
+    )
+    assert out == ["-2"]
+
+
+def test_services_protocols_and_numeric_names(guest: Guest, port: int):
     out = run(
         guest,
         port,
         "print(socket.getprotobyname('tcp'), socket.getprotobyname('udp'), socket.getprotobyname('icmp'))\n"
+        "print(socket.getprotobyname('udp'), socket.getprotobyname('tcp'))\n"
         "try: socket.getprotobyname('nosuchproto')\nexcept OSError: print('unknown protocol')\n"
         "print(socket.getservbyname('http'), socket.getservbyname('domain', 'udp'), socket.getservbyport(443))\n"
         "print(socket.getnameinfo(('127.0.0.1', 80), socket.NI_NUMERICHOST | socket.NI_NUMERICSERV))\n"
+        "print(socket.gethostbyname('localhost'))\n",
+    )
+    assert out == ["6 17 1", "17 6", "unknown protocol", "80 53 https", "('127.0.0.1', '80')", "127.0.0.1"]
+
+
+@pytest.mark.network  # the reverse lookups and NI_NAMEREQD ask a resolver
+def test_reverse_lookups(guest: Guest, port: int):
+    out = run(
+        guest,
+        port,
         "print(socket.getnameinfo(('127.0.0.1', 80), 0)[1])\n"
         "try: socket.getnameinfo(('10.255.255.1', 80), socket.NI_NAMEREQD)\n"
         "except socket.gaierror as e: print('NAMEREQD:', e.errno)\n"
-        "print(socket.gethostbyname('localhost'), socket.gethostbyaddr('127.0.0.1')[2])\n",
+        "print(socket.gethostbyaddr('127.0.0.1')[2])\n",
     )
-    assert out == [
-        "6 17 1",
-        "unknown protocol",
-        "80 53 https",
-        "('127.0.0.1', '80')",
-        "http",
-        "NAMEREQD: -2",
-        "127.0.0.1 ['127.0.0.1']",
-    ]
+    assert out == ["http", "NAMEREQD: -2", "['127.0.0.1']"]
 
 
 def test_ipv6_structures_are_written_and_read_right(guest: Guest, port: int):
@@ -412,3 +426,189 @@ def test_sockaddr_translation_round_trips():
     raw = Pyodide._sockaddr_bytes(v4)
     assert raw == b"\x02\x00\x00\x50\x0a\x01\x02\x03" + bytes(8)
     assert Pyodide._sockaddr_tuple(raw) == v4
+
+
+def test_a_non_blocking_send_never_waits(guest: Guest, port: int):
+    out = run(
+        guest,
+        port,
+        "a, b = socket.socketpair(); a.setblocking(False)\n"
+        "t = time.time(); n = a.send(b'x' * 10_000_000)\n"
+        "print('partial:', 0 < n < 10_000_000, 'quick:', time.time() - t < 20)\n"
+        "try:\n    while True: a.send(b'x' * 1_000_000)\nexcept BlockingIOError: print('full: EAGAIN')\n"
+        "a.setblocking(True)\n"
+        "try: a.send(b'y' * 10_000_000, socket.MSG_DONTWAIT)\nexcept BlockingIOError: print('MSG_DONTWAIT: EAGAIN')\n"
+        "try: a.sendmsg([b'y' * 100], [], socket.MSG_DONTWAIT)\nexcept BlockingIOError: print('sendmsg: EAGAIN')\n"
+        "b.setblocking(False)\n"
+        "got = 0\n"
+        "try:\n    while True: got += len(b.recv(1 << 20))\nexcept BlockingIOError: print('drained:', got > 0)\n",
+    )
+    assert out == [
+        "partial: True quick: True",
+        "full: EAGAIN",
+        "MSG_DONTWAIT: EAGAIN",
+        "sendmsg: EAGAIN",
+        "drained: True",
+    ]
+
+
+def test_setsockopt_is_real(guest: Guest, port: int):
+    out = run(
+        guest,
+        port,
+        "s = socket.socket()\n"
+        "print(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))\n"
+        "s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n"
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)\n"
+        "print(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY),"
+        " s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE))\n"
+        "try: s.setsockopt(socket.SOL_SOCKET, 9999, 1)\nexcept OSError as e: print(e.errno == errno.ENOPROTOOPT)\n"
+        "try: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n"
+        "except OSError as e: print('udp:', e.errno)\n",
+    )
+    assert out[:3] == ["0", "1 1", "True"]
+    assert out[3].startswith("udp: ")
+
+
+def test_errors_are_emscriptens_numbers(guest: Guest, port: int):
+    out = run(
+        guest,
+        port,
+        "print(errno.EOPNOTSUPP == errno.ENOTSUP == 138)\n"
+        "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "try: u.listen(1)\nexcept OSError as e: print('listen on UDP:', e.errno == errno.EOPNOTSUPP)\n"
+        "try: u.sendto(b'x', socket.MSG_OOB, ('127.0.0.1', 9))\n"
+        "except OSError as e: print('MSG_OOB on UDP:', e.errno == errno.EOPNOTSUPP)\n",
+    )
+    assert out == ["True", "listen on UDP: True", "MSG_OOB on UDP: True"]
+
+
+def test_bad_guest_pointers_and_sizes_are_errors_not_traps(guest: Guest, port: int):
+    out = run(
+        guest,
+        port,
+        "import ctypes, struct\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "a, b = socket.socketpair(); a.sendall(b'hello'); time.sleep(0.1)\n"
+        "buf = ctypes.create_string_buffer(64)\n"
+        "print('huge length:', libc.recv(b.fileno(), buf, ctypes.c_size_t(2**32 - 1), 0x40) in (5, -1))\n"
+        "def msg(iov, iovlen):\n"
+        "    return ctypes.create_string_buffer(struct.pack('<7I', 0, 0, iov, iovlen, 0, 0, 0))\n"
+        "ctypes.set_errno(0)\n"
+        "print('iovlen:', libc.recvmsg(b.fileno(), msg(ctypes.addressof(buf), 0x10000), 0),"
+        " ctypes.get_errno() == errno.EMSGSIZE)\n"
+        "a.sendall(b'again'); time.sleep(0.1)\n"
+        "print('wild iov:', libc.recvmsg(b.fileno(), msg(0x7FFFFFF0, 3), 0), ctypes.get_errno() == errno.EFAULT)\n"
+        "print('wild buffer:', libc.send(a.fileno(), 0x7FFFFFF0, 10, 0), ctypes.get_errno() == errno.EFAULT)\n"
+        "print('negative length:', libc.send(a.fileno(), buf, -5, 0), ctypes.get_errno() == errno.EFAULT)\n"
+        "print('alive:', socket.gethostbyname('127.0.0.1'))\n",
+    )
+    assert out == [
+        "huge length: True",
+        "iovlen: -1 True",
+        "wild iov: -1 True",
+        "wild buffer: -1 True",
+        "negative length: -1 True",
+        "alive: 127.0.0.1",
+    ]
+
+
+def test_a_wild_string_pointer_is_a_name_error(guest: Guest, port: int):
+    """libc's getaddrinfo is reached through ctypes (the dynamic build gets it as an import, not an export)."""
+    out = run(
+        guest,
+        port,
+        "import ctypes, struct\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "if not hasattr(libc, 'getaddrinfo'): print('SKIP'); raise SystemExit\n"
+        "res = ctypes.c_void_p()\n"
+        "print('past the end:', libc.getaddrinfo(ctypes.c_void_p(0x7FFFFF00), None, None, ctypes.byref(res)))\n"
+        "sa = bytes([10, 0, 0, 80]) + (0x7FFFFFFF).to_bytes(4, 'big') + bytes(15) + b'\\1' + bytes(4)\n"
+        "host, serv = ctypes.create_string_buffer(64), ctypes.create_string_buffer(16)\n"
+        "print('flow label:', libc.getnameinfo(sa, 28, host, 64, serv, 16, 3), host.value)\n",
+    )
+    if out == ["SKIP"]:
+        pytest.skip("getaddrinfo is not an export of the main module in this build (dynamic): not reachable by ctypes")
+    assert out == ["past the end: -11", "flow label: 0 b'::1'"]
+
+
+def test_a_second_run_on_one_object_sees_a_fresh_guest(flavor: str, capfd: pytest.CaptureFixture[str]):
+    from pyodide_wasmtime import Pyodide
+
+    code = "import socket; print(socket.getprotobyname('udp'), socket.getprotobyname('tcp'))"
+    with Pyodide(flavor) as py:
+        for _ in range(2):
+            assert py.run(code) == 0
+            py.close()  # everything the host remembers of the guest goes
+    assert capfd.readouterr().out == "17 6\n17 6\n"
+
+
+def test_the_accessors_check_the_memory():
+    from pyodide_wasmtime._host import GuestFault, Pyodide
+
+    class Memory:
+        def __init__(self) -> None:
+            self.data = bytearray(100)
+
+        def data_len(self, _store: object) -> int:
+            return len(self.data)
+
+        def read(self, _store: object, start: int, stop: int) -> bytes:
+            return bytes(self.data[start:stop])
+
+        def write(self, _store: object, data: bytes, start: int) -> None:
+            self.data[start : start + len(data)] = data
+
+    py = Pyodide.__new__(Pyodide)
+    py.cur, py.memory = [None], Memory()
+    py._wr(10, b"abc\0")
+    assert py._rd(10, 3) == b"abc" and py._cstr(10) == "abc"
+    for a, n in [(-1, 4), (98, 3), (0, -1), (1 << 32, 1), (-(1 << 31), 1), (2**31, 0 + 1)]:
+        with pytest.raises(GuestFault):
+            py._rd(a, n)
+    with pytest.raises(GuestFault):
+        py._wr(99, b"ab")
+    py.memory.data[96:100] = b"abcd"  # no NUL before the end of the memory
+    with pytest.raises(GuestFault):
+        py._cstr(96)
+    py.memory.data[:] = b"x" * 100
+    with pytest.raises(GuestFault):
+        py._cstr(1)  # no NUL at all
+
+
+def test_the_net_wrapper_turns_every_exception_into_an_errno():
+    from pyodide_wasmtime._host import GuestFault, Pyodide
+
+    py = Pyodide.__new__(Pyodide)
+    py.cur = []
+
+    def boom(kind: type[BaseException]):
+        def f(*_a: object) -> int:
+            raise kind("x")
+
+        return f
+
+    call = lambda name, kind: py._wrap_net(name, boom(kind))(None)  # noqa: E731
+    assert call("bind", GuestFault) == -21
+    assert call("bind", ValueError) == -29
+    assert call("bind", OverflowError) == -29
+    assert call("bind", IndexError) == -29
+    assert call("bind", OSError) == -29  # an OSError without an errno is EIO
+    assert call("getaddrinfo", GuestFault) == -11 and call("getaddrinfo", KeyError) == -4
+    assert call("protobyname", GuestFault) == 0
+    assert py.cur == []
+
+
+def test_host_errors_are_translated_by_name_on_every_os():
+    from pyodide_wasmtime._host import guest_errno
+
+    expect = {10035: "EAGAIN", 10036: "EINPROGRESS", 10061: "ECONNREFUSED", 10054: "ECONNRESET", 10053: "ECONNABORTED",
+              10060: "ETIMEDOUT", 10048: "EADDRINUSE", 10049: "EADDRNOTAVAIL", 10051: "ENETUNREACH",
+              10065: "EHOSTUNREACH", 10057: "ENOTCONN", 10056: "EISCONN", 10040: "EMSGSIZE", 10047: "EAFNOSUPPORT",
+              10045: "EOPNOTSUPP"}  # fmt: skip
+    for wsa, name in expect.items():
+        assert guest_errno(wsa) == guest_errno(getattr(errno, name)), name
+    assert guest_errno(10045) == guest_errno(errno.ENOTSUP) == 138
+    assert guest_errno(errno.EWOULDBLOCK) == guest_errno(errno.EAGAIN) == 6
+    assert guest_errno(errno.ECONNREFUSED) == 14 and guest_errno(errno.EINPROGRESS) == 26
+    assert guest_errno(999999) == guest_errno(None) == 29  # unknown: EIO
