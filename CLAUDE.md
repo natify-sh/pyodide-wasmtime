@@ -74,7 +74,7 @@ Report:      files changed, commands run with output, docs updated, open questio
 * When unsure between two designs, implement neither: report both with their costs.
 
 ## Working on the code
-* `wasm/adapter.c` is the glue as wasm. Wasmtime's adapter rules hold (checked by `tests/test_shape.py`): **no data section** (`-fno-jump-tables`, names built from integer constants), **no stack of its own** (`-z stack-size=0`, it runs on Pyodide's stack),
+* `wasm/adapter.c` is the glue as wasm: one translation unit that includes the sections in `wasm/adapter/*.h` (header-only, `common.h` first; `tools/build_adapter.sh` compiles `adapter.c` only). Wasmtime's adapter rules hold (checked by `tests/test_shape.py`): **no data section** (`-fno-jump-tables`, names built from integer constants), **no stack of its own** (`-z stack-size=0`, it runs on Pyodide's stack),
   state in wasm globals pointing at blocks from the main module's `malloc`. It imports only WASI, the main module's memory/table/stack pointer/allocator and the host's `loader`/`net`/`aux`.
 * `src/pyodide_wasmtime/_host.py` (`Pyodide`): `_start` builds either flavor; `run()` executes code in the guest's `__main__` through a wrapper that turns `SystemExit` into a status (Emscripten's `exit()` ends in `unreachable`).
   `_engine.py` is the one engine (exceptions, function references, GC), the machine-code cache in the user's cache dir, and `wasm-opt.wasm` run in-process. `_wasm.py` is the WAT of the dynamic build; import types come from `Module.imports`
