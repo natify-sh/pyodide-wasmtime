@@ -13,10 +13,12 @@ Two builds of the same sources, one `Pyodide` class:
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
 import os
+import re
 import select
 import shutil
 import socket
@@ -27,6 +29,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +59,135 @@ WASI_ERRNO = {
         "NOTEMPTY NOTRECOVERABLE NOTSOCK NOTSUP NOTTY NXIO OVERFLOW OWNERDEAD PERM PIPE PROTO PROTONOSUPPORT "
         "PROTOTYPE RANGE ROFS SPIPE SRCH STALE TIMEDOUT TXTBSY XDEV NOTCAPABLE".split()
     )
+}
+
+# musl's (Linux's) numbers, which the guest uses, by the NAME of the host's constant; the host's own numbers differ
+# The guest's errno numbers are Emscripten's (system/lib/libc/musl/arch/emscripten/bits/errno.h): WASI's for the
+# names WASI has, and its own 137.. for the rest; ENOTSUP is EOPNOTSUPP = 138 (not WASI's NOTSUP, 58).
+GUEST_ERRNO = {
+    **WASI_ERRNO,
+    "NOTSUP": 138,
+    "OPNOTSUPP": 138,
+    "SOCKTNOSUPPORT": 137,
+    "PFNOSUPPORT": 139,
+    "SHUTDOWN": 140,
+    "HOSTDOWN": 142,
+    "WOULDBLOCK": WASI_ERRNO["AGAIN"],
+    "DEADLOCK": WASI_ERRNO["DEADLK"],
+}
+ESOCKTNOSUPPORT, EOPNOTSUPP = GUEST_ERRNO["SOCKTNOSUPPORT"], GUEST_ERRNO["OPNOTSUPP"]
+# Windows reports socket errors as WSAE* numbers (and its errno.errorcode has them only there): by number, so that the
+# translation is the same on every OS
+WSA_ERRNO = {
+    10004: "INTR", 10009: "BADF", 10013: "ACCES", 10014: "FAULT", 10022: "INVAL", 10024: "MFILE",
+    10035: "AGAIN", 10036: "INPROGRESS", 10037: "ALREADY", 10038: "NOTSOCK", 10039: "DESTADDRREQ",
+    10040: "MSGSIZE", 10041: "PROTOTYPE", 10042: "NOPROTOOPT", 10043: "PROTONOSUPPORT",
+    10044: "SOCKTNOSUPPORT", 10045: "OPNOTSUPP", 10046: "PFNOSUPPORT", 10047: "AFNOSUPPORT",
+    10048: "ADDRINUSE", 10049: "ADDRNOTAVAIL", 10050: "NETDOWN", 10051: "NETUNREACH", 10052: "NETRESET",
+    10053: "CONNABORTED", 10054: "CONNRESET", 10055: "NOBUFS", 10056: "ISCONN", 10057: "NOTCONN",
+    10058: "SHUTDOWN", 10060: "TIMEDOUT", 10061: "CONNREFUSED", 10064: "HOSTDOWN", 10065: "HOSTUNREACH",
+}  # fmt: skip
+
+
+def guest_errno(code: int | None) -> int:
+    """A host errno (any OS: by its name, or the WSAE number) -> the guest's positive errno; EIO, logged, if unknown."""
+    name = WSA_ERRNO.get(code or 0) or errno.errorcode.get(code or 0, "EIO")[1:]
+    if name not in GUEST_ERRNO:
+        log.warning("[net] host error %r has no guest errno: EIO", code)
+        return GUEST_ERRNO["IO"]
+    return GUEST_ERRNO[name]
+
+
+class GuestFault(Exception):
+    """A guest pointer or length outside its memory: EFAULT, never a trap of the host."""
+
+
+MSG_FLAGS = {
+    1: "MSG_OOB",
+    2: "MSG_PEEK",
+    4: "MSG_DONTROUTE",
+    0x20: "MSG_TRUNC",
+    0x40: "MSG_DONTWAIT",
+    0x80: "MSG_EOR",
+    0x100: "MSG_WAITALL",
+    0x4000: "MSG_NOSIGNAL",
+    0x8000: "MSG_MORE",
+}
+SOCK_LEVELS = {1: "SOL_SOCKET", 0: "IPPROTO_IP", 6: "IPPROTO_TCP", 41: "IPPROTO_IPV6"}
+SOCK_OPTIONS = {
+    **{
+        (1, n): v
+        for n, v in enumerate(
+            "SO_DEBUG SO_REUSEADDR SO_TYPE SO_ERROR SO_DONTROUTE SO_BROADCAST SO_SNDBUF SO_RCVBUF SO_KEEPALIVE "
+            "SO_OOBINLINE".split(),
+            1,
+        )
+    },
+    (1, 13): "SO_LINGER",
+    (1, 15): "SO_REUSEPORT",
+    (1, 18): "SO_RCVLOWAT",
+    (1, 19): "SO_SNDLOWAT",
+    (1, 30): "SO_ACCEPTCONN",
+    (0, 1): "IP_TOS",
+    (0, 2): "IP_TTL",
+    (0, 33): "IP_MULTICAST_TTL",
+    (0, 34): "IP_MULTICAST_LOOP",
+    **{
+        (6, n): v
+        for n, v in enumerate("TCP_NODELAY TCP_MAXSEG TCP_CORK TCP_KEEPIDLE TCP_KEEPINTVL TCP_KEEPCNT".split(), 1)
+    },
+    (41, 16): "IPV6_UNICAST_HOPS",
+    (41, 18): "IPV6_MULTICAST_HOPS",
+    (41, 19): "IPV6_MULTICAST_LOOP",
+    (41, 26): "IPV6_V6ONLY",
+}
+AI_FLAGS = {
+    1: "AI_PASSIVE",
+    2: "AI_CANONNAME",
+    4: "AI_NUMERICHOST",
+    8: "AI_V4MAPPED",
+    16: "AI_ALL",
+    32: "AI_ADDRCONFIG",
+    1024: "AI_NUMERICSERV",
+}
+NI_FLAGS = {1: "NI_NUMERICHOST", 2: "NI_NUMERICSERV", 4: "NI_NOFQDN", 8: "NI_NAMEREQD", 16: "NI_DGRAM"}
+EAI_CODES = {
+    getattr(socket, "EAI_" + n): code
+    for n, code in (
+        ("BADFLAGS", -1),
+        ("NONAME", -2),
+        ("AGAIN", -3),
+        ("FAIL", -4),
+        ("FAMILY", -6),
+        ("SOCKTYPE", -7),
+        ("SERVICE", -8),
+        ("MEMORY", -10),
+        ("SYSTEM", -11),
+        ("OVERFLOW", -12),
+        ("ADDRFAMILY", -2),
+        ("NODATA", -2),
+    )  # fmt: skip
+    if hasattr(socket, "EAI_" + n)
+}
+# /etc/services of the guest (musl reads it for getservbyname/getservbyport), and getaddrinfo's fallback
+SERVICES = {
+    (n, pr): port
+    for n, port, prs in (
+        ("echo", 7, "tcp udp"),
+        ("ftp", 21, "tcp"),
+        ("ssh", 22, "tcp"),
+        ("telnet", 23, "tcp"),
+        ("smtp", 25, "tcp"),
+        ("domain", 53, "tcp udp"),
+        ("http", 80, "tcp"),
+        ("pop3", 110, "tcp"),
+        ("ntp", 123, "udp"),
+        ("imap", 143, "tcp"),
+        ("https", 443, "tcp"),
+        ("imaps", 993, "tcp"),
+        ("pop3s", 995, "tcp"),
+    )  # fmt: skip
+    for pr in prs.split()
 }
 
 
@@ -114,10 +246,34 @@ def ca_bundle() -> bytes:
     return out
 
 
+class MainExports(Mapping):
+    """The main module's symbols as dlsym and the GOT see them: its (lazy) exports, those of the adapter in the
+    dynamic build (`extra`), and not the JavaScript bridge's stubs (`hidden`)."""
+
+    def __init__(self, base: Mapping) -> None:
+        self.base, self.extra, self.hidden = base, {}, set()
+
+    def __getitem__(self, name: str) -> Any:
+        if name in self.hidden:
+            raise KeyError(name)
+        if name in self.extra:
+            return self.extra[name]
+        return self.base[name]
+
+    def __iter__(self) -> Iterator[str]:
+        for n in self.base:
+            if n not in self.hidden and n not in self.extra:
+                yield n
+        yield from self.extra
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
 class Pyodide:
     """One Python (Pyodide's CPython) in wasm, run by wasmtime.
 
-    >>> py = Pyodide()                       # the fused build from the package's data
+    >>> py = Pyodide()                       # the dynamic build from the package's data (fused if only that is there)
     >>> py.run("print(1 + 1)")               # 0 if the code ran, -1 if it raised (the traceback is on stderr)
 
     ``site``: a folder (or several) copied into the guest's ``site-packages`` (a wheel unpacked, ``micropip``...);
@@ -143,7 +299,9 @@ class Pyodide:
         self.data = data_dir(data)
         have = available_flavors(self.data)
         if flavor is None:
-            flavor = os.environ.get("PYODIDE_WASMTIME_FLAVOR") or (have[0] if have else "fused")
+            flavor = os.environ.get("PYODIDE_WASMTIME_FLAVOR") or (
+                "dynamic" if "dynamic" in have else (have[0] if have else "dynamic")
+            )
         if flavor not in FLAVORS:
             raise ValueError(f"flavor must be one of {FLAVORS}, not {flavor!r}")
         if flavor not in have:
@@ -169,6 +327,7 @@ class Pyodide:
         self._dlreason = ""  # why the last instantiate failed
         self.socks: dict = {}
         self.netlog: list[str] = []
+        self.protoents: dict[str, int] = {}  # getprotobyname's answers, by name (guest addresses)
         self.lazy: list[str] = []
         self.converted = 0  # modules whose legacy exceptions the loader converted at dlopen
         self.summary = ""
@@ -193,11 +352,15 @@ class Pyodide:
             (root / guest.lstrip("/")).mkdir(parents=True, exist_ok=True)
         (root / "etc" / "ssl").mkdir(parents=True)
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
+        (root / "etc" / "services").write_text("".join(f"{n} {p}/{pr}\n" for (n, pr), p in SERVICES.items()))
         shutil.copy(Path(__file__).with_name("guest") / "hostnet.py", sp)
         # the frozen `encodings` package looks in /lib/python3.15/encodings, which does not exist: the stdlib is the
         # zip (Pyodide's JavaScript sets this up); without it every codec but the frozen ones is missing
+        # Pyodide's _socket was built without the constant SO_REUSEADDR (musl's value is 2), which asyncio and
+        # socketserver look up; setsockopt itself is real (tools/patch_main.mjs)
         (sp / "sitecustomize.py").write_text(
             f"import encodings\nencodings.__path__.append('/lib/python{PYVER.replace('.', '')}.zip/encodings')\n"
+            "import _socket\n_socket.SO_REUSEADDR = 2\n"
         )
 
     def _drop_stubs(self) -> None:
@@ -212,7 +375,7 @@ class Pyodide:
         answered = set(_wasm.export_names(adapter_path.read_bytes())) | set(_wasm.export_names(wasm)) | {_wasm.TRAMP}
         for mod, name, kind in _wasm.import_names(wasm):
             if mod == "env" and kind == 0 and name not in answered:
-                exports.pop(name, None)
+                exports.hidden.add(name)
 
     # ------------------------------------------------------------------ the loader's host interface
     # Five operations a wasm module cannot do itself, because the host holds the instances and their exports by
@@ -223,11 +386,22 @@ class Pyodide:
     # adapter's exports), then the libraries loaded RTLD_GLOBAL, and, when the function is first called (the glue's
     # lazy stubs), the libraries of the dlopen call's own scope (its NEEDED libraries; the last one wins) and last
     # the module's own exports.
+    def _span(self, a: int, n: int) -> int:
+        """The guest address a (wasmtime passes i32 as SIGNED: -1 is 0xFFFFFFFF) after checking that [a, a+n) lies in
+        the memory; n is a size_t, so a negative one is a huge one. GuestFault (EFAULT) otherwise."""
+        a = a + (1 << 32) if a < 0 else a
+        n = n + (1 << 32) if n < 0 else n
+        if a >> 32 or n >> 32 or a + n > self.memory.data_len(self.cur[-1]):
+            raise GuestFault(f"{a:#x}+{n:#x} is outside the memory")
+        return a
+
     def _rd(self, a: int, n: int) -> bytes:
-        return bytes(self.memory.read(self.cur[-1], a, a + n))
+        a = self._span(a, n)
+        return bytes(self.memory.read(self.cur[-1], a, a + (n + (1 << 32) if n < 0 else n)))
 
     def _wr(self, a: int, data: bytes) -> None:
-        self.memory.write(self.cur[-1], bytes(data), a)
+        data = bytes(data)
+        self.memory.write(self.cur[-1], data, self._span(a, len(data)))
 
     def _env_func(self, name: str, scope: int = 0, own: dict | None = None) -> Any:
         wt = self._wt
@@ -461,55 +635,285 @@ class Pyodide:
         return 0
 
     # ------------------------------------------------------------------ the host's sockets
+    # The guest passes its own structures (sockaddr, msghdr, addrinfo, option values) as pointers and the host reads
+    # and writes them, so the adapter stays small. The numbers are musl's (Linux's); the host's differ (macOS,
+    # Windows), so options, flags and error codes are translated by NAME.
     @staticmethod
     def _werr(exc: OSError) -> int:
-        """A host OSError -> -errno in WASI's (= Emscripten's) numbering."""
-        name = errno.errorcode.get(getattr(exc, "errno", None) or 0, "EIO")[1:]
-        return -WASI_ERRNO.get(name, WASI_ERRNO["IO"])
+        """A host OSError -> -errno in the guest's (Emscripten's) numbering."""
+        return -guest_errno(getattr(exc, "errno", None))
 
-    def _n_socket(self, domain: int, type_: int, proto: int) -> int:
+    def _cstr(self, p: int) -> str | None:
+        """The NUL-terminated string at p (at most 4096 bytes: GuestFault if there is no end inside the memory)."""
+        if not p:
+            return None
+        out = bytearray()
+        for i in range(4096):
+            b = self._rd(p + i, 1)  # GuestFault past the end of memory
+            if b == b"\0":
+                return out.decode("utf-8", "replace")
+            out += b
+        raise GuestFault("string too long")
+
+    def _sockaddr(self, s: socket.socket, p: int, n: int) -> tuple:
+        """The sockaddr at p (n bytes) as the host's address tuple for socket s."""
+        want = 2 if s.family == socket.AF_INET else 10
+        raw = self._rd(p, min(n, 128)) if p and n >= 2 else b""
+        if len(raw) < 2:
+            raise OSError(errno.EINVAL, "bad sockaddr")
+        if int.from_bytes(raw[:2], "little") != want:
+            raise OSError(errno.EAFNOSUPPORT, "address family")
+        if len(raw) < (16 if want == 2 else 28):
+            raise OSError(errno.EINVAL, "short sockaddr")
+        return self._sockaddr_tuple(raw)
+
+    @staticmethod
+    def _sockaddr_tuple(raw: bytes) -> tuple:
+        port = int.from_bytes(raw[2:4], "big")
+        if raw[0] == 2:
+            return socket.inet_ntop(socket.AF_INET, raw[4:8]), port
+        return (
+            socket.inet_ntop(socket.AF_INET6, raw[8:24]),
+            port,
+            int.from_bytes(raw[4:8], "big") & 0xFFFFF,  # the flow label is 20 bits
+            int.from_bytes(raw[24:28], "little"),
+        )
+
+    @staticmethod
+    def _sockaddr_bytes(addr: tuple) -> bytes:
+        """The host's address tuple as a sockaddr_in (an IPv4 address) or sockaddr_in6 (an IPv6 one, with the flow
+        label and scope id if the tuple has them); ValueError for any other shape."""
+        if not isinstance(addr, tuple) or len(addr) not in (2, 4) or not isinstance(addr[0], str):
+            raise ValueError(f"not an internet address: {addr!r}")
+        port = int(addr[1]).to_bytes(2, "big")
+        if len(addr) == 2 and ":" not in addr[0]:
+            return b"\2\0" + port + socket.inet_aton(addr[0]) + bytes(8)
+        flow, scope = (int(addr[2]), int(addr[3])) if len(addr) == 4 else (0, 0)
+        ip = socket.inet_pton(socket.AF_INET6, addr[0].split("%")[0])
+        return b"\x0a\0" + port + (flow & 0xFFFFF).to_bytes(4, "big") + ip + (scope & 0xFFFFFFFF).to_bytes(4, "little")
+
+    def _sockaddr_out(self, sa: int, lenp: int, addr: tuple | None) -> None:
+        """Write an address to the caller's buffer (sa, *lenp = its size); *lenp becomes the real size (0: none)."""
+        if not sa or not lenp:
+            return
         try:
-            s = socket.socket(
-                {2: socket.AF_INET, 10: socket.AF_INET6}[domain], {1: socket.SOCK_STREAM, 2: socket.SOCK_DGRAM}[type_]
-            )
-        except (KeyError, OSError) as e:
-            return self._werr(e) if isinstance(e, OSError) else -WASI_ERRNO["AFNOSUPPORT"]
+            raw = self._sockaddr_bytes(addr) if addr else b""
+        except (ValueError, OSError):  # a shape no internet address has (a host that answers oddly): no address
+            raw = b""
+        cap = int.from_bytes(self._rd(lenp, 4), "little")
+        self._wr(sa, raw[:cap])
+        self._wr(lenp, len(raw).to_bytes(4, "little"))
+
+    @staticmethod
+    def _msg_flags(flags: int) -> int:
+        """musl's MSG_* bits -> the host's. DONTWAIT is the adapter's business, NOSIGNAL is moot (no SIGPIPE here)."""
+        out = 0
+        for bit, name in MSG_FLAGS.items():
+            if flags & bit:
+                if name == "MSG_DONTWAIT":  # the call is made non-blocking instead (_nonblocking)
+                    flags &= ~bit
+                    continue
+                v = getattr(socket, name, None)
+                if v is None and name != "MSG_NOSIGNAL":
+                    raise OSError(errno.EOPNOTSUPP, name)
+                out |= v or 0
+                flags &= ~bit
+        if flags:
+            raise OSError(errno.EOPNOTSUPP, "flags")
+        return out
+
+    def _new_handle(self, s: socket.socket) -> int:
         h = max(self.socks, default=0) + 1
         self.socks[h] = s
         return h
 
-    def _n_connect(self, h: int, family: int, port: int, ap: int) -> int:
-        ip = socket.inet_ntop(
-            socket.AF_INET6 if family == 10 else socket.AF_INET, self._rd(ap, 16 if family == 10 else 4)
-        )
+    def _n_socket(self, domain: int, type_: int, proto: int) -> int:
+        if domain not in (2, 10):
+            return -GUEST_ERRNO["AFNOSUPPORT"]
+        if type_ not in (1, 2):
+            return -ESOCKTNOSUPPORT
+        if proto not in (0, 6 if type_ == 1 else 17):
+            return -GUEST_ERRNO["PROTONOSUPPORT"]
         try:
-            self.socks[h].connect((ip, port))
+            s = socket.socket(
+                socket.AF_INET if domain == 2 else socket.AF_INET6,
+                socket.SOCK_STREAM if type_ == 1 else socket.SOCK_DGRAM,
+            )
         except OSError as e:
-            self.netlog.append(f"socket connect {ip}:{port} -> {e}")
             return self._werr(e)
-        self.netlog.append(f"socket connect {ip}:{port}")
+        return self._new_handle(s)
+
+    def _n_bind(self, h: int, sa: int, n: int) -> int:
+        s = self.socks[h]
+        try:
+            s.bind(self._sockaddr(s, sa, n))
+        except OSError as e:
+            return self._werr(e)
         return 0
 
-    def _n_send(self, h: int, p: int, n: int) -> int:
+    def _n_listen(self, h: int, backlog: int) -> int:
         try:
-            return self.socks[h].send(self._rd(p, n))
+            self.socks[h].listen(backlog if backlog >= 0 else socket.SOMAXCONN)
+        except OSError as e:
+            return self._werr(e)
+        return 0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _nonblocking(s: socket.socket, on: int):
+        """The guest asked for a call that must not wait (a non-blocking socket, MSG_DONTWAIT): the host socket, which
+        is blocking otherwise, is not for the length of the call."""
+        if on:
+            s.setblocking(False)
+        try:
+            yield
+        finally:
+            if on:
+                s.setblocking(True)
+
+    def _n_accept(self, h: int, sa: int, lenp: int, nb: int) -> int:
+        try:
+            with self._nonblocking(self.socks[h], nb):
+                conn, addr = self.socks[h].accept()
+            conn.setblocking(True)
+        except OSError as e:
+            return self._werr(e)
+        self._sockaddr_out(sa, lenp, addr)
+        return self._new_handle(conn)
+
+    def _n_connect(self, h: int, sa: int, n: int, nb: int) -> int:
+        """A non-blocking socket starts the connection and answers EINPROGRESS; it completes in the background (poll
+        for POLLOUT, then SO_ERROR), as in the kernel. The host socket itself stays blocking."""
+        s = self.socks[h]
+        try:
+            addr = self._sockaddr(s, sa, n)
+            if nb:
+                s.setblocking(False)
+                try:
+                    err = s.connect_ex(addr)
+                finally:
+                    s.setblocking(True)
+                if err:
+                    raise OSError(errno.EINPROGRESS if err == 10035 else err, "connect")  # Windows: WSAEWOULDBLOCK
+            else:
+                s.connect(addr)
+        except OSError as e:
+            self.netlog.append(f"socket connect -> {e}")
+            return self._werr(e)
+        self.netlog.append(f"socket connect {addr[0]}:{addr[1]}")
+        return 0
+
+    def _n_sendto(self, h: int, p: int, n: int, flags: int, sa: int, salen: int) -> int:
+        s = self.socks[h]
+        try:
+            hf = self._msg_flags(flags)
+            data = self._rd(p, n)
+            with self._nonblocking(s, flags & 0x40):  # a partial count, or EAGAIN when nothing fits
+                if sa:
+                    return s.sendto(data, hf, self._sockaddr(s, sa, salen))
+                return s.send(data, hf)
         except OSError as e:
             return self._werr(e)
 
-    def _n_recv(self, h: int, p: int, n: int, peek: int) -> int:
+    @staticmethod
+    def _recv(s: socket.socket, n: int, flags: int) -> tuple[bytes, tuple | None, int, int]:
+        """-> (data cut to n, source address, the size to return, msg_flags). A datagram is read whole, so that a
+        short buffer truncates it (MSG_TRUNC in the flags, and in the result if asked) as the kernel does."""
+        hf = Pyodide._msg_flags(flags & ~0x20)  # MSG_TRUNC is applied here
+        n = min(n + (1 << 32) if n < 0 else n, 1 << 20)  # a size_t; a stream read may return less than asked
+        with Pyodide._nonblocking(s, flags & 0x40):
+            if s.type == socket.SOCK_DGRAM:
+                data, addr = s.recvfrom(65536, hf)
+                return data[:n], addr, (len(data) if flags & 0x20 else min(n, len(data))), 0x20 if len(data) > n else 0
+            data, addr = s.recvfrom(n, hf)
+        return data, addr, len(data), 0
+
+    def _n_recvfrom(self, h: int, p: int, n: int, flags: int, sa: int, lenp: int) -> int:
         try:
-            data = self.socks[h].recv(n, socket.MSG_PEEK if peek else 0)
+            data, addr, ret, _ = self._recv(self.socks[h], n, flags)
         except OSError as e:
             return self._werr(e)
         self._wr(p, data)
-        return len(data)
+        self._sockaddr_out(sa, lenp, addr)
+        return ret
+
+    def _msghdr(self, msg: int) -> tuple[int, int, list[tuple[int, int]], int]:
+        """struct msghdr of wasm32 (name, namelen, iov, iovlen, control, controllen, flags) -> name, namelen, the
+        iovecs as (base, len), controllen"""
+        name, namelen, iov, iovlen, _ctl, ctllen, _fl = struct.unpack("<7I", self._rd(msg, 28))
+        if iovlen > 1024:  # IOV_MAX: refused before anything is read
+            raise OSError(errno.EMSGSIZE, "iovlen")
+        return name, namelen, list(struct.iter_unpack("<II", self._rd(iov, 8 * iovlen))), ctllen
+
+    def _n_sendmsg(self, h: int, msg: int, flags: int) -> int:
+        s = self.socks[h]
+        try:
+            name, namelen, iovs, ctllen = self._msghdr(msg)
+            if ctllen:  # SCM_RIGHTS, SCM_CREDENTIALS...: nothing can carry them to the host
+                return -EOPNOTSUPP
+            hf = self._msg_flags(flags)
+            data = b"".join(self._rd(b, n) for b, n in iovs)
+            with self._nonblocking(s, flags & 0x40):
+                if name:
+                    return s.sendto(data, hf, self._sockaddr(s, name, namelen))
+                return s.send(data, hf)
+        except OSError as e:
+            return self._werr(e)
+
+    def _n_recvmsg(self, h: int, msg: int, flags: int) -> int:
+        name, _namelen, iovs, _ctllen = self._msghdr(msg)
+        try:
+            data, addr, ret, mflags = self._recv(self.socks[h], sum(n for _, n in iovs), flags)
+        except OSError as e:
+            return self._werr(e)
+        pos = 0
+        for b, n in iovs:  # every buffer, in order
+            self._wr(b, data[pos : pos + n])
+            pos += n
+        if name:
+            self._sockaddr_out(name, msg + 4, addr)
+        else:
+            self._wr(msg + 4, bytes(4))
+        self._wr(msg + 20, struct.pack("<II", 0, mflags))  # msg_controllen: no ancillary data; msg_flags
+        return ret
+
+    def _poll(self, socks: list, events: list[int], timeout_ms: int) -> list[int]:
+        """revents (POLLIN 1, PRI 2, OUT 4, ERR 8, HUP 16, NVAL 32) of the sockets (None: a closed handle)."""
+        t = None if timeout_ms < 0 else timeout_ms / 1000
+        live = [(i, s) for i, s in enumerate(socks) if s is not None and s.fileno() >= 0]
+        out = [32] * len(socks)
+        if not hasattr(select, "poll"):  # Windows: select(); an error condition is all its third set can say
+            rd, wr, ex = select.select(
+                [s for i, s in live if events[i] & 1], [s for i, s in live if events[i] & 4], [s for _, s in live], t
+            )
+            for i, s in live:
+                out[i] = (1 if s in rd else 0) | (4 if s in wr else 0) | (8 if s in ex else 0)
+            return out
+        masks: dict[int, int] = {}
+        for i, s in live:
+            ev = events[i]
+            masks[s.fileno()] = masks.get(s.fileno(), 0) | (
+                (select.POLLIN if ev & 1 else 0) | (select.POLLPRI if ev & 2 else 0) | (select.POLLOUT if ev & 4 else 0)
+            )
+        p = select.poll()
+        for fd, m in masks.items():
+            p.register(fd, m)
+        got = dict(p.poll(None if t is None else t * 1000))
+        for i, s in live:
+            r = got.get(s.fileno(), 0)
+            g = (
+                (1 if r & select.POLLIN else 0)
+                | (2 if r & select.POLLPRI else 0)
+                | (4 if r & select.POLLOUT else 0)
+                | (8 if r & select.POLLERR else 0)
+                | (16 if r & select.POLLHUP else 0)
+                | (32 if r & select.POLLNVAL else 0)
+            )
+            out[i] = g & (events[i] | 8 | 16 | 32)
+        return out
 
     def _n_poll(self, h: int, events: int, timeout_ms: int) -> int:
-        s = self.socks[h]
-        r, w, _ = select.select(
-            [s] if events & 1 else [], [s] if events & 4 else [], [], None if timeout_ms < 0 else timeout_ms / 1000
-        )
-        return (1 if r else 0) | (4 if w else 0)
+        return self._poll([self.socks.get(h)], [events], timeout_ms)[0]
 
     def _n_pollv(self, n: int, hp: int, evp: int, timeout_ms: int, revp: int) -> int:
         """Several sockets at once (poll): handles and events are arrays of i32 in the guest's memory, the revents are
@@ -519,17 +923,8 @@ class Pyodide:
                 time.sleep(timeout_ms / 1000)
             return 0
         handles = struct.unpack(f"<{n}i", self._rd(hp, 4 * n))
-        events = struct.unpack(f"<{n}i", self._rd(evp, 4 * n))
-        socks = [self.socks.get(h) for h in handles]
-        r, w, _ = select.select(
-            [s for s, e in zip(socks, events, strict=True) if s and e & 1],
-            [s for s, e in zip(socks, events, strict=True) if s and e & 4],
-            [],
-            None if timeout_ms < 0 else timeout_ms / 1000,
-        )
-        revents = [
-            ((1 if s in r else 0) | (4 if s in w else 0)) if s else 32 for s in socks
-        ]  # a closed handle: POLLNVAL
+        events = list(struct.unpack(f"<{n}i", self._rd(evp, 4 * n)))
+        revents = self._poll([self.socks.get(h) for h in handles], events, timeout_ms)
         self._wr(revp, struct.pack(f"<{n}i", *revents))
         return sum(1 for x in revents if x)
 
@@ -546,13 +941,89 @@ class Pyodide:
             return self._werr(e)
         return 0
 
-    def _n_name(self, h: int, peer: int, ap: int, portp: int) -> int:
+    def _n_name(self, h: int, peer: int, sa: int, lenp: int) -> int:
+        s = self.socks[h]
         try:
-            ip, port = (self.socks[h].getpeername() if peer else self.socks[h].getsockname())[:2]
+            addr = s.getpeername() if peer else s.getsockname()
         except OSError as e:
             return self._werr(e)
-        self._wr(ap, socket.inet_aton(ip))
-        self._wr(portp, struct.pack("<i", port))
+        self._sockaddr_out(sa, lenp, addr)
+        return 0
+
+    @staticmethod
+    def _option(level: int, opt: int) -> tuple[int | None, int | None]:
+        """musl's (level, option) numbers -> the host's, found by the NAME of the constant; None: the host has none."""
+        return (
+            getattr(socket, SOCK_LEVELS.get(level, ""), None),
+            getattr(socket, SOCK_OPTIONS.get((level, opt), ""), None),
+        )
+
+    def _n_setopt(self, h: int, level: int, opt: int, valp: int, ln: int) -> int:
+        """setsockopt (the import patched into the main module, tools/patch_main.mjs): applied to the host's socket."""
+        s = self.socks[h]
+        hl, ho = self._option(level, opt)
+        if hl is None or ho is None:
+            return -GUEST_ERRNO["NOPROTOOPT"]
+        if not 0 <= ln <= 1024:
+            return -GUEST_ERRNO["INVAL"]
+        raw = self._rd(valp, ln)
+        if (level, opt) == (1, 2) and os.name != "posix":
+            return 0  # SO_REUSEADDR means "steal the port" on Windows: not what a POSIX program asks
+        try:
+            s.setsockopt(hl, ho, raw)
+        except OSError as e:
+            return self._werr(e)
+        return 0
+
+    def _n_getopt(self, h: int, level: int, opt: int, valp: int, lenp: int) -> int:
+        """getsockopt: the option is found by name in the host's socket module; an unknown one is ENOPROTOOPT."""
+        s = self.socks[h]
+        cap = int.from_bytes(self._rd(lenp, 4), "little")
+        if level == 1 and opt in (3, 38, 39):  # SO_TYPE, SO_PROTOCOL, SO_DOMAIN: musl's numbers, not the host's
+            stream = s.type == socket.SOCK_STREAM
+            val = {
+                3: 1 if stream else 2,
+                38: s.proto or (6 if stream else 17),
+                39: 2 if s.family == socket.AF_INET else 10,
+            }
+            raw = val[opt].to_bytes(4, "little")
+        else:
+            hl, ho = self._option(level, opt)
+            if hl is None or ho is None:
+                return -GUEST_ERRNO["NOPROTOOPT"]
+            try:
+                raw = s.getsockopt(hl, ho, min(max(cap, 4), 1024))
+            except OSError as e:
+                return self._werr(e)
+            if (level, opt) == (1, 4) and (
+                err := int.from_bytes(raw[:4], "little")
+            ):  # SO_ERROR: an errno, in the guest's numbers
+                raw = (-self._werr(OSError(err, ""))).to_bytes(4, "little")
+        self._wr(valp, raw[:cap])
+        self._wr(lenp, min(len(raw), cap).to_bytes(4, "little"))
+        return 0
+
+    def _n_ioctl(self, h: int, op: int, argp: int) -> int:
+        """FIONREAD: the bytes a read would get now (for a datagram socket: the size of the next datagram)."""
+        s = self.socks[h]
+        try:
+            import fcntl
+            import termios
+
+            n = int.from_bytes(fcntl.ioctl(s.fileno(), termios.FIONREAD, bytes(4)), "little")
+        except ImportError:  # Windows: peek
+            s.setblocking(False)
+            try:
+                n = len(s.recv(65536, socket.MSG_PEEK))
+            except BlockingIOError:
+                n = 0
+            except OSError as e:
+                return self._werr(e)
+            finally:
+                s.setblocking(True)
+        except OSError as e:
+            return self._werr(e)
+        self._wr(argp, n.to_bytes(4, "little"))
         return 0
 
     def _n_resolve(self, np_: int, n: int, ap: int) -> int:
@@ -560,23 +1031,217 @@ class Pyodide:
         try:
             ip = socket.gethostbyname(name)
         except OSError:
-            return -WASI_ERRNO["NOENT"]
+            return -GUEST_ERRNO["NOENT"]
         self.netlog.append(f"resolve {name} -> {ip}")
         self._wr(ap, socket.inet_aton(ip))
         return 0
 
-    def _wrap(self, fn, nres: int):
+    # ------------------------------------------------------------------ the host's view of the files
+    def _preopen_dir(self, pfd: int) -> str | None:
+        """The host folder of a preopen, named by its WASI descriptor (3 + its place in the order they are opened here:
+        the guest's root, the mounts, /dev). The guest never gives the host a path: the adapter has proved that the
+        guest's path exists through WASI and names only the preopen it belongs to."""
+        assert self.root is not None
+        dirs = [str(self.root), *self.mounts.values()]
+        if self.preopen_dev:
+            dirs.append("/dev")
+        return dirs[pfd - 3] if 3 <= pfd < 3 + len(dirs) else None
+
+    def _fs_statvfs(self, pfd: int, buf: int) -> int:
+        """statfs of a preopen's folder -> Emscripten's struct statfs64 (88 bytes) at ``buf``; -errno on failure.
+        Without os.statvfs (Windows) the numbers come from shutil.disk_usage: the files and ffree counts are 0."""
+        try:
+            host = self._preopen_dir(pfd)
+            if host is None:
+                return -WASI_ERRNO["BADF"]
+            b = bytearray(88)
+            if hasattr(os, "statvfs"):
+                st = os.statvfs(host)
+                struct.pack_into("<I", b, 4, st.f_bsize)
+                struct.pack_into("<5Q", b, 8, st.f_blocks, st.f_bfree, st.f_bavail, st.f_files, st.f_ffree)
+                struct.pack_into("<III", b, 56, st.f_namemax, st.f_frsize, st.f_flag)
+            else:
+                du = shutil.disk_usage(host)
+                struct.pack_into("<I", b, 4, 4096)
+                struct.pack_into("<5Q", b, 8, du.total // 4096, du.free // 4096, du.free // 4096, 0, 0)
+                struct.pack_into("<III", b, 56, 255, 4096, 0)
+            self._wr(buf, bytes(b))
+            return 0
+        except OSError as e:
+            return self._werr(e)
+        except Exception:  # never a trap in the guest
+            return -WASI_ERRNO["IO"]
+
+    def _malloc(self, n: int) -> int:
+        """The guest's malloc: its address as an unsigned number (0: no memory)."""
+        return self.ex["malloc"](self.cur[-1], n) & 0xFFFFFFFF
+
+    def _n_getaddrinfo(self, node_p: int, service_p: int, hint_p: int, out_p: int) -> int:
+        """getaddrinfo: Pyodide's JavaScript validates the input (EAI codes; the defaults stream/6, dgram/17), the
+        host's resolver answers, and ALL its addresses are returned as one malloc'd block that freeaddrinfo (it frees
+        the first node and its ai_addr only) releases whole."""
+        node, service = self._cstr(node_p), self._cstr(service_p)
+        flags = family = type_ = proto = 0
+        if hint_p:
+            flags, family, type_, proto = struct.unpack("<4i", self._rd(hint_p, 16))
+        if type_ and not proto:
+            proto = 17 if type_ == 2 else 6
+        if not type_ and proto:
+            type_ = 2 if proto == 17 else 1
+        proto = proto or 6
+        type_ = type_ or 1
+        if node is None and service is None:
+            return -2
+        if flags & ~(1 | 2 | 4 | 8 | 16 | 32 | 1024):
+            return -1
+        if flags & 2 and node is None:
+            return -1
+        if type_ not in (1, 2):
+            return -7
+        if family not in (0, 2, 10):
+            return -6
+        port = 0
+        if service is not None:
+            m = re.match(r"\s*[+-]?\d+", service)  # parseInt(service, 10)
+            proto_name = "tcp" if type_ == 1 else "udp"
+            if m:
+                port = int(m.group()) & 0xFFFF
+            elif flags & 1024:
+                return -2
+            else:
+                try:
+                    port = socket.getservbyname(service, proto_name)
+                except OSError:
+                    port = SERVICES.get((service, proto_name), 0)
+                    if not port:
+                        return -8
+        hflags = 0
+        for bit, name in AI_FLAGS.items():
+            if flags & bit:
+                hflags |= getattr(socket, name, 0)
+        try:
+            found = socket.getaddrinfo(
+                node,
+                port,
+                {0: socket.AF_UNSPEC, 2: socket.AF_INET, 10: socket.AF_INET6}[family],
+                socket.SOCK_STREAM if type_ == 1 else socket.SOCK_DGRAM,
+                0,
+                hflags,
+            )
+        except socket.gaierror as e:
+            return EAI_CODES.get(e.args[0], -4)
+        except UnicodeError:
+            return -2
+        entries = [(2 if f == socket.AF_INET else 10, c, self._sockaddr_bytes(a)) for f, _t, _p, c, a in found]
+        if not entries:
+            return -2
+        canon = ((entries[0][1] or node or "").encode() + b"\0") if flags & 2 else b""
+        c = self.cur[-1]
+        block = self._malloc(32 * len(entries) + len(canon) + sum(len(sa) for _f, _c, sa in entries[1:]))
+        head_sa = self._malloc(len(entries[0][2]))
+        if not block or not head_sa:
+            for q in (block, head_sa):
+                if q:
+                    self.ex["free"](c, q)
+            return -10  # EAI_MEMORY
+        at = block + 32 * len(entries)
+        self._wr(at, canon)
+        canon_p, at = (at if canon else 0), at + len(canon)
+        for k, (fam, _c, sa) in enumerate(entries):
+            sa_p = head_sa if k == 0 else at
+            at += 0 if k == 0 else len(sa)
+            self._wr(sa_p, sa)
+            nxt = block + 32 * (k + 1) if k + 1 < len(entries) else 0
+            ai = struct.pack("<8I", 0, fam, type_, proto, len(sa), sa_p, canon_p if k == 0 else 0, nxt)
+            self._wr(block + 32 * k, ai)
+        self._wr(out_p, block.to_bytes(4, "little"))
+        return 0
+
+    def _n_getnameinfo(self, sa: int, salen: int, node: int, nodelen: int, serv: int, servlen: int, flags: int) -> int:
+        raw = self._rd(sa, min(salen, 28)) if sa and salen >= 2 else b""
+        need = {2: 16, 10: 28}.get(int.from_bytes(raw[:2], "little"))
+        if need is None or len(raw) < need:
+            return -6  # EAI_FAMILY
+        hflags = 0
+        for bit, name in NI_FLAGS.items():
+            if flags & bit:
+                hflags |= getattr(socket, name, 0)
+        try:
+            host, service = socket.getnameinfo(self._sockaddr_tuple(raw), hflags)
+        except socket.gaierror as e:
+            return EAI_CODES.get(e.args[0], -4)
+        except OSError:
+            return -4
+        for ptr, cap, text in ((node, nodelen, host), (serv, servlen, service)):
+            if ptr and cap:
+                b = text.encode()
+                if len(b) >= cap:
+                    return -12  # EAI_OVERFLOW
+                self._wr(ptr, b + b"\0")
+        return 0
+
+    def _n_protobyname(self, name_p: int) -> int:
+        """getprotobyname: a struct protoent {name, aliases, proto} from the host's protocols table (tcp and udp
+        even where the host has none), built once per name and kept, as Pyodide keeps its two. 0: unknown."""
+        name = self._cstr(name_p) or ""
+        if name not in self.protoents:
+            try:
+                num = socket.getprotobyname(name)
+            except OSError:
+                num = {"tcp": 6, "udp": 17}.get(name, -1)
+            if num < 0:
+                return 0
+            b = name.encode() + b"\0"
+            p = self._malloc(16 + len(b))
+            if not p:
+                return 0
+            self._wr(p, struct.pack("<4I", p + 16, p + 12, num, 0) + b)  # aliases: [NULL]
+            self.protoents[name] = p
+        return self.protoents[name]
+
+    # what a net operation answers when the guest gave it a pointer outside its memory, or the host failed in a way
+    # nobody foresaw: -EFAULT and -EIO, but the name functions answer in EAI_* (or a NULL pointer)
+    NET_FAILS = {"getaddrinfo": (-11, -4), "getnameinfo": (-11, -4), "protobyname": (0, 0)}
+
+    def _wrap_net(self, name: str, fn):
+        """No exception of a net operation reaches the wasm (it would be a trap that ends the interpreter): a pointer
+        outside the memory is EFAULT, a host error is its errno, anything else is logged and EIO."""
+        fault, other = self.NET_FAILS.get(name, (-GUEST_ERRNO["FAULT"], -GUEST_ERRNO["IO"]))
+
+        def f(caller, *args):
+            self.cur.append(caller)
+            try:
+                return fn(*args)
+            except GuestFault:
+                return fault
+            except OSError as e:
+                return other if name in self.NET_FAILS else self._werr(e)
+            except Exception:
+                log.exception("[net] %s failed", name)
+                return other
+            finally:
+                self.cur.pop()
+
+        return f
+
+    def _wrap(self, fn, nres: int, fail: int = 0):
+        """A loader operation: no exception reaches the wasm (it would be a trap that ends the interpreter); a pointer
+        outside the memory or an unforeseen host error is logged and answered with `fail` (0; -1 for instantiate)."""
+
         def f(caller, *args):
             self.cur.append(caller)
             try:
                 r = fn(*args)
+            except Exception:
+                log.exception("[loader] %s failed", fn.__name__)
+                r = fail
             finally:
                 self.cur.pop()
             return r if nres else None
 
         return f
 
-    def _ops(self) -> tuple[dict, dict]:
+    def _ops(self) -> tuple[dict, dict, dict]:
         wt = self._wt
         i32 = wt.ValType.i32()
 
@@ -593,17 +1258,29 @@ class Pyodide:
         }
         net = {
             "socket": (self._n_socket, ft(3)),
+            "bind": (self._n_bind, ft(3)),
+            "listen": (self._n_listen, ft(2)),
+            "accept": (self._n_accept, ft(4)),
             "connect": (self._n_connect, ft(4)),
-            "send": (self._n_send, ft(3)),
-            "recv": (self._n_recv, ft(4)),
+            "sendto": (self._n_sendto, ft(6)),
+            "recvfrom": (self._n_recvfrom, ft(6)),
+            "sendmsg": (self._n_sendmsg, ft(3)),
+            "recvmsg": (self._n_recvmsg, ft(3)),
             "poll": (self._n_poll, ft(3)),
             "pollv": (self._n_pollv, ft(5)),
             "close": (self._n_close, ft(1)),
             "shutdown": (self._n_shutdown, ft(2)),
             "name": (self._n_name, ft(4)),
+            "getopt": (self._n_getopt, ft(5)),
+            "setopt": (self._n_setopt, ft(5)),
+            "ioctl": (self._n_ioctl, ft(3)),
             "resolve": (self._n_resolve, ft(3)),
+            "getaddrinfo": (self._n_getaddrinfo, ft(4)),
+            "getnameinfo": (self._n_getnameinfo, ft(7)),
+            "protobyname": (self._n_protobyname, ft(1)),
         }
-        return loader, net
+        fs = {"statvfs": (self._fs_statvfs, ft(2))}
+        return loader, net, fs
 
     # ------------------------------------------------------------------ start
     def _start(self) -> None:
@@ -627,23 +1304,31 @@ class Pyodide:
         wasi.inherit_stdout()
         wasi.inherit_stderr()
         store.set_wasi(wasi)
-        loader_ops, net_ops = self._ops()
+        loader_ops, net_ops, fs_ops = self._ops()
         I32 = wt.ValType.i32()  # noqa: N806
 
         def define_ops(linker):
             for name, (fn, ty) in loader_ops.items():
-                linker.define_func("loader", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
+                linker.define_func(
+                    "loader",
+                    name,
+                    ty,
+                    self._wrap(fn, len(ty.results), -1 if name == "instantiate" else 0),
+                    access_caller=True,
+                )
             for name, (fn, ty) in net_ops.items():
-                linker.define_func("net", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
+                linker.define_func("net", name, ty, self._wrap_net(name, fn), access_caller=True)
+            for name, (fn, ty) in fs_ops.items():
+                linker.define_func("fs", name, ty, self._wrap_net(name, fn), access_caller=True)
 
         if self.flavor == "fused":
             main_mod = _engine.load_module(self.data / "pyodide_fused.wasm")
             linker = wt.Linker(engine)
             linker.define_wasi()
             define_ops(linker)
-            self.ex = linker.instantiate(store, main_mod).exports(store)
+            self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
             self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
-            self.instances[0] = {"exports": {e.name: self.ex[e.name] for e in main_mod.exports}, "got": []}
+            self.instances[0] = {"exports": MainExports(self.ex), "got": []}
             self._drop_stubs()
             mods: dict[str, int] = {}
             for i in main_mod.imports:
@@ -667,7 +1352,7 @@ class Pyodide:
                 "_emscripten_find_dylib",
             }
             for i in adapter_mod.imports:
-                assert i.module in ("wasi_snapshot_preview1", "loader", "aux", "net") or (
+                assert i.module in ("wasi_snapshot_preview1", "loader", "aux", "net", "fs") or (
                     i.module == "env" and i.name in allowed
                 ), (i.module, i.name)
             adapter_names = [
@@ -695,9 +1380,9 @@ class Pyodide:
                     n_env["adapter" if n in fwd else "stub"] += 1
             for g in got:
                 linker.define(store, "GOT.func", g, shim["got:" + g])
-            self.ex = linker.instantiate(store, main_mod).exports(store)
+            self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
             self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
-            self.instances[0] = {"exports": {e.name: self.ex[e.name] for e in main_mod.exports}, "got": []}
+            self.instances[0] = {"exports": MainExports(self.ex), "got": []}
 
             tl = wt.Linker(engine)
             tl.define(store, "env", "__indirect_function_table", self.table)
@@ -716,8 +1401,8 @@ class Pyodide:
             define_ops(al)
             adapter = al.instantiate(store, adapter_mod).exports(store)
             # what the fused module exports: the main module's symbols and the adapter's (dlsym(NULL), the GOT)
-            self.instances[0]["exports"].update({n: adapter[n] for n in adapter_names})
-            self.instances[0]["exports"][_wasm.TRAMP] = tramp[_wasm.TRAMP]
+            self.instances[0]["exports"].extra.update({n: adapter[n] for n in adapter_names})
+            self.instances[0]["exports"].extra[_wasm.TRAMP] = tramp[_wasm.TRAMP]
             table = shim["table"]  # fixup
             for n, k in fwd.items():
                 table.set(store, k, wt.Val.funcref(tramp[n] if n == _wasm.TRAMP else adapter[n]))
@@ -784,6 +1469,9 @@ class Pyodide:
         for s in self.socks.values():
             s.close()
         self.socks.clear()
+        self.protoents.clear()  # guest addresses, and the guest is gone: so are the table slots and instances
+        self.slots.clear()
+        self.instances = [None]
         if self.root is not None:
             shutil.rmtree(self.root, ignore_errors=True)
             self.root = None

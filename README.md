@@ -32,14 +32,14 @@ files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs th
 Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**, after the
 shape of Wasmtime's `wasi_snapshot_preview1` adapter (`wasm/adapter.c`, about 1 200 lines of C, no data section, no stack of its own):
 system calls over WASI, the dynamic loader (`dlopen` of a wheel's `.so`), libffi's calls, sockets, time, the trampoline.
-The host (`_host.py`) gives what a wasm module cannot do: wasmtime's WASI, six loader operations (it holds the instances by name) and
-the host's sockets. **Pyodide is not rebuilt**: its wasm is the npm package's, with the legacy wasm exceptions converted once to
+The host (`_host.py`) gives what a wasm module cannot do: wasmtime's WASI, six loader operations (it holds the instances by name), the host's sockets and `statvfs`
+(the numbers of the folder behind a guest path). Permission bits, owners and the umask are kept by the adapter for the interpreter's lifetime (WASI has none). **Pyodide is not rebuilt**: its wasm is the npm package's, with the legacy wasm exceptions converted once to
 `exnref` (wasmtime does not run the legacy ones).
 
 Two packagings of the same sources, both in the wheel, both tested:
 
-* **`fused`** (default): `pyodide_fused.wasm`, one core module (`tools/fuse.py`, `wasm-merge`) that imports only `wasi_snapshot_preview1`, `loader` and `net`;
-* **`dynamic`**: `pyodide.asm.wasm` and `adapter.wasm` linked at run time (a shim generated from the import list, the trampoline, a fixup).
+* **`fused`**: `pyodide_fused.wasm`, one core module (`tools/fuse.py`, `wasm-merge`) that imports only `wasi_snapshot_preview1`, `loader` and `net`;
+* **`dynamic`** (default): `pyodide.asm.wasm` and `adapter.wasm` linked at run time (a shim generated from the import list, the trampoline, a fixup).
 
 Wheels with legacy exceptions (every Emscripten wheel of Pyodide's CDN with C++ exceptions, numpy's two modules...) are converted at
 `dlopen` by **`wasm-opt.wasm`**: Binaryen 132 as a `wasm32-wasip1` module, run in-process by wasmtime-py. Machine code of the big modules is cached in
@@ -49,7 +49,7 @@ More in [docs/EXPERIMENT.md](docs/EXPERIMENT.md) (the experiment this came from:
 and [docs/NOTES-FUSEDWASI-AND-TESTSUITE.md](docs/NOTES-FUSEDWASI-AND-TESTSUITE.md) (WASI 0.2 over fusedwasi, next).
 
 ## Build (CI does this; Node is a build tool only)
-One toolchain: **wasi-sdk 34's clang** builds `adapter.wasm`, `wasm-opt.wasm` and the guest's `_ssl`; Binaryen's `wasm-opt`/`wasm-merge` come from npm (`package.json` pins Pyodide and Binaryen; Dependabot tracks them).
+One toolchain: **wasi-sdk 34's clang** builds `adapter.wasm`, `wasm-opt.wasm` and the guest's `_ssl`; Binaryen's `wasm-opt`/`wasm-merge` and binaryen.js (`tools/patch_main.mjs`, which makes libc's `setsockopt` call the adapter) come from npm (`package.json` pins Pyodide and Binaryen; Dependabot tracks them).
 
 ```sh
 uv sync

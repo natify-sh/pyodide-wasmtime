@@ -133,3 +133,9 @@ def test_exit_codes(guest: Guest):
     assert guest.run("import os; os._exit(7)").returncode == 7
     assert guest.run("1 / 0").returncode == 1
     assert guest.run("import os; os.abort()").returncode == 134  # the guest trapped
+
+
+def test_stdin_is_eof_when_the_parent_closes_it(guest: Guest):
+    p = guest.run("import sys; print(repr(sys.stdin.read()))")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.strip() == "''"

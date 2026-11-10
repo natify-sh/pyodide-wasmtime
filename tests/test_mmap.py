@@ -136,6 +136,8 @@ with open("/mm/empty", "r+b") as f:
 print(err(lambda: mmap.mmap(os.open("/mm", os.O_RDONLY), 10, access=mmap.ACCESS_READ)))
 fd = os.open(p, os.O_WRONLY)
 print(err(lambda: mmap.mmap(fd, 10)))
+print(err(lambda: mmap.mmap(99, 10)))
+print(err(lambda: os.dup(999)))
 print(err(lambda: (lambda a: (a.write(b"abc"), a[:3])[1])(mmap.mmap(-1, 100))))
 with open(p, "r+b") as f:
     m = mmap.mmap(f.fileno(), 100)
@@ -150,6 +152,8 @@ with open(p, "r+b") as f:
         "ValueError cannot mmap an empty file",
         "OSError [Errno 43] No such device",
         "PermissionError [Errno 2] Permission denied",
+        "OSError [Errno 8] Bad file descriptor",
+        "OSError [Errno 8] Bad file descriptor",
         "b'abc'",
         "OSError [Errno 48] Out of memory 100",
     ]
