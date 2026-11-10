@@ -95,6 +95,7 @@ def engine() -> Any:
         cfg.wasm_exceptions = True
         cfg.wasm_function_references = True
         cfg.wasm_gc = True
+        cfg.max_wasm_stack = 1 << 20  # 2x the default: the loader's NEEDED recursion is 1500 deep (adapter.c MAXDEPTH)
         _STATE["engine"] = wt.Engine(cfg)
     return _STATE["engine"]
 

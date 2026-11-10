@@ -1320,20 +1320,13 @@ static char *norm_path(const char *s) {
     return r;
 }
 
-static i32 base_eq(const char *a, const char *b) {  // equal file names (the part after the last '/')
-    const char *x = a, *y = b;
-    for (const char *p = a; *p; p++) if (*p == '/') x = p + 1;
-    for (const char *p = b; *p; p++) if (*p == '/') y = p + 1;
-    return eq((const u8 *)x, slen(x), y, slen(y));
-}
-
 // the loader.error codes (the host words them):
 //  1 no such file (arg: the name)       2 no wasm magic number            3 dylink.0 is not the first section
 //  4 the first section is not dylink.0  5 a length that is not a multiple of 4 (the glue's Uint32Array)
 //  6 truncated or malformed             7 undefined symbol (arg)          8 cannot be read
 //  9 out of memory or table            10 NEEDED libraries nested too deep  11 the engine's own reason
 //  12 dlsym: unknown symbol (arg) in the library (name; no name: the main module)     +256: from emscripten_dlopen
-#define MAXDEPTH 512
+#define MAXDEPTH 1500
 static Lib *fail(Libs *L, u32 code, const u8 *arg, i32 n) {
     free(L->arg);
     L->code = code, L->arg = 0, L->argn = 0;
@@ -1473,60 +1466,29 @@ static char *runtime_paths(const u8 *b, const DyMeta *m, const char *path) {
 static i32 missing(Libs *L, const char *path) { return L->code == 1 && L->arg && eq((const u8 *)L->arg, L->argn, path, slen(path)); }
 
 // A NEEDED library, as the glue finds it: the main module's search (runtime paths with $ORIGIN, LD_LIBRARY_PATH), else
-// the name as written; the library is then the one with that full (normalized) name. Beyond the glue: next to the
-// module that needs it, then /lib, then a loaded library of that file name.
-static Lib *load_needed(Libs *L, const char *from, const char *rpath, const u8 *name, i32 n, i32 global, u32 scope,
+// the name as written; the library is then the one with that full (normalized) name. Nothing else is tried.
+static Lib *load_needed(Libs *L, const char *rpath, const u8 *name, i32 n, i32 global, u32 scope,
                         i32 depth) {
     char *nm = (char *)malloc((u32)n + 1);
     char *buf = (char *)malloc(512);
-    i32 dl = 0;
-    for (i32 i = 0; from[i]; i++) if (from[i] == '/') dl = i + 1;
-    char *p = (char *)malloc((u32)(dl + n + 8));  // (nm is not filled in yet)
     Lib *x = 0;
-    if (!nm || !buf || !p) {
-        free(nm), free(buf), free(p);
+    if (!nm || !buf) {
+        free(nm), free(buf);
         return fail(L, 9, 0, 0);
     }
     for (i32 i = 0; i < n; i++) nm[i] = (char)name[i];
     nm[n] = 0;
-    if (nm[0] == '/') dl = 0;  // an absolute name is used as it is
     char *found = nm[0] != '/' ? _emscripten_find_dylib(buf, rpath, nm, 512) : 0;
     char *q = norm_path(found ? found : nm);  // the glue's candidate
     if (!q) {
-        free(nm), free(buf), free(p);
+        free(nm), free(buf);
         return fail(L, 9, 0, 0);
     }
     x = load_lib(L, q, global, scope, depth + 1, 0);
     i32 gone = !x && missing(L, q);
     free(q);
-    if (!x && (found || !gone)) goto done;  // a library that was found but is bad, or no memory, or one it needs...
-    if (!x) {                               // next to the module that needs it, then /lib
-        for (i32 i = 0; i < dl; i++) p[i] = from[i];
-        for (i32 i = 0; i <= n; i++) p[dl + i] = nm[i];
-        q = norm_path(p);
-        if (!q) {
-            fail(L, 9, 0, 0);
-            goto done;
-        }
-        x = load_lib(L, q, global, scope, depth + 1, 0);
-        gone = !x && missing(L, q);
-        free(q);
-        if (!x && !gone) goto done;
-    }
-    if (!x) {  // /lib/<name>
-        p[0] = '/', p[1] = 'l', p[2] = 'i', p[3] = 'b', p[4] = '/';
-        for (i32 i = 0; i <= n; i++) p[5 + i] = nm[i];
-        x = load_lib(L, p, global, scope, depth + 1, 0);
-        if (!x && !missing(L, p)) goto done;
-    }
-    if (!x) {  // a library of that file name that is loaded already
-        for (i32 k = 0; k < L->libs.n && !x; k++)
-            if (base_eq(((Lib *)L->libs.v[k])->name, nm))
-                x = load_lib(L, ((Lib *)L->libs.v[k])->name, global, scope, depth + 1, 0);
-    }
-    if (!x) fail(L, 1, name, n);  // the glue names the NEEDED library, as it was written
-done:
-    free(p), free(nm), free(buf);
+    if (!x && !found && gone) fail(L, 1, name, n);  // the glue names the NEEDED library, as it was written
+    free(nm), free(buf);
     return x;
 }
 
@@ -1537,12 +1499,13 @@ static void lib_drop(Libs *L, Lib *x) {
     free(x->name), free(x);
 }
 
-// a symbol of module `id` as the GOT wants it: a data address (base added) or a table slot; out[0] = 0: none
-static u32 sym_of(i32 id, u32 base, const u8 *nm, i32 n, u32 *out) {
-    out[0] = out[1] = 0;  // the host leaves them alone when it fails
-    u32 v = dl_sym(id, (const char *)nm, n, out);
-    if (out[0] == 1) v += base;
-    return v;
+// a symbol of module `id`: out[0] = 0: none; 1: a number (the host has made it what the glue's relocateExports and
+// ToInt32 make of the global, the memory base included); 2, 3: a table slot. out[1] goes in as 1 for dlsym: the host
+// then answers a mutable reference global with 0 and ends the process for a mutable i64 (the glue's TypeError), while
+// the GOT does not see those two.
+static u32 sym_of(i32 id, const u8 *nm, i32 n, u32 *out, i32 for_dlsym) {
+    out[0] = 0, out[1] = (u32)for_dlsym;  // the host leaves them alone when it fails
+    return dl_sym(id, (const char *)nm, n, out);
 }
 
 static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth, const u8 *handle) {
@@ -1604,7 +1567,7 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
             u32 nl;
             const u8 *nn = rd_name(&r, &nl);
             if (r.bad) break;
-            if (!load_needed(L, path, rpath, nn, (i32)nl, global, scope, depth)) goto failed;
+            if (!load_needed(L, rpath, nn, (i32)nl, global, scope, depth)) goto failed;
         }
         if (r.bad) {
             fail(L, 6, 0, 0);
@@ -1708,12 +1671,12 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
     for (i32 g = 0; g < nimp_got; g++) {
         const u8 *nm = got[g].name;
         i32 n = got[g].n;
-        u32 out[2], v = sym_of(0, 0, nm, n, out);
+        u32 out[2], v = sym_of(0, nm, n, out, 0);
         for (i32 k = 0; out[0] == 0 && k < L->libs.n; k++) {
             Lib *o = (Lib *)L->libs.v[k];
-            if (o->ready) v = sym_of(o->id, o->base, nm, n, out);
+            if (o->ready) v = sym_of(o->id, nm, n, out, 0);
         }
-        if (out[0] == 0) v = sym_of(id, base, nm, n, out);
+        if (out[0] == 0) v = sym_of(id, nm, n, out, 0);
         if (out[0] == 0) {
             if (is_weak(b, &m, nm, n)) continue;
             fail(L, 7, nm, n);
@@ -1802,13 +1765,13 @@ EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
     u32 out[2] = {0, 0}, v = 0;
     i32 n = slen(sym);
     if (lib) {
-        v = sym_of(lib->id, lib->base, (const u8 *)sym, n, out);
+        v = sym_of(lib->id, (const u8 *)sym, n, out, 1);
     } else {  // not a library loaded by dlopen: the main module (dlopen(NULL), RTLD_DEFAULT), then the RTLD_GLOBAL libraries
-        v = sym_of(0, 0, (const u8 *)sym, n, out);
+        v = sym_of(0, (const u8 *)sym, n, out, 1);
         for (u32 seq = 1; out[0] == 0 && seq <= L->gcount; seq++)  // in the order they became global
             for (i32 k = 0; out[0] == 0 && k < L->libs.n; k++) {
                 Lib *o = (Lib *)L->libs.v[k];
-                if (o->ready && o->global && o->gseq == seq) v = sym_of(o->id, o->base, (const u8 *)sym, n, out);
+                if (o->ready && o->global && o->gseq == seq) v = sym_of(o->id, (const u8 *)sym, n, out, 1);
             }
     }
     if (out[0] == 0) {

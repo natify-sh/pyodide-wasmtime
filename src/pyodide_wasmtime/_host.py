@@ -420,6 +420,10 @@ class MainExports(Mapping):
         return sum(1 for _ in self)
 
 
+_JS_MODULES = ("env", "GOT.mem", "GOT.func", "wasi_snapshot_preview1")  # the glue's import object
+_GLOBAL_WHY = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
+
+
 class Pyodide:
     """One Python (Pyodide's CPython) in wasm, run by wasmtime.
 
@@ -626,6 +630,77 @@ class Pyodide:
         log.info("[loader] instantiate failed: %s: %s", type(exc).__name__, exc)
         return -1
 
+    def _dl_reason(self, text: str) -> int:
+        """A failed load whose reason is the JS API's own text (a link error the engine would word differently)."""
+        self._dlreason = text
+        log.info("[loader] instantiate failed: %s", text)
+        return -1
+
+    def _link_error(self, i: int, imp: Any, item: Any, number: bool) -> str | None:
+        """What V8 says when the glue's import object gives `item` for import `imp` (#i) and it does not fit, else
+        None. `number`: the glue gives a plain number (__memory_base, __table_base); item None: a JS function."""
+        wt, c = self._wt, self.cur[-1]
+        ty = imp.type
+        pre = f'LinkError: WebAssembly.Instance(): Import #{i} module="{imp.module}" function="{imp.name}": '
+        if isinstance(ty, wt.FuncType):
+            if not isinstance(item, wt.Func):
+                return pre + "function import requires a callable"
+            if imp.module == "env":  # the glue's own functions are JavaScript, which takes any signature: not checked
+                have = item.type(c)
+                if [str(t) for t in have.params] != [str(t) for t in ty.params] or [str(t) for t in have.results] != [
+                    str(t) for t in ty.results
+                ]:
+                    return pre + "imported function does not match the expected type"
+        elif isinstance(ty, wt.GlobalType):
+            if number:
+                if ty.mutable:
+                    return pre + "imported mutable global must be a WebAssembly.Global object"
+                if str(ty.content) not in ("i32", "f32", "f64"):
+                    return pre + _GLOBAL_WHY
+            elif not isinstance(item, wt.Global):
+                return pre + _GLOBAL_WHY
+            else:
+                have = item.type(c)
+                if have.mutable != ty.mutable:
+                    return pre + "imported global does not match the expected mutability"
+                if str(have.content) != str(ty.content):
+                    return pre + "imported global does not match the expected type"
+        elif isinstance(ty, wt.MemoryType):
+            if not isinstance(item, wt.Memory):
+                return pre + "memory import must be a WebAssembly.Memory object"
+            lim, mt, pages = ty.limits, item.type(c), item.size(c)
+            if pages < lim.min:
+                return pre + f"memory import has {pages} pages which is smaller than the declared initial of {lim.min}"
+            if lim.max is not None:
+                have_max = mt.limits.max
+                if have_max is None:
+                    return pre + f"memory import has no maximum limit, expected at most {lim.max}"
+                if have_max > lim.max:
+                    why = f"memory import has a larger maximum size {have_max} than the module's declared maximum"
+                    return pre + f"{why} {lim.max}"
+            if ty.is_shared != mt.is_shared:
+                declared, imported = int(ty.is_shared), int(mt.is_shared)
+                return pre + f"mismatch in shared state of memory, declared = {declared}, imported = {imported}"
+        elif isinstance(ty, wt.TableType):
+            if not isinstance(item, wt.Table):
+                return pre + "table import requires a WebAssembly.Table"
+            if str(item.type(c).element) != str(ty.element):
+                return pre + "imported table does not match the expected type"
+            size, lim = item.size(c), ty.limits
+            if size < lim.min:
+                return (
+                    f"LinkError: WebAssembly.Instance(): table import {i} is smaller than initial {lim.min}, got {size}"
+                )
+            if lim.max is not None and item.type(c).limits.max is None:
+                return f"LinkError: WebAssembly.Instance(): table import {i} has no maximum length, expected {lim.max}"
+        elif isinstance(ty, wt.TagType):
+            if not isinstance(item, wt.Tag):
+                return pre + "tag import requires a WebAssembly.Tag"
+            ft = ty.functype  # the glue's tags carry one i32
+            if [str(t) for t in ft.params] != ["i32"] or list(ft.results):
+                return pre + "imported tag does not match the expected type"
+        return None
+
     # the reasons of loader.error, as Emscripten's glue words them (`${e}` of the error it throws)
     _DL_WHY = {
         1: 'Error: Failed to find dynamic library "{arg}"',
@@ -637,7 +712,7 @@ class Pyodide:
         7: "Error: Dynamic linking error: undefined symbol '{arg}'",
         8: "[object Object]",
         9: "RangeError: WebAssembly.Memory(): out of memory",
-        10: "Error: too many nested NEEDED libraries",
+        10: "RangeError: Maximum call stack size exceeded",
     }
 
     def _dl_error(self, code: int, np_: int, nn: int, ap: int, an: int) -> None:
@@ -691,20 +766,43 @@ class Pyodide:
             got: list = []
             i32 = wt.ValType.i32()
             main = self.instances[0]["exports"]
-            for imp in module.imports:
+            imports = list(module.imports)
+            for i, imp in enumerate(imports):  # V8 looks at every module object before it checks any import
+                if imp.module not in _JS_MODULES:
+                    return self._dl_reason(
+                        f'TypeError: WebAssembly.Instance(): Import #{i} module="{imp.module}": '
+                        "module is not an object or function"
+                    )
+            for i, imp in enumerate(imports):
                 m, nm, ty = imp.module, imp.name, imp.type
+                number = m == "env" and nm in ("__memory_base", "__table_base")  # a number in the glue
+                if isinstance(ty, wt.TableType) and ty.limits.min > 10_000_000:
+                    return self._dl_reason(
+                        f"RangeError: WebAssembly.Instance(): initial table size ({ty.limits.min} elements) is "
+                        "larger than implementation limit (10000000 elements)"
+                    )
+                item: Any = None  # None: what the glue's import object gives is a JavaScript function
                 if m == "env" and nm == "memory":
                     item = self.memory
                 elif m == "env" and nm == "__indirect_function_table":
                     item = self.table
-                elif m == "env" and nm in ("__memory_base", "__table_base"):
+                elif number:
                     item = wt.Global(c, wt.GlobalType(i32, False), wt.Val.i32(mb if nm == "__memory_base" else tb))
                 elif m == "env" and nm == "__stack_pointer":
                     item = main["__stack_pointer"]
-                elif isinstance(ty, wt.TagType):
-                    item = main.get(nm) or wt.Tag(c, ty)
-                elif m == "env" and isinstance(ty, wt.FuncType):
-                    item = self._env_func(nm)
+                elif m == "env" and nm in ("__cpp_exception", "__c_longjmp"):
+                    item = main.get(nm) or (wt.Tag(c, ty) if isinstance(ty, wt.TagType) else None)
+                elif m in ("GOT.mem", "GOT.func"):
+                    item = wt.Global(c, wt.GlobalType(i32, True), wt.Val.i32(0))
+                elif isinstance(ty, wt.FuncType):  # env or WASI (the other modules are handled above)
+                    if m == "env":
+                        item = self._env_func(nm)
+                    else:  # the glue gives a side module the main module's WASI imports: the adapter's or wasmtime's
+                        item = self._env_func(nm) if nm in _wasm.WASI_ROUTED else None
+                        try:
+                            item = item or self._wasi_func(nm)
+                        except Exception:  # not a WASI function: the lazy stub below, as for env
+                            pass
                     if item is None:  # as Emscripten's glue: resolved when called, an error only if still missing then
                         hit: list = []
 
@@ -718,23 +816,21 @@ class Pyodide:
 
                         item = wt.Func(self.store, ty, lazy, access_caller=True)
                         self.lazy.append(nm)
-                elif m == "wasi_snapshot_preview1" and isinstance(ty, wt.FuncType):
-                    # the glue gives a side module the main module's WASI imports: the adapter's (fd_read, fd_write,
-                    # fd_close, fd_fdstat_get) or wasmtime's own
-                    item = self._env_func(nm) if nm in _wasm.WASI_ROUTED else None
-                    if item is None:
-                        item = self._wasi_func(nm)
-                elif m in ("GOT.mem", "GOT.func"):
-                    item = wt.Global(c, wt.GlobalType(i32, True), wt.Val.i32(0))
+                why = self._link_error(i, imp, item, number)
+                if why:
+                    return self._dl_reason(why)
+                if m in ("GOT.mem", "GOT.func"):
                     got.append(item)
-                else:
-                    raise RuntimeError(f"unresolved import {m}.{nm}")
                 linker.define(c, m, nm, item)
             inst = linker.instantiate(c, module)
             ex = inst.exports(c)
             exports = {e.name: ex[e.name] for e in module.exports}
+            for e in module.exports:  # relocateExports: ToInt32 of `value + memoryBase`, which a BigInt cannot do
+                t = e.type
+                if isinstance(t, wt.GlobalType) and str(t.content) == "i64" and not t.mutable:
+                    return self._dl_reason("TypeError: Cannot mix BigInt and other types, use explicit conversions")
             own.update(exports)
-            self.instances.append({"exports": exports, "got": got, "global": False})
+            self.instances.append({"exports": exports, "got": got, "global": False, "base": mb & 0xFFFFFFFF})
             return len(self.instances) - 1
         except Exception as exc:
             return self._dl_fail("LinkError: WebAssembly.Instance()", exc)
@@ -786,15 +882,27 @@ class Pyodide:
         exports = self.instances[id_]["exports"]
         e = exports.get(name)
         if isinstance(e, wt.Global):
-            kind = str(e.type(c).content)
-            val = e.value(c)
-            if kind not in ("i32", "f32", "f64"):  # an i64 or a reference: the glue's ToInt32 throws on it
-                self._wr(out, struct.pack("<II", 0, 0))
+            ty = e.type(c)
+            kind, val = str(ty.content), e.value(c)
+            base = self.instances[id_].get("base", 0)  # the glue's relocateExports: an immutable global + memoryBase
+            if kind in ("i32", "f32", "f64"):
+                # ToInt32 of the number, NaN and infinity are 0 (the sum of a float and the base is a float too)
+                v = val if ty.mutable else val + base
+                v = int(v) if v == v and abs(v) != float("inf") else 0
+                self._wr(out, struct.pack("<II", 1, 0))
+                return _s32(v & 0xFFFFFFFF)
+            if ty.mutable:  # a reference (ToNumber: 0) or an i64 (ToInt32 throws) is no GOT symbol
+                if struct.unpack("<I", self._rd(out + 4, 4))[0] == 0:  # the GOT asks (out[1] = 0)
+                    return 0
+                if kind == "i64":
+                    raise RuntimeError("TypeError: Cannot convert a BigInt value to a number")
+                self._wr(out, struct.pack("<II", 1, 0))
                 return 0
-            if kind != "i32":  # ToInt32 of a number: truncated, wrapped, NaN and infinity are 0
-                val = int(val) if val == val and abs(val) != float("inf") else 0
-            self._wr(out, struct.pack("<II", 1, 0))
-            return _s32(val & 0xFFFFFFFF)
+            if kind != "i64":  # an immutable reference: null + base is the base, a function + base is NaN
+                self._wr(out, struct.pack("<II", 1, 0))
+                return _s32((base if getattr(val, "value", 1) is None else 0) & 0xFFFFFFFF)
+            self._wr(out, struct.pack("<II", 0, 0))
+            return 0
         if isinstance(e, wt.Func):
             if (id_, name) in self.slots:
                 slot, new = self.slots[(id_, name)], False

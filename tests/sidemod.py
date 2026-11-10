@@ -62,7 +62,6 @@ def lib_parts(
     got_funcs: tuple[str, ...] = (),
     got_mems: tuple[str, ...] = (),
     data: tuple[str, ...] = (),
-    other_globals: bool = False,
     callbacks: bool = False,
     wasi: bool = False,
     garbage: int = 0,
@@ -99,9 +98,6 @@ def lib_parts(
     w.append("  (elem (global.get $tb) func $v)")
     for d in data:
         w.append(f'  (global (export "{d}") i32 (i32.const 0))')
-    if other_globals:  # exported globals that are no address: f64 and i64
-        w.append('  (global (export "gf64") f64 (f64.const 1.5))')
-        w.append('  (global (export "gi64") i64 (i64.const 7))')
     if wasi:  # fd_write of an empty buffer to stdout, and random_get of 8 bytes: 0 is success
         w.append('  (func (export "rnd") (result i32) (call $random_get (global.get $mb) (i32.const 8)))')
         w.append(
@@ -135,15 +131,17 @@ def lib_parts(
 
 
 def guest_chain(directory: str, count: int, wasm: bytes, dy: dict[str, int]) -> str:
-    """Guest source that writes `count` copies of `wasm` as <directory>/l<i>.so, each NEEDing the next one (the guest
-    builds them: 600 modules would not fit on a command line)."""
+    """Guest source that writes `count` copies of `wasm` as <directory>/l<i>.so, each NEEDing the next one, found by
+    its runtime path $ORIGIN (the guest builds them: 600 modules would not fit on a command line)."""
     import inspect
 
     src = "".join(inspect.getsource(f) + "\n" for f in (uleb, name, with_dylink))
     return (
         f"import os\n{src}\nos.makedirs({directory!r}, exist_ok=True)\nW = bytes.fromhex({wasm.hex()!r})\n"
         f"for i in range({count}):\n"
-        f"    open({directory!r} + '/l%d.so' % i, 'wb').write(with_dylink(W, needed=('l%d.so' % (i + 1),), **{dy!r}))\n"
+        f"    nd = ('l%d.so' % (i + 1),) if i < {count - 1} else ()\n"
+        f"    open({directory!r} + '/l%d.so' % i, 'wb').write(\n"
+        f"        with_dylink(W, needed=nd, rpaths=('$ORIGIN',), **{dy!r}))\n"
     )
 
 

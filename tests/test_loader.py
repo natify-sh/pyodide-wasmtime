@@ -85,23 +85,183 @@ def test_a_failed_load_prints_nothing_on_stderr(flavor: str):
     assert "instantiate failed" not in p.stderr and "[loader]" not in p.stderr
 
 
-def test_engine_errors_are_the_dlerror(guest: Guest):
-    # a valid module whose import nobody answers: a link error, with the engine's reason
-    wat = '(module (import "env" "memory" (memory 1)) (import "nowhere" "x" (func)))'
+_M = '(import "env" "memory" (memory 1)) '
+_PRE = "LinkError: WebAssembly.Instance(): "
+_GLOBAL = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
+_GOT_TYPE = "imported global does not match the expected "
+_TYPE_ERR = "TypeError: WebAssembly.Instance(): "
+
+
+def _imp(i: int, m: str, f: str) -> str:
+    return f'Import #{i} module="{m}" function="{f}": '
+
+
+def _nowhere(i: int) -> str:
+    return _TYPE_ERR + f'Import #{i} module="nowhere": module is not an object or function'
+
+
+# A module that imports what the glue's import object does not give, or gives another way: the class and the text
+# are V8's, as Pyodide 315.0.0a2 on Node 22 printed them (the dlerror after "could not load dynamic lib: p\n").
+# <N> stands for a number that depends on the memory (pages, table slots).
+_TAB = f'{_M} (import "env" "__indirect_function_table" (table '
+LINK_ERRORS = {
+    "unknown module": (f'(module {_M} (import "nowhere" "x" (func)))', _nowhere(1)),
+    "unknown module, a global": (f'(module {_M} (import "nowhere" "x" (global i32)))', _nowhere(1)),
+    "unknown module first": (f'(module (import "nowhere" "x" (func)) {_M})', _nowhere(0)),
+    "unknown module before a type error": (  # V8 looks at all the modules before it checks any type
+        f'(module {_M} (import "env" "malloc" (func (param i64) (result i32))) (import "nowhere" "y" (func)))',
+        _nowhere(2),
+    ),
+    "malloc with an i64": (
+        f'(module {_M} (import "env" "malloc" (func (param i64) (result i32))))',
+        _PRE + _imp(1, "env", "malloc") + "imported function does not match the expected type",
+    ),
+    "malloc without a result": (
+        f'(module {_M} (import "env" "malloc" (func (param i32))))',
+        _PRE + _imp(1, "env", "malloc") + "imported function does not match the expected type",
+    ),
+    "an env global": (f'(module {_M} (import "env" "foo" (global i32)))', _PRE + _imp(1, "env", "foo") + _GLOBAL),
+    "a mutable __memory_base": (
+        f'(module {_M} (import "env" "__memory_base" (global (mut i32))))',
+        _PRE + _imp(1, "env", "__memory_base") + "imported mutable global must be a WebAssembly.Global object",
+    ),
+    "an i64 __memory_base": (
+        f'(module {_M} (import "env" "__memory_base" (global i64)))',
+        _PRE + _imp(1, "env", "__memory_base") + _GLOBAL,
+    ),
+    "__table_base as a function": (
+        f'(module {_M} (import "env" "__table_base" (func)))',
+        _PRE + _imp(1, "env", "__table_base") + "function import requires a callable",
+    ),
+    "a memory of 60000 pages": (
+        '(module (import "env" "memory" (memory 60000)))',
+        _PRE
+        + _imp(0, "env", "memory")
+        + r"memory import has <N> pages which is smaller than the declared initial of 60000",
+    ),
+    "a memory with a maximum of 2": (
+        '(module (import "env" "memory" (memory 1 2)))',
+        _PRE
+        + _imp(0, "env", "memory")
+        + "memory import has a larger maximum size 65536 than the module's declared maximum 2",
+    ),
+    "a shared memory": (
+        '(module (import "env" "memory" (memory 1 65536 shared)))',
+        _PRE + _imp(0, "env", "memory") + "mismatch in shared state of memory, declared = 1, imported = 0",
+    ),
+    "a table of 100000000": (
+        f"(module {_TAB} 100000000 funcref)))",
+        "RangeError: WebAssembly.Instance(): initial table size (100000000 elements) is larger than implementation "
+        "limit (10000000 elements)",
+    ),
+    "a table of 5000000": (
+        f"(module {_TAB} 5000000 funcref)))",
+        _PRE + r"table import 1 is smaller than initial 5000000, got <N>",
+    ),
+    "an externref table": (
+        f"(module {_TAB} 0 externref)))",
+        _PRE + _imp(1, "env", "__indirect_function_table") + "imported table does not match the expected type",
+    ),
+    "a table with a maximum": (
+        f"(module {_TAB} 0 5 funcref)))",
+        _PRE + "table import 1 has no maximum length, expected 5",
+    ),
+    "an immutable __stack_pointer": (
+        f'(module {_M} (import "env" "__stack_pointer" (global i32)))',
+        _PRE + _imp(1, "env", "__stack_pointer") + _GOT_TYPE + "mutability",
+    ),
+    "an i64 __stack_pointer": (
+        f'(module {_M} (import "env" "__stack_pointer" (global (mut i64))))',
+        _PRE + _imp(1, "env", "__stack_pointer") + _GOT_TYPE + "type",
+    ),
+    "an immutable GOT.mem": (
+        f'(module {_M} (import "GOT.mem" "x" (global i32)))',
+        _PRE + _imp(1, "GOT.mem", "x") + _GOT_TYPE + "mutability",
+    ),
+    "an i64 GOT.mem": (
+        f'(module {_M} (import "GOT.mem" "x" (global (mut i64))))',
+        _PRE + _imp(1, "GOT.mem", "x") + _GOT_TYPE + "type",
+    ),
+    "a GOT.mem function": (
+        f'(module {_M} (import "GOT.mem" "x" (func)))',
+        _PRE + _imp(1, "GOT.mem", "x") + "function import requires a callable",
+    ),
+    "an immutable GOT.func": (
+        f'(module {_M} (import "GOT.func" "x" (global i32)))',
+        _PRE + _imp(1, "GOT.func", "x") + _GOT_TYPE + "mutability",
+    ),
+    "a GOT.mem memory": (
+        f'(module {_M} (import "GOT.mem" "x" (memory 1)))',
+        _PRE + _imp(1, "GOT.mem", "x") + "memory import must be a WebAssembly.Memory object",
+    ),
+    "a GOT.mem table": (
+        f'(module {_M} (import "GOT.mem" "x" (table 1 funcref)))',
+        _PRE + _imp(1, "GOT.mem", "x") + "table import requires a WebAssembly.Table",
+    ),
+    "memory as a function": (
+        '(module (import "env" "memory" (func)))',
+        _PRE + _imp(0, "env", "memory") + "function import requires a callable",
+    ),
+    "memory as a global": (
+        '(module (import "env" "memory" (global i32)))',
+        _PRE + _imp(0, "env", "memory") + _GLOBAL,
+    ),
+    "the table as a function": (
+        f'(module {_M} (import "env" "__indirect_function_table" (func)))',
+        _PRE + _imp(1, "env", "__indirect_function_table") + "function import requires a callable",
+    ),
+    "a WASI global": (
+        f'(module {_M} (import "wasi_snapshot_preview1" "fd_write" (global i32)))',
+        _PRE + _imp(1, "wasi_snapshot_preview1", "fd_write") + _GLOBAL,
+    ),
+    "an unknown WASI function is a stub": (
+        f'(module {_M} (import "wasi_snapshot_preview1" "nosuch_fn" (func)))',
+        "loaded",
+    ),
+    "an unknown tag": (
+        f'(module {_M} (import "env" "__zzz" (tag (param i32))))',
+        _PRE + _imp(1, "env", "__zzz") + "tag import requires a WebAssembly.Tag",
+    ),
+}
+
+
+def test_link_failures_have_the_class_and_the_text_of_the_js_api(guest: Guest):
+    import re
+
     from wasmtime import wat2wasm
 
-    files = {"/t/link.so": sidemod.with_dylink(bytes(wat2wasm(wat)))}
+    files = {f"/e/{i}.so": sidemod.with_dylink(bytes(wat2wasm(wat))) for i, (wat, _) in enumerate(LINK_ERRORS.values())}
     out = ok(
         guest,
         files,
+        f"""
+for i in range({len(LINK_ERRORS)}):
+    try:
+        ctypes.CDLL("/e/%d.so" % i)
+        print("loaded")
+    except OSError as e:
+        print(str(e).replace("\\n", "|").split("|", 1)[1])
+""",
+    )
+    assert len(out) == len(LINK_ERRORS)
+    for (name, (_, want)), got in zip(LINK_ERRORS.items(), out, strict=True):
+        assert re.fullmatch(re.escape(want).replace("<N>", r"\d+"), got), (name, got)
+
+
+def test_a_module_the_engine_rejects_says_so_with_the_js_class(guest: Guest):
+    # the reason after the colon is the engine's own validator message (V8's on Pyodide, wasmtime's here)
+    bad = bytes.fromhex("0061736d01000000010401600000030201000a0501030041000b")
+    out = ok(
+        guest,
+        {"/e/bad.so": sidemod.with_dylink(bad)},
         """
 try:
-    ctypes.CDLL("/t/link.so")
+    ctypes.CDLL("/e/bad.so")
 except OSError as e:
     print(str(e).replace("\\n", "|"))
 """,
     )
-    assert out[0].startswith("could not load dynamic lib: /t/link.so|LinkError: WebAssembly.Instance(): ")
+    assert out[0].startswith("could not load dynamic lib: /e/bad.so|CompileError: WebAssembly.Module(): ")
 
 
 def test_dlsym_and_function_pointers(guest: Guest):
@@ -186,7 +346,7 @@ FILES_SCOPE = {
     "/m/a.so": sidemod.lib(1, fn="val"),
     "/m/b.so": sidemod.lib(2, fn="val", got_funcs=("val",)),
     "/m/c.so": sidemod.lib(3, fn="c", env_calls=("val",)),
-    "/m/e.so": sidemod.lib(5, fn="e", env_calls=("val",), needed=("a.so",)),
+    "/m/e.so": sidemod.lib(5, fn="e", env_calls=("val",), needed=("a.so",), rpaths=("$ORIGIN",)),
     "/m/g.so": sidemod.lib(9, fn="val"),
     "/m/d.so": sidemod.lib(4, fn="d", env_calls=("val",)),
 }
@@ -229,10 +389,13 @@ print("unreachable")
 
 
 def test_there_is_no_limit_of_libraries_or_of_needed_depth(guest: Guest):
-    chain = {f"/c/c{i}.so": sidemod.lib(i, fn=f"f{i}", needed=(f"c{i + 1}.so",) if i < 19 else ()) for i in range(20)}
+    chain = {
+        f"/c/c{i}.so": sidemod.lib(i, fn=f"f{i}", needed=(f"c{i + 1}.so",) if i < 19 else (), rpaths=("$ORIGIN",))
+        for i in range(20)
+    }
     cyc = {
-        "/y/x.so": sidemod.lib(1, fn="x", needed=("y.so",)),
-        "/y/y.so": sidemod.lib(2, fn="y", needed=("x.so",)),
+        "/y/x.so": sidemod.lib(1, fn="x", needed=("y.so",), rpaths=("$ORIGIN",)),
+        "/y/y.so": sidemod.lib(2, fn="y", needed=("x.so",), rpaths=("$ORIGIN",)),
     }
     out = ok(
         guest,
@@ -250,20 +413,25 @@ print("cycle", x.x(), ctypes.CDLL("/y/y.so").y())
 """,
     )
     assert out == ["300 libraries True 300", "chain 0 19 True", "cycle 1 2"]
+    # the depth: V8's stack ends a chain of NEEDED libraries at about 2000 (Pyodide on Node 22 loads 1800, fails with
+    # "RangeError: Maximum call stack size exceeded" from 2200); here 1500 below the first one is the cap
+    # (adapter.c MAXDEPTH, 1 MiB of wasm stack in _engine.py): deliberate difference, the text is V8's
     wasm, dy = sidemod.lib_parts(1)
     out = ok(
         guest,
         {},
-        sidemod.guest_chain("/d", 600, wasm, dy)
+        sidemod.guest_chain("/d", 1501, wasm, dy)
+        + sidemod.guest_chain("/e", 1502, wasm, dy)
         + r"""
-try:
-    ctypes.CDLL("/d/l0.so")
-    print("loaded")
-except OSError as e:
-    print(str(e).replace("\n", "|"))
+for d in ("/d", "/e"):
+    try:
+        ctypes.CDLL(d + "/l0.so")
+        print("loaded")
+    except OSError as e:
+        print(str(e).replace("\n", "|"))
 """,
     )
-    assert out == ["could not load dynamic lib: /d/l0.so|Error: too many nested NEEDED libraries"]
+    assert out == ["loaded", "could not load dynamic lib: /e/l0.so|RangeError: Maximum call stack size exceeded"]
 
 
 def test_a_side_module_may_import_wasi(guest: Guest):
@@ -280,7 +448,7 @@ print(w.wr(), w.rnd())
 
 def test_needed_libraries_are_searched_as_the_glue_does(guest: Guest):
     files = {
-        "/r/top.so": sidemod.lib(1, fn="top", needed=("dep.so", "viald.so", "beside.so"), rpaths=("$ORIGIN/sub",)),
+        "/r/top.so": sidemod.lib(1, fn="top", needed=("dep.so", "viald.so", "/r/beside.so"), rpaths=("$ORIGIN/sub",)),
         "/r/sub/dep.so": sidemod.lib(2, fn="dep"),
         "/r/ld/viald.so": sidemod.lib(3, fn="viald"),
         "/r/beside.so": sidemod.lib(4, fn="beside"),
@@ -296,6 +464,36 @@ print(top.top(), ctypes.CDLL("/r/sub/dep.so").dep(), ctypes.CDLL("/r/ld/viald.so
 """,
     )
     assert out == ["1 2 3 4"]
+
+
+def test_needed_is_not_searched_beyond_the_glues_search(guest: Guest):
+    # Pyodide 315.0.0a2 fails all three: next to the module, in /lib, or a loaded file of that name is no NEEDED library
+    files = {
+        "/p1/top.so": sidemod.lib(1, fn="top", needed=("beside.so",)),
+        "/p1/beside.so": sidemod.lib(2, fn="beside"),
+        "/p2/top.so": sidemod.lib(1, fn="top", needed=("zz_only.so",)),
+        "/lib/zz_only.so": sidemod.lib(2, fn="zz"),
+        "/p3/a/dep3.so": sidemod.lib(2, fn="dep"),
+        "/p3/top.so": sidemod.lib(1, fn="top", needed=("dep3.so",)),
+    }
+    out = ok(
+        guest,
+        files,
+        r"""
+ctypes.CDLL("/p3/a/dep3.so")
+for p in ("/p1/top.so", "/p2/top.so", "/p3/top.so"):
+    try:
+        ctypes.CDLL(p)
+        print("loaded", p)
+    except OSError as e:
+        print(str(e).replace("\n", "|"))
+""",
+    )
+    assert out == [
+        'could not load dynamic lib: /p1/top.so|Error: Failed to find dynamic library "beside.so"',
+        'could not load dynamic lib: /p2/top.so|Error: Failed to find dynamic library "zz_only.so"',
+        'could not load dynamic lib: /p3/top.so|Error: Failed to find dynamic library "dep3.so"',
+    ]
 
 
 def _cuts(lib_bytes: bytes) -> list[int]:
@@ -545,21 +743,130 @@ except AttributeError as e:
     assert out == ["AttributeError True"]
 
 
-def test_exported_globals_that_are_no_address(guest: Guest):
+_GLOBALS = {  # an exported global "g" (and "z", an immutable i32 0: the module's memory base) of each kind
+    "i64imm": '(global (export "g") i64 (i64.const 7))',
+    "i64mut": '(global (export "g") (mut i64) (i64.const 7))',
+    "i32mut": '(global (export "g") (mut i32) (i32.const 5))',
+    "i32imm": '(global (export "g") i32 (i32.const 5))',
+    "f64imm": '(global (export "g") f64 (f64.const -1.5))',
+    "f32imm": '(global (export "g") f32 (f32.const 2.5))',
+    "f64mut": '(global (export "g") (mut f64) (f64.const 7.9))',
+    "f32mut": '(global (export "g") (mut f32) (f32.const -3.5))',
+    "f64mutnan": '(global (export "g") (mut f64) (f64.const nan))',
+    "f64mutbig": '(global (export "g") (mut f64) (f64.const 4294967301.5))',
+    "f64immbig": '(global (export "g") f64 (f64.const 4294967301.5))',
+    "i32mutneg": '(global (export "g") (mut i32) (i32.const -5))',
+    "extimm": '(global (export "g") externref (ref.null extern))',
+    "extmut": '(global (export "g") (mut externref) (ref.null extern))',
+    "fnimm": '(global (export "g") funcref (ref.null func))',
+    "fnmut": '(global (export "g") (mut funcref) (ref.null func))',
+    "fnimm2": '(func $f) (global (export "g") funcref (ref.func $f)) (elem declare func $f)',
+}
+_SIDE = (
+    '(module (import "env" "memory" (memory 1)) (import "env" "__indirect_function_table" (table 0 funcref))'
+    ' (import "env" "__memory_base" (global $mb i32)) (import "env" "__table_base" (global $tb i32))'
+)
+
+
+def _glob_files() -> dict[str, bytes]:
+    from wasmtime import wat2wasm
+
+    def make(wat: str) -> bytes:
+        return sidemod.with_dylink(bytes(wat2wasm(wat)), memsize=16, memalign=4)
+
+    files = {}
+    for k, v in _GLOBALS.items():
+        v = v.replace('(export "g")', f'(export "g_{k}")')  # (the GOT is first-definition-wins: one name per case)
+        files[f"/o/{k}.so"] = make(_SIDE + v + ' (global (export "z") i32 (i32.const 0)))')
+        files[f"/o/i_{k}.so"] = make(
+            _SIDE.replace("(module ", f'(module (import "GOT.mem" "g_{k}" (global $g (mut i32))) ', 1)
+            + '(func (export "got") (result i32) (global.get $g)))'
+        )
+    return files
+
+
+def test_exported_globals_are_what_the_glues_relocateExports_makes_of_them(guest: Guest):
+    # Probed on Pyodide 315.0.0a2: an IMMUTABLE global becomes an i32 global holding ToInt32(value + memoryBase) (an
+    # i64 one fails the whole load); a MUTABLE one stays as it is (ToInt32(value), no base). dlsym and the GOT see
+    # the same numbers, but the GOT skips what is no number (an i64 or a reference global).
+    names = [k for k in _GLOBALS if k != "i64mut"]
     out = ok(
         guest,
-        {"/o/o.so": sidemod.lib(1, other_globals=True)},
-        r"""
-o = ctypes.CDLL("/o/o.so")
-for n in ("gf64", "gi64"):
+        _glob_files(),
+        f"""
+def T(e): return str(e).replace("\\n", "|")
+for k in {names!r}:
     try:
-        print(n, "found", isinstance(ctypes.c_int.in_dll(o, n).value, int))
-    except (AttributeError, ValueError) as e:
-        print(n, type(e).__name__)
-print(o.val())
+        o = ctypes.CDLL("/o/%s.so" % k)
+    except OSError as e:
+        print(k, "LOAD", T(e)); continue
+    z = ctypes.addressof(ctypes.c_int.in_dll(o, "z"))
+    try:
+        a = ctypes.addressof(ctypes.c_int.in_dll(o, "g_" + k))
+        print(k, "dlsym", (a - z if "imm" in k and k != "fnimm2" else a) & 0xFFFFFFFF)
+    except ValueError as e:
+        print(k, "dlsym", e)
+    try:
+        v = ctypes.CDLL("/o/i_%s.so" % k).got()
+        print(k, "GOT", (v - z if "imm" in k and k != "fnimm2" else v) & 0xFFFFFFFF)
+    except OSError as e:
+        print(k, "GOT", T(e).split("|", 1)[1])
 """,
     )
-    assert out[0].startswith("gf64 found") and out[1] in ("gi64 AttributeError", "gi64 ValueError") and out[2] == "1"
+
+    def u(k):
+        return f"Error: Dynamic linking error: undefined symbol 'g_{k}'"
+
+    def nf(k):
+        return f"symbol 'g_{k}' not found"
+
+    assert out == [
+        "i64imm LOAD could not load dynamic lib: /o/i64imm.so|TypeError: Cannot mix BigInt and other types, use "
+        "explicit conversions",
+        "i32mut dlsym 5",
+        "i32mut GOT 5",
+        "i32imm dlsym 5",
+        "i32imm GOT 5",
+        "f64imm dlsym 4294967294",
+        "f64imm GOT 4294967294",
+        "f32imm dlsym 2",
+        "f32imm GOT 2",
+        "f64mut dlsym 7",
+        "f64mut GOT 7",
+        "f32mut dlsym 4294967293",
+        "f32mut GOT 4294967293",
+        f"f64mutnan dlsym {nf('f64mutnan')}",
+        "f64mutnan GOT 0",
+        "f64mutbig dlsym 5",
+        "f64mutbig GOT 5",
+        "f64immbig dlsym 5",
+        "f64immbig GOT 5",
+        "i32mutneg dlsym 4294967291",
+        "i32mutneg GOT 4294967291",
+        "extimm dlsym 0",
+        "extimm GOT 0",
+        f"extmut dlsym {nf('extmut')}",
+        f"extmut GOT {u('extmut')}",
+        "fnimm dlsym 0",
+        "fnimm GOT 0",
+        f"fnmut dlsym {nf('fnmut')}",
+        f"fnmut GOT {u('fnmut')}",
+        f"fnimm2 dlsym {nf('fnimm2')}",
+        "fnimm2 GOT 0",
+    ]
+
+
+def test_a_mutable_i64_global_is_no_got_symbol_and_dlsym_of_it_ends_the_process(guest: Guest):
+    # Pyodide: dlsym returns the Global object to wasm, ToInt32 of a BigInt throws TypeError out of the call: its
+    # "fatal error" (the process ends). Here the host stops the process with the same TypeError text.
+    files = _glob_files()
+    p = run(
+        guest,
+        files,
+        'o = ctypes.CDLL("/o/i64mut.so")\nprint("loaded", flush=True)\nctypes.c_int.in_dll(o, "g_i64mut")\n',
+    )
+    assert p.stdout.splitlines() == ["loaded"] and p.returncode != 0
+    assert "Cannot convert a BigInt value to a number" in p.stderr
 
 
 def test_legacy_exceptions_and_wasi_together(guest: Guest):

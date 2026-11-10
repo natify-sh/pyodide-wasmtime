@@ -61,7 +61,7 @@ GL and the like, zero/null stubs):
   (`fd_prestat_*`, as wasi-libc does) and an absolute path goes to the longest matching one; modes and times
   are accepted and ignored;
 * **the loader** (`_dlopen_js`, `_dlsym_js`, `ffi_closure_*`): the file through WASI, `dylink.0` (sizes and
-  **NEEDED**: the libraries a module needs are loaded first, next to it or in `/lib`), the GOT (its own
+  **NEEDED**: the libraries a module needs are loaded first, found as the glue finds them: the runtime paths, `LD_LIBRARY_PATH`, else the name as written), the GOT (its own
   symbols, the main module's, the libraries loaded before), memory from `calloc`, table slots, relocations,
   constructors;
 * **`ffi_call_js`** (ctypes and cffi calls) and **`ffi_prep_closure_loc_js`** (callbacks): host operations (`loader.ffi_call`,
