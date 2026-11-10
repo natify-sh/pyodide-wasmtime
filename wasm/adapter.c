@@ -84,6 +84,7 @@ LOADER("localtime") i32 host_localtime(i64 t, i32 *tm);  // tm_isdst and tm_gmto
 LOADER("mktime") i64 host_mktime(i32 *tm);
 LOADER("tzset") void host_tzset(i32 *timezone, i32 *daylight, char *std_name, char *dst_name);
 LOADER("sigcell") u32 *host_sigcell(void);  // the word where the host posts a signal for Python
+LOADER("depth") i32 host_depth(void);       // how many NEEDED libraries may nest (the wasm stack in force decides)
 LOADER("runtime") u32 host_runtime(void);   // a malloc'd string naming the runtime
 
 #define AT_FDCWD (-100)
@@ -1326,7 +1327,6 @@ static char *norm_path(const char *s) {
 //  6 truncated or malformed             7 undefined symbol (arg)          8 cannot be read
 //  9 out of memory or table            10 NEEDED libraries nested too deep  11 the engine's own reason
 //  12 dlsym: unknown symbol (arg) in the library (name; no name: the main module)     +256: from emscripten_dlopen
-#define MAXDEPTH 1500
 static Lib *fail(Libs *L, u32 code, const u8 *arg, i32 n) {
     free(L->arg);
     L->code = code, L->arg = 0, L->argn = 0;
@@ -1521,7 +1521,7 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
         }
         return x;
     }
-    if (depth > MAXDEPTH) return fail(L, 10, 0, 0);
+    if (depth > host_depth()) return fail(L, 10, 0, 0);
 
     u8 *b = 0;
     i32 size = 0, own = 1;

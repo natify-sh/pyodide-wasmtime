@@ -415,13 +415,19 @@ print("cycle", x.x(), ctypes.CDLL("/y/y.so").y())
     assert out == ["300 libraries True 300", "chain 0 19 True", "cycle 1 2"]
     # the depth: V8's stack ends a chain of NEEDED libraries at about 2000 (Pyodide on Node 22 loads 1800, fails with
     # "RangeError: Maximum call stack size exceeded" from 2200); here 1500 below the first one is the cap
-    # (adapter.c MAXDEPTH, 1 MiB of wasm stack in _engine.py): deliberate difference, the text is V8's
+    # (_engine.depth_cap for the 1 MiB wasm stack of _engine.wasm_stack; 800 with the default one): deliberate difference,
+    # the text is V8's
+    from pyodide_wasmtime import _engine
+
+    cap = _engine.depth_cap(
+        _engine._wasm_stack()
+    )  # 1500 on Linux and macOS, 800 where the stack is not known to be big
     wasm, dy = sidemod.lib_parts(1)
     out = ok(
         guest,
         {},
-        sidemod.guest_chain("/d", 1501, wasm, dy)
-        + sidemod.guest_chain("/e", 1502, wasm, dy)
+        sidemod.guest_chain("/d", cap + 1, wasm, dy)
+        + sidemod.guest_chain("/e", cap + 2, wasm, dy)
         + r"""
 for d in ("/d", "/e"):
     try:
@@ -432,6 +438,20 @@ for d in ("/d", "/e"):
 """,
     )
     assert out == ["loaded", "could not load dynamic lib: /e/l0.so|RangeError: Maximum call stack size exceeded"]
+
+
+def test_the_wasm_stack_and_the_depth_cap_follow_the_native_stack():
+    from pyodide_wasmtime import _engine
+
+    big, small = _engine.BIG_WASM_STACK, _engine.DEFAULT_WASM_STACK
+    ws = _engine.wasm_stack
+    assert ws("linux", 8 << 20, True) == big and ws("darwin", 8 << 20, True) == big
+    assert ws("linux", -1, True) == big  # unlimited
+    assert ws("linux", 4 * big, True) == big and ws("linux", 4 * big - 1, True) == small
+    assert ws("win32", 8 << 20, True) == small  # a 1 MiB main thread: never more than wasmtime's default
+    assert ws("linux", 8 << 20, False) == small  # not the main thread (macOS: 512 KiB)
+    assert ws("linux", None, True) == small  # no resource module
+    assert _engine.depth_cap(big) == 1500 and _engine.depth_cap(small) == 800
 
 
 def test_a_side_module_may_import_wasi(guest: Guest):

@@ -1769,6 +1769,11 @@ class Pyodide:
         self._wr(dst_name, zone(dst))
 
     # ------------------------------------------------------------------ signals and the runtime's name
+    def _dl_depth(self) -> int:
+        """How many NEEDED libraries the adapter may nest: what the wasm stack in force allows."""
+        _engine.engine()
+        return _engine.depth_cap(_engine._STATE["wasm_stack"])
+
     def _sigcell(self) -> int:
         """The word that `_Py_CheckEmscriptenSignals_Helper` reads (JavaScript's Py_EmscriptenSignalBuffer)."""
         self.host_state = True
@@ -2011,6 +2016,7 @@ class Pyodide:
             "tzset",
             "sigcell",
             "runtime",
+            "depth",
         )
     )
 
@@ -2057,6 +2063,7 @@ class Pyodide:
             "tzset": (self._t_tzset, ft(4, 0)),
             "sigcell": (self._sigcell, ft(0)),
             "runtime": (self._runtime_name, ft(0)),
+            "depth": (self._dl_depth, ft(0)),
             "error": (self._dl_error, ft(5, 0)),
         }
         net = {

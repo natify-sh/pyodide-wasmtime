@@ -87,6 +87,39 @@ class LazyExports(Mapping):
         return len(self._names)
 
 
+DEFAULT_WASM_STACK = 512 * 1024  # wasmtime's own
+BIG_WASM_STACK = 1 << 20
+
+
+def wasm_stack(platform: str, soft_limit: int | None, main_thread: bool) -> int:
+    """The wasm stack to ask wasmtime for. wasm runs on the native thread stack, so more than the default only where
+    that is known to be big: not on Windows (a 1 MiB main thread), not off the main thread (macOS gives 512 KiB), and
+    only when the soft RLIMIT_STACK (None: unknown; negative: unlimited) is at least 4 times what is asked."""
+    if platform == "win32" or not main_thread or soft_limit is None:
+        return DEFAULT_WASM_STACK
+    return BIG_WASM_STACK if soft_limit < 0 or soft_limit >= 4 * BIG_WASM_STACK else DEFAULT_WASM_STACK
+
+
+def depth_cap(stack: int) -> int:
+    """How many NEEDED libraries may nest below the first, for that wasm stack (measured on Linux, fused and dynamic:
+    1 MiB loads 1500 and traps at about 2000; the default 512 KiB loads 1000 and traps at 1200)."""
+    return 1500 if stack >= BIG_WASM_STACK else 800
+
+
+def _wasm_stack() -> int:
+    import threading
+
+    try:
+        import resource
+
+        soft: int | None = resource.getrlimit(resource.RLIMIT_STACK)[0]
+        if soft == resource.RLIM_INFINITY:
+            soft = -1
+    except (ImportError, ValueError, OSError):
+        soft = None
+    return wasm_stack(sys.platform, soft, threading.current_thread() is threading.main_thread())
+
+
 def engine() -> Any:
     """One engine: exceptions (exnref), function references and GC are what Pyodide and the trampoline need."""
     if "engine" not in _STATE:
@@ -95,7 +128,7 @@ def engine() -> Any:
         cfg.wasm_exceptions = True
         cfg.wasm_function_references = True
         cfg.wasm_gc = True
-        cfg.max_wasm_stack = 1 << 20  # 2x the default: the loader's NEEDED recursion is 1500 deep (adapter.c MAXDEPTH)
+        _STATE["wasm_stack"] = cfg.max_wasm_stack = _wasm_stack()  # the loader's NEEDED recursion runs on it
         _STATE["engine"] = wt.Engine(cfg)
     return _STATE["engine"]
 
