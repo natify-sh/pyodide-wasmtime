@@ -40,8 +40,8 @@ def test_fused_imports_only_wasi_loader_net():
     assert sorted({i.module for i in m.imports}) == ["loader", "net", "wasi_snapshot_preview1"]
     counts = {mod: sum(i.module == mod for i in m.imports) for mod in ("wasi_snapshot_preview1", "loader", "net")}
     # 36 WASI imports (the main module's own and the adapter's: files, links, dup, fcntl, exit), the loader's 4
-    # operations and the 10 of the host's sockets
-    assert counts == {"wasi_snapshot_preview1": 36, "loader": 4, "net": 10}
+    # operations and the 22 of the host's sockets and names
+    assert counts == {"wasi_snapshot_preview1": 36, "loader": 4, "net": 22}
 
 
 def test_the_package_carries_what_the_run_time_needs():
