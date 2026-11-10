@@ -36,6 +36,11 @@ WASI("path_unlink_file") i32 w_unlink(i32 fd, const char *p, i32 n);
 WASI("path_remove_directory") i32 w_rmdir(i32 fd, const char *p, i32 n);
 WASI("path_rename") i32 w_rename(i32 fd, const char *p, i32 n, i32 fd2, const char *p2, i32 n2);
 WASI("fd_filestat_set_size") i32 w_fd_set_size(i32 fd, u64 size);
+WASI("path_symlink") i32 w_symlink(const char *old, i32 oldn, i32 fd, const char *new_, i32 newn);
+WASI("path_link") i32 w_link(i32 ofd, i32 oflags, const char *op, i32 on, i32 nfd, const char *np, i32 nn);
+WASI("fd_allocate") i32 w_fd_allocate(i32 fd, u64 offset, u64 len);
+WASI("fd_datasync") i32 w_fd_datasync(i32 fd);
+WASI("proc_exit") __attribute__((noreturn)) void w_proc_exit(i32 code);
 
 // the main module's allocator (resolved from its exports, like any side module's import)
 void *malloc(u32 n);
@@ -311,9 +316,46 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     return -ENOTTY;
 }
 
+static i32 is_sock(i32 fd);
+WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
+WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
+
+// fcntl: the flags are WASI's fdflags (append, nonblock) and rights; descriptors can not be duplicated in WASI 0.1 (ENOSYS).
 EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
-    (void)fd, (void)cmd, (void)va;
-    return 0;
+    switch (cmd) {
+        case 1:  // F_GETFD: FD_CLOEXEC is not kept (there is no exec)
+        case 2:  // F_SETFD
+            return 0;
+        case 3: {  // F_GETFL
+            if (is_sock(fd)) return 2;  // O_RDWR
+            u8 st[24] __attribute__((aligned(8)));
+            i32 e = w_fd_fdstat_get(fd, st);
+            if (e) return -e;
+            u16 ff = *(u16 *)(st + 2);
+            u64 rights = *(u64 *)(st + 8);
+            i32 r = (rights & (1ull << 1)) != 0, w = (rights & (1ull << 6)) != 0;
+            i32 fl = r && w ? 2 : w ? 1 : 0;  // O_RDWR, O_WRONLY, O_RDONLY
+            if (ff & 1) fl |= 02000;          // O_APPEND
+            if (ff & 4) fl |= 04000;          // O_NONBLOCK
+            return fl;
+        }
+        case 4: {  // F_SETFL: append and nonblock only
+            if (is_sock(fd)) return 0;
+            i32 ff = 0;
+            if (va & 02000) ff |= 1;
+            if (va & 04000) ff |= 4;
+            i32 e = w_fd_fdstat_set_flags(fd, ff);
+            return e ? -e : 0;
+        }
+        case 6:  // F_SETLK
+        case 7:  // F_SETLKW: one process, so a lock is always granted
+            return 0;
+        case 0:     // F_DUPFD
+        case 1030:  // F_DUPFD_CLOEXEC
+            return -52;  // ENOSYS
+        default:
+            return -28;  // EINVAL
+    }
 }
 
 EXPORT("_emscripten_get_progname") void get_progname(char *buf, i32 len) {
@@ -697,6 +739,60 @@ EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
     i32 e = w_fd_set_size(fd, (u64)len);
     return e ? -e : 0;
 }
+
+EXPORT("__syscall_truncate64") i32 sc_truncate64(const char *path, i64 len) {
+    char dot[2];
+    const char *p;
+    i32 n, fd = resolve(AT_FDCWD, path, &p, &n, dot), out = -1;
+    i32 e = w_path_open(fd, 1, p, n, 0, (1ull << 6) | (1ull << 22), 0, 0, &out);  // rights: FD_WRITE (opens it for writing), FD_FILESTAT_SET_SIZE
+    if (e) return -e;
+    e = w_fd_set_size(out, (u64)len);
+    w_fd_close(out);
+    return e ? -e : 0;
+}
+
+EXPORT("__syscall_fallocate") i32 sc_fallocate(i32 fd, i32 mode, i64 offset, i64 len) {
+    (void)mode;
+    i32 e = w_fd_allocate(fd, (u64)offset, (u64)len);
+    return e ? -e : 0;
+}
+
+EXPORT("__syscall_fdatasync") i32 sc_fdatasync(i32 fd) {
+    i32 e = w_fd_datasync(fd);
+    return e ? -e : 0;
+}
+
+// advice only: nothing to do (the answer of every libc when the kernel ignores it)
+EXPORT("__syscall_fadvise64") i32 sc_fadvise64(i32 fd, i64 offset, i64 len, i32 advice) {
+    (void)fd, (void)offset, (void)len, (void)advice;
+    return 0;
+}
+
+EXPORT("__syscall_symlinkat") i32 sc_symlinkat(const char *target, i32 newdirfd, const char *linkpath) {
+    char dot[2];
+    const char *p;
+    i32 n, fd = resolve(newdirfd, linkpath, &p, &n, dot);
+    i32 e = w_symlink(target, slen(target), fd, p, n);  // the target is stored as it is
+    return e ? -e : 0;
+}
+
+EXPORT("__syscall_linkat") i32 sc_linkat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath, i32 flags) {
+    char d1[2], d2[2];
+    const char *p1, *p2;
+    i32 n1, n2, f1 = resolve(olddirfd, oldpath, &p1, &n1, d1), f2 = resolve(newdirfd, newpath, &p2, &n2, d2);
+    i32 e = w_link(f1, (flags & 0x400) ? 1 : 0, p1, n1, f2, p2, n2);  // AT_SYMLINK_FOLLOW
+    return e ? -e : 0;
+}
+
+// the process runs as root of a single-user world (as Pyodide's JavaScript glue answers)
+EXPORT("__syscall_getuid32_js") i32 sc_getuid(void) { return 0; }
+EXPORT("__syscall_geteuid32") i32 sc_geteuid(void) { return 0; }
+EXPORT("__syscall_getgid32") i32 sc_getgid(void) { return 0; }
+EXPORT("__syscall_getegid32") i32 sc_getegid(void) { return 0; }
+EXPORT("__syscall_umask_js") i32 sc_umask(i32 mask) { (void)mask; return 022; }  // the previous mask; WASI has none
+
+// exit(): the process ends, with the code (Emscripten's JavaScript glue throws; here WASI says it)
+EXPORT("exit") void sc_exit(i32 code) { w_proc_exit(code); }
 
 // permissions and times: accepted and ignored (WASI preview1 has no modes; times are not needed here)
 EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 a, i32 b, i32 c, i32 d) { (void)a, (void)b, (void)c, (void)d; return 0; }
