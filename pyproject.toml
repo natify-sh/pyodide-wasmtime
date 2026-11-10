@@ -88,6 +88,7 @@ select = ["E", "F", "I", "UP", "B"]
 # WAT text in strings
 "src/pyodide_wasmtime/_wasm.py" = ["E501"]
 "tools/fuse.py" = ["E501"]
+"tools/wasip2/gen_net.py" = ["E501"]
 # guest programs: they run inside Pyodide's CPython, import after setting things up, and print what the checks read
 "src/pyodide_wasmtime/guest/*.py" = ["E402", "E501"]
 "tests/checks/*.py" = ["E402", "E501"]

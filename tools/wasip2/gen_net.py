@@ -7,7 +7,17 @@ NAMES = (
     "NOEXEC NOLCK NOLINK NOMEM NOMSG NOPROTOOPT NOSPC NOSYS"
 ).split()
 ENOSYS = -NAMES.index("NOSYS")
-PARAMS = {"socket": 3, "connect": 4, "send": 3, "recv": 4, "poll": 3, "close": 1, "shutdown": 2, "name": 4, "resolve": 3}
+PARAMS = {
+    "socket": 3,
+    "connect": 4,
+    "send": 3,
+    "recv": 4,
+    "poll": 3,
+    "close": 1,
+    "shutdown": 2,
+    "name": 4,
+    "resolve": 3,
+}
 
 print("(module")
 for name, n in PARAMS.items():
