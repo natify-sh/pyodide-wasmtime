@@ -17,7 +17,6 @@ import errno
 import json
 import logging
 import os
-import posixpath
 import select
 import shutil
 import socket
@@ -448,29 +447,40 @@ class Pyodide:
         return 0
 
     # ------------------------------------------------------------------ the host's view of the files
-    def _host_path(self, guest: str) -> str:
-        """The host path behind an absolute guest path: under the longest mount that matches, else the guest's root."""
+    def _preopen_dir(self, pfd: int) -> str | None:
+        """The host folder of a preopen, named by its WASI descriptor (3 + its place in the order they are opened here:
+        the guest's root, the mounts, /dev). The guest never gives the host a path: the adapter has proved that the
+        guest's path exists through WASI and names only the preopen it belongs to."""
         assert self.root is not None
-        path = posixpath.normpath("/" + guest)
-        best, host = "", str(self.root)
-        for g, h in self.mounts.items():
-            g = posixpath.normpath("/" + g)
-            if (path == g or path.startswith(g.rstrip("/") + "/")) and len(g) > len(best):
-                best, host = g, h
-        return os.path.join(host, path[len(best) :].lstrip("/"))
+        dirs = [str(self.root), *self.mounts.values()]
+        if self.preopen_dev:
+            dirs.append("/dev")
+        return dirs[pfd - 3] if 3 <= pfd < 3 + len(dirs) else None
 
-    def _fs_statvfs(self, pp: int, n: int, buf: int) -> int:
-        """statfs of the folder behind a guest path -> Emscripten's (musl's) struct statfs64, 88 bytes at ``buf``."""
+    def _fs_statvfs(self, pfd: int, buf: int) -> int:
+        """statfs of a preopen's folder -> Emscripten's struct statfs64 (88 bytes) at ``buf``; -errno on failure.
+        Without os.statvfs (Windows) the numbers come from shutil.disk_usage: the files and ffree counts are 0."""
         try:
-            st = os.statvfs(self._host_path(self._rd(pp, n).decode("utf-8", "surrogateescape")))
+            host = self._preopen_dir(pfd)
+            if host is None:
+                return -WASI_ERRNO["BADF"]
+            b = bytearray(88)
+            if hasattr(os, "statvfs"):
+                st = os.statvfs(host)
+                struct.pack_into("<I", b, 4, st.f_bsize)
+                struct.pack_into("<5Q", b, 8, st.f_blocks, st.f_bfree, st.f_bavail, st.f_files, st.f_ffree)
+                struct.pack_into("<III", b, 56, st.f_namemax, st.f_frsize, st.f_flag)
+            else:
+                du = shutil.disk_usage(host)
+                struct.pack_into("<I", b, 4, 4096)
+                struct.pack_into("<5Q", b, 8, du.total // 4096, du.free // 4096, du.free // 4096, 0, 0)
+                struct.pack_into("<III", b, 56, 255, 4096, 0)
+            self._wr(buf, bytes(b))
+            return 0
         except OSError as e:
             return self._werr(e)
-        b = bytearray(88)
-        struct.pack_into("<I", b, 4, st.f_bsize)
-        struct.pack_into("<5Q", b, 8, st.f_blocks, st.f_bfree, st.f_bavail, st.f_files, st.f_ffree)
-        struct.pack_into("<III", b, 56, st.f_namemax, st.f_frsize, st.f_flag)
-        self._wr(buf, bytes(b))
-        return 0
+        except Exception:  # never a trap in the guest
+            return -WASI_ERRNO["IO"]
 
     def _wrap(self, fn, nres: int):
         def f(caller, *args):
@@ -508,7 +518,7 @@ class Pyodide:
             "name": (self._n_name, ft(4)),
             "resolve": (self._n_resolve, ft(3)),
         }
-        fs = {"statvfs": (self._fs_statvfs, ft(3))}
+        fs = {"statvfs": (self._fs_statvfs, ft(2))}
         return loader, net, fs
 
     # ------------------------------------------------------------------ start

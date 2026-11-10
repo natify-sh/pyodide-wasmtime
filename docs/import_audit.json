@@ -1507,8 +1507,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c open_at: the mode of O_CREAT (the variable argument) minus the umask is recorded for a file made now (checked with a stat before the open); an existing file with a recorded mode is opened only if that mode allows the access (EACCES, as Pyodide's mayOpen); a file made now needs the directory to allow write and search (dir_denies); the path record of dup() is malloc'd and has no length limit. The ABI's '..' above the root is clamped in resolve()/fixpath (stat('/..') is the root); cwd + relative paths are composed in growing buffers (no 1024-byte limit, no silent resolution against '/'). O_SYNC/O_DSYNC/O_RSYNC/O_NOATIME are no-ops in Pyodide as well. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: open mode, umask, chmod 0 + open -> EACCES, long paths match.",
-  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_long_paths_have_no_wrong_answer"
+  "evidence": "adapter.c open_at: the mode of O_CREAT (the variable argument) minus the umask is recorded for a file made now (checked with a stat before the open); an existing file with a recorded mode is opened only if that mode allows the access (EACCES, as Pyodide's mayOpen); a file made now needs the directory to allow write and search (dir_denies); the path record of dup() is malloc'd and has no length limit. The ABI's '..' above the root is clamped in resolve()/fixpath (stat('/..') is the root); cwd + relative paths are composed in growing buffers (no 1024-byte limit, no silent resolution against '/'). O_SYNC/O_DSYNC/O_RSYNC/O_NOATIME are no-ops in Pyodide as well. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: open mode, umask, chmod 0 + open -> EACCES, long paths match. '..' after a name is resolved physically (phys(): a path like /l/../../top with l -> a/b gives /top, as Linux; a leading chain of '..' from the cwd or the root is clamped lexically); a dirfd-relative path is left to WASI, and only a '..' out of the descriptor (which cap-std refuses) is walked from the descriptor's recorded path, if that path still names the same directory. dup() reopens the file without any permission check (open_at nocheck), as Linux. Out of memory is ENOMEM where a syscall can say it.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_long_paths_have_no_wrong_answer, tests/test_files.py::test_dotdot_after_a_symlink_is_physical, tests/test_files.py::test_dup_does_not_check_permissions"
  },
  {
   "name": "_tzset_js",
@@ -1542,7 +1542,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c phys() + sc_chdir: physical, an iterative readlink walk of the components (loop limit 40 -> ELOOP, '..' is the real parent), the target must be a directory (ENOTDIR) it may search (EACCES for a recorded mode without x); the path is not limited in length. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chdir through a link, chdir('..') after it, chdir('/'+'a/'*600) -> ENOENT, empty -> ENOENT match.",
+  "evidence": "adapter.c phys() + sc_chdir: physical, an iterative readlink walk of the components (loop limit 40 -> ELOOP, '..' is the real parent), the target must be a directory (ENOTDIR) it may search (EACCES for a recorded mode without x); the path is not limited in length. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chdir through a link, chdir('..') after it, chdir('/'+'a/'*600) -> ENOENT, empty -> ENOENT match. Uses the same physical walk for '..' as the other path calls.",
   "tested": "tests/test_files.py::test_chdir_is_physical, tests/test_files.py::test_long_paths_have_no_wrong_answer"
  },
  {
@@ -1765,15 +1765,15 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c put_stat/sc_fstat64: the S_IF* type from the WASI filetype (char, block, socket, symlink, directory, regular), the permission bits, uid and gid from the metadata table (defaults 0644/0755/0777), st_dev/st_ino from WASI (st_dev is 32 bits in this ABI: the two halves are folded, st_ino is the full 64 bits), a symlink's size is the length of the target it holds; fd 0-2 are 0o20666 character devices as Pyodide's fstat(1). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
-  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
+  "evidence": "adapter.c put_stat/sc_fstat64: the S_IF* type from the WASI filetype (char, block, socket, symlink, directory, regular), the permission bits, uid and gid from the metadata table (defaults 0644/0755/0777), st_dev/st_ino from WASI (st_dev is 32 bits in this ABI: the two halves are folded, st_ino is the full 64 bits), a symlink's size is the length of the target it holds; fd 0-2 are 0o20666 character devices as Pyodide's fstat(1). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings. The guest's root directory has the default mode 0o40777, as Pyodide's.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_the_guest_root_is_0777"
  },
  {
   "name": "__syscall_stat64",
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c stat_path/fx_lookup/put_stat: an empty path is ENOENT; '..' above the root is the root; modes, owners and types as fstat64. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "evidence": "adapter.c stat_path/fx_lookup/put_stat: an empty path is ENOENT; '..' above the root is the root; modes, owners and types as fstat64. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings. The guest's root is 0o40777.",
   "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths"
  },
  {
@@ -2023,8 +2023,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_unlinkat: flags other than 0 and AT_REMOVEDIR (0x200) are EINVAL before anything is removed; the record of the last name of a file (or of a removed directory) is dropped, so a new file with the same inode gets its own; the parent directory must allow write and search (dir_denies, EACCES as Pyodide's mayDelete). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: unlinkat(f, 1) -> EINVAL, file kept.",
-  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat, tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record"
+  "evidence": "adapter.c sc_unlinkat: flags other than 0 and AT_REMOVEDIR (0x200) are EINVAL before anything is removed; the record of the last name of a file (or of a removed directory) is dropped, so a new file with the same inode gets its own; the parent directory must allow write and search (dir_denies, EACCES as Pyodide's mayDelete). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: unlinkat(f, 1) -> EINVAL, file kept. The record of an unlinked file stays while a descriptor opened by the adapter still holds the inode (fstat keeps the mode) and is dropped at the last close; a new file never inherits it.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat, tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_an_unlinked_open_file_keeps_its_mode_until_the_last_close"
  },
  {
   "name": "__syscall_rmdir",
@@ -2039,8 +2039,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_renameat; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match; the record of a replaced file is dropped, and a link made with an absolute target is made again for its new directory.",
-  "tested": "tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
+  "evidence": "adapter.c sc_renameat; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match; the record of a replaced file is dropped, and a link made with an absolute target is made again for its new directory. Renaming a directory makes every symlink with a stored absolute target under it again (relink_tree).",
+  "tested": "tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored, tests/test_files.py::test_a_renamed_directory_keeps_its_absolute_symlinks_pointing_at_the_same_file"
  },
  {
   "name": "_setitimer_js",
@@ -2057,23 +2057,25 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_statfs64 + _host.py _fs_statvfs (host operation fs.statvfs): the host answers with os.statvfs of the host folder that backs the guest path (the guest root, or the mounted folder with the longest matching prefix), written as Emscripten's statfs64; ENOENT for a missing path. Pyodide answers made-up numbers.",
-  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host"
+  "evidence": "adapter.c sc_statfs64 + _host.py _fs_statvfs (host operation fs.statvfs): the guest path is first proved through WASI (fx_lookup: sandboxed, so ENOENT/EACCES/EPERM come out exactly as for os.stat, and a link out of the sandbox is EPERM, never host data); only then does the adapter ask the host for the numbers of the PREOPEN that the path belongs to (the longest-prefix mount, as resolve() chooses it), naming it by its WASI descriptor: the host never receives a path of the guest. The host answers with os.statvfs of that preopen's folder; where os.statvfs does not exist (Windows) it uses shutil.disk_usage (f_bsize 4096, f_files and f_ffree are 0 there). Any host error is an errno, never a trap. Pyodide answers made-up numbers.",
+  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host, tests/test_files.py::test_statvfs_never_gives_the_host_a_path_from_the_guest, tests/test_files.py::test_the_preopen_of_a_path_picks_the_host_folder, tests/test_files.py::test_the_host_operation_has_no_trap_without_statvfs_or_on_any_error"
  },
  {
   "name": "__syscall_fstatfs64",
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_fstatfs64 + fs.statvfs: the path the descriptor was opened with; a stream, a socket or a file deleted since: the guest root; EBADF for a closed descriptor.",
-  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host"
+  "evidence": "adapter.c sc_fstatfs64 + fs.statvfs: EBADF for a closed descriptor (fd_fdstat_get), else the numbers of the preopen that the path the descriptor was opened with belongs to (a stream, a socket or no known path: the guest's root); the host is given the preopen, never a path. Windows and errors as statfs64.",
+  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host, tests/test_files.py::test_the_preopen_of_a_path_picks_the_host_folder"
  },
  {
   "name": "__syscall_symlinkat",
   "class": "os",
-  "verdict": "full",
-  "gaps": [],
-  "evidence": "adapter.c sc_symlinkat/rel_target: wasmtime refuses an absolute target (EPERM), so the link is made with the target relative to the link's real directory (phys()) and the original string is kept in the metadata table: readlink returns exactly what the program stored, lstat's size is its length, opening through the link reaches the same file; rename makes the link again for its new directory (relink), copytree(symlinks=True) round-trips. The directory of the new link must allow write and search (EACCES). A link and a target under different preopens (a --mount) cannot be expressed: EXDEV. Relative targets are stored as they are.",
+  "verdict": "partial",
+  "gaps": [
+   "A link in one preopen to an absolute target in another (a --mount) gives EXDEV, where Linux symlink(2) never fails that way. The reason is the platform's: wasmtime/cap-std refuses an ABSOLUTE target (EPERM) and cannot follow ANY link, even a relative one, from one preopen directory into another, so no target string stored in the host file can make the link work; making the link without a working target would be a dangling fake. (Links within one preopen, absolute or relative, work.)"
+  ],
+  "evidence": "adapter.c sc_symlinkat/rel_target: wasmtime refuses an absolute target (EPERM), so the link is made with the target relative to the link's real directory (phys()) and the original string is kept in the metadata table: readlink returns exactly what the program stored, lstat's size is its length, opening through the link reaches the same file; rename makes the link again for its new directory (relink), copytree(symlinks=True) round-trips. The directory of the new link must allow write and search (EACCES). A link and a target under different preopens (a --mount) cannot be expressed: EXDEV. Relative targets are stored as they are. Targets are stored relative to the link's real directory; a directory renamed later has the stored absolute links inside it made again (relink_tree, skipped when no such link exists).",
   "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {

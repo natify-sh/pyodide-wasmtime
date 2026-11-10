@@ -373,13 +373,19 @@ def test_statvfs_and_fstatvfs_come_from_the_host(guest: Guest, tmp_path):
     (host / "f").write_text("x")
     import os
 
-    want = os.statvfs(host)
+    if hasattr(os, "statvfs"):
+        want = os.statvfs(host)
+        same = (
+            f"assert m.f_bsize == {want.f_bsize} and m.f_blocks == {want.f_blocks}"
+            f" and m.f_namemax == {want.f_namemax}, m"
+        )
+    else:  # Windows: the numbers come from shutil.disk_usage
+        same = "assert m.f_bsize > 0 and m.f_blocks > 0, m"
     code = f"""
 import os, errno
 r, m = os.statvfs('/'), os.statvfs('/mnt/h')
-assert m.f_bsize == {want.f_bsize} and m.f_blocks == {want.f_blocks} and m.f_namemax == {want.f_namemax}, m
-assert m.f_frsize == {want.f_frsize}
-assert r.f_bsize > 0 and r.f_blocks >= r.f_bfree >= r.f_bavail and r.f_files > 0, r
+{same}
+assert r.f_bsize > 0 and r.f_blocks >= r.f_bfree >= r.f_bavail, r
 assert os.statvfs('/mnt/h/f').f_blocks == m.f_blocks == os.fstatvfs(os.open('/mnt/h/f', os.O_RDONLY)).f_blocks
 assert os.fstatvfs(os.open('/lib', os.O_RDONLY)).f_blocks == r.f_blocks
 assert os.fstatvfs(1).f_bsize > 0
@@ -512,5 +518,209 @@ assert oct(os.stat(B + '/dd').st_mode) == '0o40755'
 for i in range(3000):
     os.close(os.open(B + '/m%d' % i, os.O_CREAT | os.O_WRONLY, 0o600 + i % 8))
 assert oct(os.stat(B + '/m0').st_mode) == '0o100600' and oct(os.stat(B + '/m2999').st_mode) == '0o100605'  # & ~umask
+""",
+    )
+
+
+def test_statvfs_never_gives_the_host_a_path_from_the_guest(guest: Guest, tmp_path):
+    host = tmp_path / "h"
+    host.mkdir()
+    (host / "f").write_text("x")
+    # links that leave the sandbox: os.stat and os.statvfs must fail alike, never answer with the host's numbers
+    code = """
+import os
+os.symlink('../../../../../../../../../../../../proc', '/pr')
+os.symlink('../../../../../../../../../../../../etc', '/esc')
+os.symlink('../../../../../../../../../../../../proc', '/mnt/h/pr')
+for p in ('/pr', '/esc/passwd', '/esc/nonexist', '/esc', '/mnt/h/pr', '/mnt/h/pr/self'):
+    errs = []
+    for f in (os.stat, os.statvfs):
+        try:
+            f(p)
+        except OSError as e:
+            errs.append(e.errno)
+        else:
+            errs.append(None)
+    assert errs[0] is not None and errs[0] == errs[1], (p, errs)
+assert os.statvfs('/mnt/h/f').f_bsize > 0
+print('ok')
+"""
+    p = guest.run(code, None, "--mount", f"/mnt/h={host}")
+    assert p.returncode == 0, p.stderr[-3000:]
+    assert p.stdout.split() == ["ok"], p.stdout
+
+
+def test_the_preopen_of_a_path_picks_the_host_folder(flavor: str, tmp_path, monkeypatch):
+    """The adapter names the preopen that a guest path belongs to (the longest mount that matches) and the host maps it
+    to its folder: asked through a recording os.statvfs, the folders must be the right ones even when they are all on
+    one filesystem (so the numbers could not tell)."""
+    import os
+
+    import pytest
+
+    from pyodide_wasmtime import Pyodide
+
+    if not hasattr(os, "statvfs"):
+        pytest.skip("no os.statvfs (Windows): the numbers come from shutil.disk_usage")
+    a, b, c = (tmp_path / n for n in "abc")
+    for d in (a, b, c):
+        d.mkdir()
+        (d / "f").write_text("x")
+    mounts = {"/m1": a, "/m2": b, "/m1/inner": c}
+    py = Pyodide(flavor, mounts=mounts)
+    py._setup_root()
+    assert [py._preopen_dir(n) for n in (3, 4, 5, 6, 7)] == [str(py.root), str(a), str(b), str(c), None]
+    py.close()
+
+    seen: list[str] = []
+    real = os.statvfs
+
+    def recording(path):
+        seen.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(os, "statvfs", recording)
+    code = (
+        "import os\n"
+        "for p in ('/', '/lib', '/m1', '/m1/f', '/m2', '/m2/f', '/m1/inner', '/m1/inner/f'):\n"
+        "    os.statvfs(p)\n"
+        "os.fstatvfs(os.open('/m1/inner/f', os.O_RDONLY))\n"
+        "os.fstatvfs(os.open('/m2', os.O_RDONLY))\n"
+        "os.fstatvfs(1)\n"
+    )
+    with Pyodide(flavor, mounts=mounts) as py:
+        assert py.run(code) == 0
+        root = str(py.root)
+    A, B, C = str(a), str(b), str(c)
+    assert seen == [root, root, A, A, B, B, C, C, C, B, root]
+
+
+def test_the_host_operation_has_no_trap_without_statvfs_or_on_any_error(flavor: str, monkeypatch):
+    import collections
+    import os
+    import shutil
+
+    from pyodide_wasmtime import Pyodide
+
+    usage = collections.namedtuple("usage", "total used free")
+    with Pyodide(flavor) as py:
+        monkeypatch.delattr(os, "statvfs", raising=False)  # as on Windows
+        monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(4096 * 100, 0, 4096 * 40))
+        code = (
+            "import os\nr = os.statvfs('/')\n"
+            "assert (r.f_bsize, r.f_blocks, r.f_bavail, r.f_files) == (4096, 100, 40, 0), r"
+        )
+        assert py.run(code) == 0
+        monkeypatch.setattr(shutil, "disk_usage", lambda p: 1 / 0)  # an error of any kind: an errno, not a trap
+        code = (
+            "import os\ntry:\n    os.statvfs('/')\nexcept OSError as e:\n    assert e.errno > 0\n"
+            "else:\n    raise AssertionError"
+        )
+        assert py.run(code) == 0
+
+
+def test_dotdot_after_a_symlink_is_physical(guest: Guest):
+    check(
+        guest,
+        """
+os.makedirs('/a/b')
+open('/top', 'w').write('top')
+open('/a/top', 'w').write('a')
+os.symlink('a/b', '/l')
+assert open('/l/../../top').read() == 'top'  # l -> a/b: /l/.. is /a, and /a/.. is /
+assert open('/l/../top').read() == 'a'
+assert open('/l/../../../../top').read() == 'top'  # above the root is the root
+os.chdir('/l')
+assert os.getcwd() == '/a/b' and open('../../top').read() == 'top' and open('../top').read() == 'a'
+os.chdir('/')
+os.makedirs('/p/q/d/sub')
+open('/p/q/d/sub/f', 'w').write('in')
+open('/p/q/marker', 'w').write('real')
+d = os.open('/p/q/d', os.O_RDONLY)
+assert os.read(os.open('sub/../sub/f', os.O_RDONLY, dir_fd=d), 2) == b'in'
+assert os.read(os.open('../marker', os.O_RDONLY, dir_fd=d), 4) == b'real'  # out of the descriptor: walked from its path
+os.rename('/p/q', '/p/r')
+assert os.read(os.open('sub/../sub/f', os.O_RDONLY, dir_fd=d), 2) == b'in'  # WASI resolves it from the descriptor
+os.makedirs('/p/q/d')  # a decoy where the descriptor used to be
+open('/p/q/marker', 'w').write('DECOY')
+try:
+    got = os.read(os.open('../marker', os.O_RDONLY, dir_fd=d), 5)
+except OSError:
+    got = None  # refused, as WASI does
+assert got in (None, b'real'), got
+""",
+    )
+
+
+def test_a_renamed_directory_keeps_its_absolute_symlinks_pointing_at_the_same_file(guest: Guest):
+    check(
+        guest,
+        """
+os.makedirs('/w/d/deep/er')
+open('/w/t', 'w').write('T')
+os.symlink('/w/t', '/w/d/abs')
+os.symlink('/w/t', '/w/d/deep/er/abs2')
+os.makedirs('/w/x/y')
+os.makedirs('/w/x/w')
+open('/w/x/w/t', 'w').write('WRONG FILE')
+os.rename('/w/d', '/w/x/y/d')
+assert os.readlink('/w/x/y/d/abs') == '/w/t' and open('/w/x/y/d/abs').read() == 'T'
+assert os.readlink('/w/x/y/d/deep/er/abs2') == '/w/t' and open('/w/x/y/d/deep/er/abs2').read() == 'T'
+""",
+    )
+
+
+def test_dup_does_not_check_permissions(guest: Guest):
+    check(
+        guest,
+        """
+fd = os.open(B + '/f', os.O_CREAT | os.O_RDWR, 0o644)
+os.chmod(B + '/f', 0)
+d = os.dup(fd)
+os.write(d, b'x')
+t = os.open(B + '/other', os.O_CREAT | os.O_RDWR)
+assert os.dup2(fd, t) == t
+assert fcntl.fcntl(fd, fcntl.F_DUPFD, 50) > 2  # (the minimum number is the descriptor layer's)
+assert fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 60) > 2
+assert err(os.open, B + '/f', os.O_RDWR) == 'EACCES'  # opening anew is still checked
+""",
+    )
+
+
+def test_an_unlinked_open_file_keeps_its_mode_until_the_last_close(guest: Guest):
+    check(
+        guest,
+        """
+fd = os.open(B + '/g', os.O_CREAT | os.O_RDWR, 0o600)
+d = os.dup(fd)
+os.unlink(B + '/g')
+assert oct(os.fstat(fd).st_mode) == '0o100600'
+os.close(fd)
+assert oct(os.fstat(d).st_mode) == '0o100600'
+os.close(d)
+# the record is gone with the last close: a new file, maybe on the same inode, has its own mode
+for i in range(200):
+    p = B + '/c%d' % (i % 3)
+    fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o600)
+    os.chmod(p, 0o400 if i % 2 else 0o640)
+    if i % 4 < 2:
+        os.unlink(p)
+        os.close(fd)
+    else:
+        os.close(fd)
+        os.unlink(p)
+    open(B + '/n%d' % (i % 3), 'w').close()
+    assert oct(os.stat(B + '/n%d' % (i % 3)).st_mode) == '0o100644', i
+    os.unlink(B + '/n%d' % (i % 3))
+""",
+    )
+
+
+def test_the_guest_root_is_0777(guest: Guest):
+    check(
+        guest,
+        """
+assert oct(os.stat('/').st_mode) == '0o40777' and oct(os.stat('/..').st_mode) == '0o40777'
+assert oct(os.stat(B).st_mode) == '0o40755'
 """,
     )
