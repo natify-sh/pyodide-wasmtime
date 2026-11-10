@@ -117,7 +117,7 @@ def ca_bundle() -> bytes:
 class Pyodide:
     """One Python (Pyodide's CPython) in wasm, run by wasmtime.
 
-    >>> py = Pyodide()                       # the fused build from the package's data
+    >>> py = Pyodide()                       # the dynamic build from the package's data (fused if only that is there)
     >>> py.run("print(1 + 1)")               # 0 if the code ran, -1 if it raised (the traceback is on stderr)
 
     ``site``: a folder (or several) copied into the guest's ``site-packages`` (a wheel unpacked, ``micropip``...);
@@ -143,7 +143,9 @@ class Pyodide:
         self.data = data_dir(data)
         have = available_flavors(self.data)
         if flavor is None:
-            flavor = os.environ.get("PYODIDE_WASMTIME_FLAVOR") or (have[0] if have else "fused")
+            flavor = os.environ.get("PYODIDE_WASMTIME_FLAVOR") or (
+                "dynamic" if "dynamic" in have else (have[0] if have else "dynamic")
+            )
         if flavor not in FLAVORS:
             raise ValueError(f"flavor must be one of {FLAVORS}, not {flavor!r}")
         if flavor not in have:
