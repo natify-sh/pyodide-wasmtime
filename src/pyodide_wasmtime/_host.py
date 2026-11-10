@@ -14,7 +14,9 @@ Two builds of the same sources, one `Pyodide` class:
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +49,8 @@ BASE_ENV = [
     ("PYTHONPATH", f"/lib/python{PYVER}/site-packages"),
     ("PYTHONDONTWRITEBYTECODE", "1"),
 ]
+
+SNAPSHOT_VERSION = 1  # the layout of a snapshot file; part of its key
 
 # the host's sockets: errors in WASI's numbering, which is Emscripten's
 WASI_ERRNO = {
@@ -281,6 +285,13 @@ class Pyodide:
     ``preopen_dev``: the host's ``/dev`` (OpenSSL reads ``/dev/urandom``); ``env``: more environment variables.
     The guest's ``/`` is a temporary folder (stdlib zip, site-packages); it is not a sandbox against the host's own
     network: ``socket`` and the host's fetch are real.
+
+    ``preload``: Python source run once at start (as ``run(preload)``). The memory after it is cached in a snapshot file
+    in the cache dir, so a next start with the same preload and settings restores it instead of booting Python
+    (``$PYODIDE_WASMTIME_SNAPSHOT=0`` turns that off). The preload must only import and compute: it must not print (it
+    prints at snapshot time only); opening files or sockets, ``chdir``, writing files, ``dlopen`` or ``ctypes`` symbol
+    lookups make the snapshot be skipped (a normal start, the preload run once); with ``site=`` or ``mounts=`` there is
+    no snapshot at all.
     """
 
     def __init__(
@@ -293,6 +304,7 @@ class Pyodide:
         env: dict[str, str] | None = None,
         data: str | os.PathLike[str] | None = None,
         wasm_opt: str | os.PathLike[str] | None = None,
+        preload: str | None = None,
     ) -> None:
         wt = _engine.require_wasmtime()
         self._wt = wt
@@ -313,6 +325,9 @@ class Pyodide:
         self.mounts = {k: str(v) for k, v in (mounts or {}).items()}
         self.preopen_dev = bool(os.environ.get("PREOPEN_DEV")) if preopen_dev is None else preopen_dev
         self.env = dict(env or {})
+        self.preload = preload
+        self.restored = False  # the guest came from a snapshot
+        self._net_slots: tuple[int, int] = (0, 0)
         opt = os.environ.get("WASM_OPT") or wasm_opt or self.data / "wasm-opt.wasm"
         self.wasm_opt = str(opt) if (os.environ.get("WASM_OPT") or wasm_opt or Path(opt).exists()) else None
         # state of the running guest
@@ -1290,11 +1305,7 @@ class Pyodide:
         assert self.root is not None
         self.store = store = wt.Store(engine)
         wasi = wt.WasiConfig()
-        wasi.env = [
-            *BASE_ENV,
-            ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
-            ("REQUESTS_CA_BUNDLE", "/etc/ssl/cert.pem"),
-        ] + list(self.env.items())
+        wasi.env = self._wasi_env()
         wasi.preopen_dir(str(self.root), "/")
         for guest, host in self.mounts.items():
             wasi.preopen_dir(host, guest)
@@ -1421,10 +1432,151 @@ class Pyodide:
         (sp / "_hostnet_slots.py").write_text(f"FETCH = {slots[0]}\nFREE = {slots[1]}\n")
         log.info("[host] %s; WASI: wasmtime's own; the host's loader ops: %s", self.summary, ", ".join(loader_ops))
         self.cur.append(store)
+        self._boot(slots)
+
+    def _wasi_env(self) -> list[tuple[str, str]]:
+        return [
+            *BASE_ENV,
+            ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/ssl/cert.pem"),
+        ] + list(self.env.items())
+
+    # ------------------------------------------------------------------ snapshot of the memory after `preload`
+    def _snapshot_path(self) -> Path:
+        files = [
+            "python_stdlib.zip",
+            *(["pyodide_fused.wasm"] if self.flavor == "fused" else ["pyodide.asm.wasm", "adapter.wasm"]),
+        ]
+
+        def isatty(fd: int) -> bool:  # WASI inherits the OS's fds, not Python's sys.std* objects
+            try:
+                return os.isatty(fd)
+            except (OSError, ValueError):
+                return False
+
+        key = hashlib.sha256(
+            json.dumps(
+                [
+                    SNAPSHOT_VERSION,
+                    self.flavor,
+                    [_engine._stamp((self.data / f).resolve()).decode() for f in files],
+                    PYVER,
+                    self.preload,
+                    hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    hashlib.sha256(Path(__file__).with_name("guest").joinpath("hostnet.py").read_bytes()).hexdigest(),
+                    self._wasi_env(),
+                    self.preopen_dev,
+                    [isatty(fd) for fd in (0, 1, 2)],  # the guest decides buffering at init
+                ]
+            ).encode()
+        ).hexdigest()
+        return _engine.cache_dir() / f"snapshot-{self.flavor}-{key[:16]}.mem"
+
+    def _boot(self, slots: tuple[int, int]) -> None:
+        """Start CPython (or restore a snapshot of it after the preload) and run the preload."""
+        store = self.store
+        self._net_slots = slots
+        self.restored = False
+        path = None
+        # with site= or mounts= the preload may need them, and the snapshot is taken without: no snapshot then
+        if (
+            self.preload is not None
+            and not self.site
+            and not self.mounts
+            and os.environ.get("PYODIDE_WASMTIME_SNAPSHOT") != "0"
+        ):
+            path = self._snapshot_path()
+            if self._restore(path, slots):
+                self.restored = self._started = True
+                # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
+                self.run('import sys; "random" in sys.modules and __import__("random").seed()')
+                return
         self.ex["emscripten_stack_init"](store)
         self.ex["__wasm_call_ctors"](store)
         self.ex["Py_Initialize"](store)
         self._started = True
+        if self.preload is not None and self.run(self.preload) == 0 and path is not None:
+            self._save(path)
+
+    def _restore(self, path: Path, slots: tuple[int, int]) -> bool:
+        store = self.store
+        try:
+            data = path.read_bytes()
+            nl = data.index(b"\n")
+            hdr = json.loads(data[:nl])
+            pages = hdr["pages"]
+            have = self.memory.size(store)
+            if (
+                hdr["version"] != SNAPSHOT_VERSION
+                or hdr["slots"] != list(slots)
+                or pages < have
+                or len(data) - nl - 1 != pages * 65536
+            ):
+                return False
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        # all of the file is checked: from here on the memory is written once
+        self.ex["emscripten_stack_init"](store)
+        if pages > have:
+            self.memory.grow(store, pages - have)
+        src = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p).value
+        assert src is not None
+        ctypes.memmove(ctypes.addressof(self.memory.data_ptr(store).contents), src + nl + 1, pages * 65536)
+        if hdr["table"] > self.table.size(store):
+            self.table.grow(store, hdr["table"] - self.table.size(store), self._wt.Val.funcref(None))
+        return True
+
+    _PROBE = (
+        "def _p():\n    import os\n    r = []\n    for i in range(64):\n        try: os.fstat(i); r.append(i)\n"
+        "        except OSError: pass\n    open('/_probe', 'w').write(repr((r, os.getcwd())))\n_p(); del _p\n"
+    )
+
+    def _probe(self) -> tuple[str, list[tuple[str, int]]]:
+        """What a snapshot does not hold: the guest's open fds and cwd, and the files under its root."""
+        self.run(self._PROBE)
+        assert self.root is not None
+        state = (self.root / "_probe").read_text()
+        files = [
+            (str(p.relative_to(self.root)), p.stat().st_size)
+            for p in sorted(self.root.rglob("*"))
+            if p.is_file() and not p.name.startswith(("_pw_", "_probe"))
+        ]
+        return state, files
+
+    def _save(self, path: Path) -> None:
+        """Write the snapshot from a throwaway interpreter (no site, no mounts), unless the preload changed what a
+        snapshot does not hold: dlopen, table slots, open fds, the cwd, files."""
+        with Pyodide(self.flavor, preopen_dev=self.preopen_dev, env=self.env, data=self.data) as fresh:
+            before = fresh._probe()
+            rc = fresh.run(self.preload or "")
+            if rc != 0 or len(fresh.instances) != 1 or fresh.slots or fresh._probe() != before:
+                return
+            st = fresh.store
+            pages = fresh.memory.size(st)
+            hdr = {
+                "version": SNAPSHOT_VERSION,
+                "pages": pages,
+                "table": fresh.table.size(st),
+                "slots": list(fresh._net_slots),
+            }
+            buf = (ctypes.c_char * (pages * 65536)).from_address(ctypes.addressof(fresh.memory.data_ptr(st).contents))
+            tmp = path.with_suffix(f".tmp{os.getpid()}")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(tmp, "wb") as f:
+                    f.write(json.dumps(hdr).encode() + b"\n")
+                    f.write(buf)
+                os.replace(tmp, path)
+                for old in path.parent.glob(f"snapshot-{self.flavor}-*.mem"):
+                    if old != path:
+                        old.unlink(missing_ok=True)
+            except OSError:
+                pass
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------ public
     def run(self, code: str, argv: list[str] | None = None) -> int:
