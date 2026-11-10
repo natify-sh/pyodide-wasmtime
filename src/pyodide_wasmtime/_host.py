@@ -47,9 +47,15 @@ BASE_ENV = [
     ("PYTHONHOME", "/"),
     ("LANG", "C.UTF-8"),
     ("PYTHONPATH", f"/lib/python{PYVER}/site-packages"),
+    (
+        "LD_LIBRARY_PATH",
+        f"/usr/lib:/lib/python{PYVER}/site-packages",
+    ),  # as Pyodide sets it: where NEEDED are looked for
     ("PYTHONDONTWRITEBYTECODE", "1"),
 ]
 
+MAX_MEMORY = 4 << 30  # the main module's memory: 65536 pages
+MAX_TABLE = 10_000_000  # the glue's WebAssembly.Table limit in V8
 SNAPSHOT_VERSION = 1  # the layout of a snapshot file; part of its key
 
 # the host's sockets: errors in WASI's numbering, which is Emscripten's
@@ -250,6 +256,12 @@ def ca_bundle() -> bytes:
     return out
 
 
+def _s32(x: int) -> int:
+    """x as the signed i32 wasmtime-py wants for a parameter or a result."""
+    x &= 0xFFFFFFFF
+    return x - (1 << 32) if x >> 31 else x
+
+
 class MainExports(Mapping):
     """The main module's symbols as dlsym and the GOT see them: its (lazy) exports, those of the adapter in the
     dynamic build (`extra`), and not the JavaScript bridge's stubs (`hidden`)."""
@@ -338,6 +350,7 @@ class Pyodide:
         self.scopes: dict[int, list[int]] = {}  # a dlopen call's scope -> the instances loaded in it
         self._tfuncs: dict[bytes, int] = {}  # the table's functions (by engine handle) -> first slot
         self._tscanned = 0
+        self._gseq = 0  # libraries made RTLD_GLOBAL so far
         self._wasi_linker: Any = None  # wasmtime's WASI functions, for the side modules that import them
         self._dlreason = ""  # why the last instantiate failed
         self.socks: dict = {}
@@ -385,12 +398,22 @@ class Pyodide:
         main_path, adapter_path = self.data / "pyodide.asm.wasm", self.data / "adapter.wasm"
         if not (main_path.exists() and adapter_path.exists()):
             return
-        wasm = main_path.read_bytes()
-        exports = self.instances[0]["exports"]
-        answered = set(_wasm.export_names(adapter_path.read_bytes())) | set(_wasm.export_names(wasm)) | {_wasm.TRAMP}
-        for mod, name, kind in _wasm.import_names(wasm):
-            if mod == "env" and kind == 0 and name not in answered:
-                exports.hidden.add(name)
+        # the names are read from 10 MB of wasm: kept in the cache dir, keyed by the two files' size and mtime
+        key = hashlib.sha256(b"|".join(_engine._stamp(p) for p in (main_path, adapter_path))).hexdigest()[:16]
+        cached = _engine.cache_dir() / f"stubs-{key}.json"
+        try:
+            names = json.loads(cached.read_text())
+        except (OSError, ValueError):
+            wasm = main_path.read_bytes()
+            answered = set(_wasm.export_names(adapter_path.read_bytes())) | set(_wasm.export_names(wasm))
+            answered.add(_wasm.TRAMP)
+            names = [n for mod, n, kind in _wasm.import_names(wasm) if mod == "env" and kind == 0 and n not in answered]
+            try:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                cached.write_text(json.dumps(names))
+            except OSError:
+                pass
+        self.instances[0]["exports"].hidden.update(names)
 
     # ------------------------------------------------------------------ the loader's host interface
     # Five operations a wasm module cannot do itself, because the host holds the instances and their exports by
@@ -420,7 +443,11 @@ class Pyodide:
 
     def _env_func(self, name: str, scope: int = 0, own: dict | None = None) -> Any:
         wt = self._wt
-        ids = [0] + [i for i in range(1, len(self.instances)) if self.instances[i]["global"]]
+        # the main module, then the libraries in the order they became RTLD_GLOBAL (the glue's mergeLibSymbols)
+        glob = sorted(
+            (self.instances[i]["global"], i) for i in range(1, len(self.instances)) if self.instances[i]["global"]
+        )
+        ids = [0] + [i for _, i in glob]
         if scope:
             ids += reversed(self.scopes.get(scope, []))
         for i in ids:
@@ -454,7 +481,7 @@ class Pyodide:
     def _dl_error(self, code: int, np_: int, nn: int, ap: int, an: int) -> None:
         """dlerror's text: the glue's own, set through the main module's __dl_seterr."""
         name = self._rd(np_, nn).decode("utf-8", "replace") if np_ else "__main__"
-        arg = self._rd(ap, an).decode("utf-8", "replace") if ap else ""
+        arg = self._rd(ap, an).decode("utf-8", "replace") if ap and an else ""
         if code == 12:
             text = f'Tried to lookup unknown symbol "{arg}" in dynamic lib: {name}'
         else:
@@ -463,10 +490,12 @@ class Pyodide:
         c = self.cur[-1]
         ex = self.instances[0]["exports"]
         msg = text.encode("utf-8", "replace")
-        blk = ex["malloc"](c, 8 + len(msg) + 1)  # [the %s argument][the format "%s"][the text]
+        blk = ex["malloc"](c, 8 + len(msg) + 1) & 0xFFFFFFFF  # [the %s argument][the format "%s"][the text]
+        if not blk:  # no memory even for the message: dlerror stays what it was
+            return
         self._wr(blk, struct.pack("<I", blk + 8) + b"%s\0\0" + msg + b"\0")
-        ex["__dl_seterr"](c, blk + 4, blk)  # the format and the pointer to its arguments
-        ex["free"](c, blk)
+        ex["__dl_seterr"](c, _s32(blk + 4), _s32(blk))  # the format and the pointer to its arguments
+        ex["free"](c, _s32(blk))
 
     def _dl_instantiate(self, p: int, n: int, mb: int, tb: int, scope: int) -> int:
         wt = self._wt
@@ -480,7 +509,8 @@ class Pyodide:
             except Exception as exc:  # legacy exceptions (a wheel micropip just installed): Binaryen's wasm-opt, here
                 if "legacy_exceptions" not in str(exc) or not self.wasm_opt:
                     raise
-                module = wt.Module(_engine.engine(), _engine.translate_to_exnref(data, self.wasm_opt))
+                data = _engine.translate_to_exnref(data, self.wasm_opt)
+                module = wt.Module(_engine.engine(), data)
                 self.converted += 1
                 log.info("[loader] converted legacy exceptions to exnref (%d bytes)", n)
             wasi = [
@@ -559,7 +589,8 @@ class Pyodide:
         if scope:
             self.scopes.setdefault(scope, []).append(id_)
         else:
-            self.instances[id_]["global"] = True
+            self._gseq += 1
+            self.instances[id_]["global"] = self._gseq
 
     def _dl_got_set(self, id_: int, i: int, v: int) -> None:
         self.instances[id_]["got"][i].set_value(self.cur[-1], v)
@@ -593,8 +624,15 @@ class Pyodide:
         exports = self.instances[id_]["exports"]
         e = exports.get(name)
         if isinstance(e, wt.Global):
+            kind = str(e.type(c).content)
+            val = e.value(c)
+            if kind not in ("i32", "f32", "f64"):  # an i64 or a reference: the glue's ToInt32 throws on it
+                self._wr(out, struct.pack("<II", 0, 0))
+                return 0
+            if kind != "i32":  # ToInt32 of a number: truncated, wrapped, NaN and infinity are 0
+                val = int(val) if val == val and abs(val) != float("inf") else 0
             self._wr(out, struct.pack("<II", 1, 0))
-            return e.value(c) & 0xFFFFFFFF
+            return _s32(val & 0xFFFFFFFF)
         if isinstance(e, wt.Func):
             if (id_, name) in self.slots:
                 slot, new = self.slots[(id_, name)], False
@@ -603,7 +641,7 @@ class Pyodide:
                 self.slots[(id_, name)] = slot
             # kind 3: a slot made by this lookup, with the export's index (the glue's symbolIndex)
             self._wr(out, struct.pack("<II", 3 if new else 2, list(exports).index(name) if new else 0))
-            return slot
+            return _s32(slot)
         self._wr(out, struct.pack("<II", 0, 0))
         return 0
 
@@ -1304,6 +1342,9 @@ class Pyodide:
         self._setup_root()
         assert self.root is not None
         self.store = store = wt.Store(engine)
+        # growth that Pyodide's glue gets as a RangeError (a dylink table of 2^31 slots, memory beyond 4 GiB) fails
+        # here as -1 from memory.grow / table.grow, which the loader turns into a dlerror (not an error of the host)
+        store.set_limits(memory_size=MAX_MEMORY, table_elements=MAX_TABLE)
         wasi = wt.WasiConfig()
         wasi.env = self._wasi_env()
         wasi.preopen_dir(str(self.root), "/")

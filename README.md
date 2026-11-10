@@ -36,7 +36,7 @@ files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs th
 
 ## How it works
 Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**, after the
-shape of Wasmtime's `wasi_snapshot_preview1` adapter (`wasm/adapter.c`, about 1 200 lines of C, no data section, no stack of its own):
+shape of Wasmtime's `wasi_snapshot_preview1` adapter (`wasm/adapter.c`, about 3 000 lines of C, no data section, no stack of its own):
 system calls over WASI, the dynamic loader (`dlopen` of a wheel's `.so`), libffi's calls, sockets, time, the trampoline.
 The host (`_host.py`) gives what a wasm module cannot do: wasmtime's WASI, six loader operations (it holds the instances by name), the host's sockets and `statvfs`
 (the numbers of the folder behind a guest path). Permission bits, owners and the umask are kept by the adapter for the interpreter's lifetime (WASI has none). **Pyodide is not rebuilt**: its wasm is the npm package's, with the legacy wasm exceptions converted once to

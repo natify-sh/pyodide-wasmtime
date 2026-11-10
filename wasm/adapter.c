@@ -1447,6 +1447,9 @@ static char *runtime_paths(const u8 *b, const DyMeta *m, const char *path) {
     return out;
 }
 
+// the load of `path` failed because that file is not there (not because something it needs is)
+static i32 missing(Libs *L, const char *path) { return L->code == 1 && L->arg && eq((const u8 *)L->arg, L->argn, path, slen(path)); }
+
 // A NEEDED library, as the glue finds it: the main module's search (runtime paths with $ORIGIN, LD_LIBRARY_PATH), else
 // the name as written; the library is then the one with that full (normalized) name. Beyond the glue: next to the
 // module that needs it, then /lib, then a loaded library of that file name.
@@ -1456,8 +1459,7 @@ static Lib *load_needed(Libs *L, const char *from, const char *rpath, const u8 *
     char *buf = (char *)malloc(512);
     i32 dl = 0;
     for (i32 i = 0; from[i]; i++) if (from[i] == '/') dl = i + 1;
-    if (nm && nm[0] == '/') dl = 0;
-    char *p = (char *)malloc((u32)(dl + n + 8));
+    char *p = (char *)malloc((u32)(dl + n + 8));  // (nm is not filled in yet)
     Lib *x = 0;
     if (!nm || !buf || !p) {
         free(nm), free(buf), free(p);
@@ -1473,9 +1475,10 @@ static Lib *load_needed(Libs *L, const char *from, const char *rpath, const u8 *
         return fail(L, 9, 0, 0);
     }
     x = load_lib(L, q, global, scope, depth + 1, 0);
+    i32 gone = !x && missing(L, q);
     free(q);
-    if (!x && (found || L->code != 1)) goto done;  // a library that was found but is bad, or no memory...
-    if (!x) {                                      // next to the module that needs it, then /lib
+    if (!x && (found || !gone)) goto done;  // a library that was found but is bad, or no memory, or one it needs...
+    if (!x) {                               // next to the module that needs it, then /lib
         for (i32 i = 0; i < dl; i++) p[i] = from[i];
         for (i32 i = 0; i <= n; i++) p[dl + i] = nm[i];
         q = norm_path(p);
@@ -1484,18 +1487,22 @@ static Lib *load_needed(Libs *L, const char *from, const char *rpath, const u8 *
             goto done;
         }
         x = load_lib(L, q, global, scope, depth + 1, 0);
+        gone = !x && missing(L, q);
         free(q);
+        if (!x && !gone) goto done;
     }
-    if (!x && L->code == 1) {
+    if (!x) {  // /lib/<name>
         p[0] = '/', p[1] = 'l', p[2] = 'i', p[3] = 'b', p[4] = '/';
         for (i32 i = 0; i <= n; i++) p[5 + i] = nm[i];
         x = load_lib(L, p, global, scope, depth + 1, 0);
+        if (!x && !missing(L, p)) goto done;
     }
-    if (!x && L->code == 1) {  // a library of that file name that is loaded already
+    if (!x) {  // a library of that file name that is loaded already
         for (i32 k = 0; k < L->libs.n && !x; k++)
-            if (base_eq(((Lib *)L->libs.v[k])->name, nm)) x = load_lib(L, ((Lib *)L->libs.v[k])->name, global, scope, depth + 1, 0);
+            if (base_eq(((Lib *)L->libs.v[k])->name, nm))
+                x = load_lib(L, ((Lib *)L->libs.v[k])->name, global, scope, depth + 1, 0);
     }
-    if (!x && L->code == 1) fail(L, 1, name, n);  // the glue names the NEEDED library, as it was written
+    if (!x) fail(L, 1, name, n);  // the glue names the NEEDED library, as it was written
 done:
     free(p), free(nm), free(buf);
     return x;
