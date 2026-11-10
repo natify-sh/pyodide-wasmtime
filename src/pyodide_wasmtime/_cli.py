@@ -13,12 +13,7 @@ from ._host import FLAVORS, Pyodide
 # The REPL's console lives in the guest (state between lines); the host reads the lines (readline, or prompt_toolkit
 # when installed) and pushes each one. The guest tells the host in /_repl whether the line needs more.
 SETUP = """\
-import ast, code, inspect, types
-try:
-    import hostnet
-    hostnet.install()
-except ImportError:
-    hostnet = None
+import ast, code, types
 
 
 class Console(code.InteractiveConsole):
@@ -30,7 +25,10 @@ class Console(code.InteractiveConsole):
     def runcode(self, c):
         try:
             r = types.FunctionType(c, self.locals)()
-            if inspect.iscoroutine(r):
+            if isinstance(r, types.CoroutineType):
+                import hostnet  # only now: asyncio and urllib cost ~1.2 s at start
+
+                hostnet.install()
                 r = hostnet.run(r)
         except SystemExit:
             raise
