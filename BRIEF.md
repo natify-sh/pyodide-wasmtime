@@ -26,14 +26,14 @@ package's, with the legacy wasm exceptions converted once to `exnref`. The packa
 data/ (in the wheel):  pyodide.asm.wasm (exnref) + adapter.wasm  -> "dynamic": linked at run time (shim from the import list, trampoline, fixup)
                        pyodide_fused.wasm (tools/fuse.py, wasm-merge) -> "fused": one core module, only instantiated
                        python_stdlib.zip, wasm-opt.wasm (Binaryen 132 as wasm32-wasip1: converts a wheel's legacy exceptions at dlopen, in-process)
-_host.py (Pyodide)  WASI = wasmtime's own; loader ops (instantiate/sym/got_set/call); net ops (sockets); fs op (statvfs); the host's fetch; run() = PyRun_SimpleString
+_host.py (Pyodide)  WASI = wasmtime's own; loader ops (instantiate/scope/sym/got_set/call/error); net ops (sockets); fs op (statvfs); the host's fetch; run() = PyRun_SimpleString
 _engine.py          the engine, the machine-code cache (~/.cache/pyodide-wasmtime), wasm-opt.wasm run in-process
 tests/              offline + network + Pyodide's official CPython suite, each on BOTH builds;  CI: build.yml -> tests.yml / publish.yml
 ```
 
 ## Where it is, and what is next
 
-* **Done (2026-11-10):** the package on branch `claude/ecstatic-cray-to1b3t` (not yet merged): both builds, CLI, API, wheel (13 MB), tests, CI written. Offline tests pass locally on both builds; a part of the official suite passes (see the PR / CI for the current numbers). CI has not yet run end to end.
+* **Done (2026-11-10):** the package on branch `claude/ecstatic-cray-to1b3t` (not yet merged): both builds, CLI, API, wheel (13 MB), tests, CI written. Offline tests pass locally on both builds; a part of the official suite passes (see the PR / CI for the current numbers). CI has not yet run end to end. `Pyodide(preload=)` starts from a cached memory snapshot (`tests/test_snapshot.py`; the REPL's start to the first prompt 0.7 s -> 0.3 s with asyncio preloaded); one snapshot per packaging is kept, so alternating preloads (e.g. the REPL with and without `--allow-top-level-await`) rewrites it each time.
 * **Next** (from [docs/NOTES-FUSEDWASI-AND-TESTSUITE.md](docs/NOTES-FUSEDWASI-AND-TESTSUITE.md)): read the CI run and fix what it shows; then the rest of the official suite (`test_python_socket.py`, the package tests of numpy/cffi/micropip/test-cpp-exceptions); WASI 0.2 over fusedwasi, replacing the `net` operations.
 * **Standards we follow:** core WebAssembly 3.0 (exnref, GC, function references), the `dylink.0` convention (LLVM/Emscripten tool-conventions) for side modules, PEP 783 for the wheel tag (`pyemscripten_YYYY_N_wasm32`), WASI 0.1 now and 0.2/0.3 for sockets, HTTP and files next (replacing our `net` operations). The `loader.*` interface (four functions) is our own extension and the contract between the adapter and a host.
 * **Waiting for the owner:** a pull request (the assistant does not open one); the decision about the license/size policy of Pyodide artifacts in the wheel (they are carried now; the alternative is a download at first run with a sha256 check); `CLAUDE.md` rules that were taken from wasmhost and are not yet confirmed for this project (below).

@@ -17,6 +17,12 @@ with Pyodide() as py:  # the fused build; Pyodide("dynamic") for the other
     py.run("import sys; sys.exit(3)")  # -> 3, the interpreter stays usable
 ```
 
+`Pyodide(preload=CODE)` runs CODE once at start and keeps the guest's memory afterwards as a snapshot in the cache dir
+(one file of ~30 MB per packaging, keyed by the preload, the wasm files, the environment, `preopen_dev` and whether
+stdin/stdout/stderr are terminals); the next start restores it instead of booting Python, so `Pyodide(preload=P).run("pass")`
+takes ~0.2 s instead of ~2 s when P imports `asyncio`. The preload must only import and compute: it must not print (it prints at snapshot time only), and opening files or sockets, `chdir`, writing files, `dlopen` or `ctypes` symbol lookups make the snapshot be skipped (a normal start, the preload run once); with `site=` or `mounts=` there is none. The snapshot is frozen with its hash seed, so every restore shares one `PYTHONHASHSEED` (`random` is re-seeded).
+`PYODIDE_WASMTIME_SNAPSHOT=0` turns it off. Without `preload` nothing changes. The REPL uses it.
+
 It is meant to run anything Pyodide runs without the browser's JavaScript: the standard library, binary Emscripten wheels
 (numpy and the rest of Pyodide's lock: `site=` folders, or `micropip` over the host's fetch or the guest's own TLS),
 files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs the JavaScript bridge (`js`, `pyodide.ffi`,

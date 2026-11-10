@@ -116,7 +116,16 @@ def main(pyodide_wasm, adapter_wasm, out):
     got = [i.name for i in Module(eng, main_bytes).imports if i.module == "GOT.func"]
     renames = {
         ("env", n): "pyodide"
-        for n in ("memory", "__indirect_function_table", "__stack_pointer", "malloc", "calloc", "free")
+        for n in (
+            "memory",
+            "__indirect_function_table",
+            "__stack_pointer",
+            "malloc",
+            "calloc",
+            "free",
+            "emscripten_builtin_memalign",
+            "_emscripten_find_dylib",
+        )
     }
     renames.update({("env", "__memory_base"): "base", ("env", "__table_base"): "base"})
     with tempfile.TemporaryDirectory() as td:

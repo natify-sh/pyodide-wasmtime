@@ -49,6 +49,89 @@ def leb(b, i):
             return r, i
 
 
+def _section(b, wanted):
+    """(start, end) of the first section with id `wanted` in the binary b, or None."""
+    i = 8
+    while i < len(b):
+        size, j = leb(b, i + 1)
+        if b[i] == wanted:
+            return j, j + size
+        i = j + size
+    return None
+
+
+def import_names(b):
+    """[(module, name, kind)] of a binary's imports (kind 0 function, 1 table, 2 memory, 3 global, 4 tag), read from
+    the bytes: no compile. For the main module only (its global imports are plain, no reference types)."""
+    sec = _section(b, 2)
+    if not sec:
+        return []
+    n, i = leb(b, sec[0])
+    out = []
+    for _ in range(n):
+        ml, i = leb(b, i)
+        m = bytes(b[i : i + ml]).decode()
+        i += ml
+        fl, i = leb(b, i)
+        f = bytes(b[i : i + fl]).decode()
+        i += fl
+        kind = b[i]
+        i += 1
+        if kind == 0:
+            _, i = leb(b, i)
+        elif kind in (1, 2):
+            i += kind == 1  # a table's element type
+            flags, i = leb(b, i)
+            _, i = leb(b, i)
+            if flags & 1:
+                _, i = leb(b, i)
+        elif kind == 3:
+            i += 2
+        else:
+            i += 1
+            _, i = leb(b, i)
+        out.append((m, f, kind))
+    return out
+
+
+def export_names(b):
+    """The names of a binary's exports, read from the bytes."""
+    sec = _section(b, 7)
+    if not sec:
+        return []
+    n, i = leb(b, sec[0])
+    out = []
+    for _ in range(n):
+        nl, i = leb(b, i)
+        out.append(bytes(b[i : i + nl]).decode())
+        i += nl + 1
+        _, i = leb(b, i)
+    return out
+
+
+def with_memory_export(b):
+    """The binary with its imported memory 0 also exported as `memory` (wasmtime's WASI reads the memory of the
+    instance that calls it from that export); b is returned as it is when there is no export section to add to."""
+    sec = _section(b, 7)
+    if not sec:
+        return b
+    n, i = leb(b, sec[0])
+    body = bytes(_uleb(n + 1)) + bytes(b[i : sec[1]]) + bytes([6]) + b"memory" + b"\x02\x00"
+    return (
+        bytes(b[: sec[0] - len(_uleb(sec[1] - sec[0])) - 1]) + bytes([7]) + _uleb(len(body)) + body + bytes(b[sec[1] :])
+    )
+
+
+def _uleb(n):
+    out = bytearray()
+    while True:
+        c = n & 0x7F
+        n >>= 7
+        out.append(c | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
 def zero(t):
     return {"i32": "(i32.const 0)", "i64": "(i64.const 0)", "f32": "(f32.const 0)", "f64": "(f64.const 0)"}.get(
         t, "(ref.null extern)" if "extern" in t else "(ref.null func)"

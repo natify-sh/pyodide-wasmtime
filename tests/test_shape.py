@@ -16,6 +16,8 @@ ALLOWED_ENV = {
     "malloc",
     "calloc",
     "free",
+    "emscripten_builtin_memalign",
+    "_emscripten_find_dylib",
 }
 
 
@@ -39,10 +41,11 @@ def test_fused_imports_only_wasi_loader_net():
     m = Module(_engine.engine(), need("pyodide_fused.wasm").read_bytes())
     assert sorted({i.module for i in m.imports}) == ["fs", "loader", "net", "wasi_snapshot_preview1"]
     counts = {mod: sum(i.module == mod for i in m.imports) for mod in ("wasi_snapshot_preview1", "loader", "net", "fs")}
-    # the WASI imports (the main module's own and the adapter's: files, links, times, dup, fcntl, exit), the loader's 14
-    # operations (4 of the loader itself, 5 of libffi and the trampoline's fallback, 3 of local time, the signal
-    # word and the runtime's name), the 21 of the host's sockets and names, and the 1 of its files (statvfs)
-    assert counts == {"wasi_snapshot_preview1": 36, "loader": 14, "net": 21, "fs": 1}
+    # the WASI imports (the main module's own and the adapter's: files, links, times, dup, fcntl, exit, pread,
+    # pwrite), the loader's 16 operations (6 of the loader itself, 5 of libffi and the trampoline's
+    # fallback, 3 of local time, the signal word and the runtime's name), the 21 of the host's sockets and names,
+    # and the 1 of its files (statvfs)
+    assert counts == {"wasi_snapshot_preview1": 38, "loader": 16, "net": 21, "fs": 1}
 
 
 def test_the_package_carries_what_the_run_time_needs():

@@ -63,13 +63,6 @@ class LazyExports(Mapping):
         self._known = frozenset(self._names)
         self._got: dict[str, Any] = {}
 
-    def add(self, name: str, item: Any) -> None:
-        """An export of another instance, found by dlsym as if this module exported it (the adapter's, in the dynamic build)."""
-        if name not in self._known:
-            self._names.append(name)
-            self._known |= {name}
-            self._got[name] = item
-
     def __getitem__(self, name: str) -> Any:
         if name in self._got:
             return self._got[name]

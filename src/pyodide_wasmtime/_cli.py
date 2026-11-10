@@ -19,6 +19,7 @@ import ast, code, types
 class Console(code.InteractiveConsole):
     def __init__(self, aw):
         super().__init__(__import__("__main__").__dict__)
+        self.net = False
         if aw:  # top-level await, as in Pyodide's REPL: on hostnet's loop (no JavaScript, no threads)
             self.compile.compiler.flags |= ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
 
@@ -26,9 +27,11 @@ class Console(code.InteractiveConsole):
         try:
             r = types.FunctionType(c, self.locals)()
             if isinstance(r, types.CoroutineType):
-                import hostnet  # only now: asyncio and urllib cost ~1.2 s at start
+                import hostnet  # imported by the preload (the snapshot); install() patches urllib: only now
 
-                hostnet.install()
+                if not self.net:
+                    self.net = True
+                    hostnet.install()
                 r = hostnet.run(r)
         except SystemExit:
             raise
@@ -37,8 +40,10 @@ class Console(code.InteractiveConsole):
 
 
 _console = Console({aw})
-import sys; print("Python " + sys.version.split()[0] + " on wasmtime (Pyodide {v})")
+import asyncio, hostnet  # in the snapshot, so that the first `await` is fast
 """
+# the banner is the host's: a preload must not print (it would print at snapshot time only)
+BANNER = 'import sys; print("Python " + sys.version.split()[0] + " on wasmtime (Pyodide {v})")'
 PUSH = """\
 import sys
 try:
@@ -65,8 +70,9 @@ def _reader():
         return input
 
 
-def repl(py: Pyodide, aw: bool) -> int:
-    py.run(SETUP.format(aw=aw, v=PYODIDE_VERSION))
+def repl(py: Pyodide) -> int:
+    """The REPL on PY, which was made with ``preload=SETUP.format(aw=...)``."""
+    py.run(BANNER.format(v=PYODIDE_VERSION))
     assert py.root is not None
     flag = py.root / "_repl"
     read = _reader()
@@ -137,7 +143,10 @@ def main(argv: list[str] | None = None) -> int:
         code = None
     else:
         code = sys.stdin.read()
-    with Pyodide(ns.flavor, site=ns.site, mounts=mounts, data=ns.data, preopen_dev=ns.dev or None) as py:
+    preload = SETUP.format(aw=ns.allow_top_level_await) if code is None else None
+    with Pyodide(
+        ns.flavor, site=ns.site, mounts=mounts, data=ns.data, preopen_dev=ns.dev or None, preload=preload
+    ) as py:
         if code is None:
-            return repl(py, ns.allow_top_level_await)
+            return repl(py)
         return py.run(code, argv0)  # 0, 1 for an uncaught error, or the code of sys.exit()/os._exit()
