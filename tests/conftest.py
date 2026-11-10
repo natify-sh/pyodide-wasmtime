@@ -55,7 +55,8 @@ class Guest:
                 missing(f"{path} is missing")
             cmd += ["--site", str(path)]
         cmd += [*args, "-c", code]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # stdin is /dev/null: a guest that reads it gets EOF, not a wait for the terminal of the test run
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
 
 @pytest.fixture

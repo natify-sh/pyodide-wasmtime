@@ -131,7 +131,13 @@ def test_cpython_core(suite_flavor: str, module: tuple[str, dict[str, Any]]):
         dedent(GUEST).format(name=name, ignore_tests=repr(ignore_tests), boot_modules=repr(BOOT_MODULES)),
     ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout * TIMEOUT_FACTOR, 120))
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout * TIMEOUT_FACTOR, 120),
+            stdin=subprocess.DEVNULL,  # a test that reads stdin gets EOF, not the terminal of this run
+        )
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"")[-1500:]
         pytest.fail(f"timeout after {e.timeout:.0f} s (Pyodide's limit is {timeout} s); output ends: {out!r}")
