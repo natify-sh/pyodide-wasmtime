@@ -164,3 +164,34 @@ def test_stdlib_of_another_python_warns(tmp_path: Path, caplog: pytest.LogCaptur
         assert py.run("pass") == 0
     assert [r.getMessage() for r in caplog.records if "is for Python 3.14" in r.getMessage()] != []
     assert len([r for r in caplog.records if "is for Python" in r.getMessage()]) == 1  # once per start
+
+
+def test_legacy_exceptions_are_converted_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pyodide_wasmtime import _engine
+
+    def sec(i: int, body: bytes) -> bytes:
+        return bytes([i, len(body)]) + body
+
+    body = bytes([0, 0x06, 0x40, 0x01, 0x19, 0x01, 0x0B, 0x0B])  # try nop catch_all nop end
+    legacy = tmp_path / "legacy.wasm"
+    legacy.write_bytes(
+        b"\0asm\1\0\0\0"
+        + sec(1, b"\1\x60\0\0")
+        + sec(3, b"\1\0")
+        + sec(7, b"\1\1f\0\0")
+        + sec(10, bytes([1, len(body)]) + body)
+    )
+    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path / "cache"))
+    calls: list[int] = []
+    real = _engine.translate_to_exnref
+    monkeypatch.setattr(_engine, "translate_to_exnref", lambda d, w: (calls.append(1), real(d, w))[1])
+    opt = data_dir() / "wasm-opt.wasm"
+    with pytest.raises(Exception, match="legacy_exceptions"):
+        _engine.load_module(legacy)  # without wasm_opt: refused, as before
+    done: list[Path] = []
+    _engine.load_module(legacy, wasm_opt=opt, converted=done)
+    assert (calls, done) == ([1], [legacy.resolve()])
+    _engine._STATE.clear()  # a new process: only the machine-code cache is left
+    done.clear()
+    _engine.load_module(legacy, wasm_opt=opt, converted=done)
+    assert (calls, done) == ([1], [])

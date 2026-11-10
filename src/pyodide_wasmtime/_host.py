@@ -2064,7 +2064,10 @@ class Pyodide:
                 if isinstance(e.type, wt.FuncType) and not e.name.startswith("__wasm")
             ]
             fwd = {n: k for k, n in enumerate([*adapter_names, _wasm.TRAMP])}
-            main_mod = _engine.load_module(main_path)
+            done: list[Path] = []
+            main_mod = _engine.load_module(main_path, wasm_opt=self.wasm_opt if self.asm_wasm else None, converted=done)
+            if done:
+                log.warning("pyodide-wasmtime: %s: converted from legacy exceptions at start; cached", main_path)
             imports = _wasm.func_imports(main_mod)
             got = [i.name for i in main_mod.imports if i.module == "GOT.func"]
             shim_mod = wt.Module(engine, wt.wat2wasm(_wasm.shim_wat(imports, fwd, got)))

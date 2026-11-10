@@ -108,8 +108,16 @@ def _stamp(path: Path) -> bytes:
     return f"wasmtime-py {wt_version}:{st.st_size}:{st.st_mtime_ns}".encode()
 
 
-def load_module(path: str | os.PathLike[str], *, cache: bool = True) -> Any:
-    """Compile a module from a file, through the machine-code cache."""
+def load_module(
+    path: str | os.PathLike[str],
+    *,
+    cache: bool = True,
+    wasm_opt: str | os.PathLike[str] | None = None,
+    converted: list[Path] | None = None,
+) -> Any:
+    """Compile a module from a file, through the machine-code cache. With WASM_OPT, a file refused for its legacy
+    exceptions is converted to exnref (and PATH appended to CONVERTED); the cache then holds the converted module,
+    keyed by the source file's stamp, so the conversion runs once per file."""
     wt = require_wasmtime()
     path = Path(path).resolve()
     stamp = _stamp(path)
@@ -132,7 +140,14 @@ def load_module(path: str | os.PathLike[str], *, cache: bool = True) -> Any:
         except (OSError, wt.WasmtimeError):
             module = None
     if module is None:
-        module = wt.Module.from_file(eng, str(path))
+        try:
+            module = wt.Module.from_file(eng, str(path))
+        except wt.WasmtimeError as exc:
+            if wasm_opt is None or "legacy_exceptions" not in str(exc):
+                raise
+            module = wt.Module(eng, translate_to_exnref(path.read_bytes(), wasm_opt))
+            if converted is not None:
+                converted.append(path)
         if cached is not None:
             try:
                 cached.parent.mkdir(parents=True, exist_ok=True)
