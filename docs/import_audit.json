@@ -1335,13 +1335,10 @@
  {
   "name": "__syscall_umask_js",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The mask is never stored: every call returns 022, so os.umask(0o77); os.umask(0o22) returns 0o22 where Pyodide returns 0o77.",
-   "The umask is never applied to created files (modes are ignored anyway)."
-  ],
-  "evidence": "adapter.c:1002; probe os.umask twice: ours ('0o22','0o22'), Pyodide ('0o22','0o77')",
-  "tested": "no (suite test_os notes 'os.umask is not supported')"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_umask: the mask is stored (MetaT.umask, & 0777) and the previous one returned; open_at/mkdirat/mknodat apply it to the recorded mode. os.umask(0o77), os.umask(0o22), os.umask(0o22) -> (0o22, 0o77, 0o22) in Pyodide and in ours. Note: Pyodide on Node forwards the mask to the host process (process.umask) and does not apply it to its in-memory files; ours applies it (Linux), by decision. The mask lives for the interpreter's lifetime.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files"
  },
  {
   "name": "__syscall_ioctl",
@@ -1500,28 +1497,18 @@
   "class": "os",
   "verdict": "partial",
   "gaps": [
-   "F_DUPFD ignores its minimum number (fcntl(fd, F_DUPFD, 50) returns the lowest free).",
-   "F_GETLK/F_SETLK/F_SETLKW of this ABI are 12/13/14 but the code handles 6/7 (dead code): fcntl.lockf fails with EINVAL.",
-   "F_GETFD/F_SETFD return 0 for an invalid descriptor (Pyodide: EBADF).",
-   "F_DUPFD on a standard stream, a socket or a pipe is ENOSYS (no path to reopen).",
-   "F_GETFL/F_SETFL on a socket keep O_NONBLOCK now (fixed)."
+   "F_DUPFD/F_DUPFD_CLOEXEC are left to dup (minimum number not honoured; streams, sockets and pipes ENOSYS): the descriptor layer's work, not this step's."
   ],
-  "evidence": "adapter.c sc_fcntl64: va points at the variable arguments; F_GETFL over fd_fdstat_get, F_SETFL over fd_fdstat_set_flags",
-  "tested": "tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor"
+  "evidence": "adapter.c sc_fcntl64: EBADF for a closed descriptor for every command (Pyodide's getStreamFromFD); F_GETLK (12) reports F_UNLCK, F_SETLK/F_SETLKW (13, 14) are granted (one process): fcntl.lockf and flock work; F_GETFD/F_SETFD 0; F_GETFL/F_SETFL for files and sockets; other commands EINVAL. F_DUPFD is dup's (the descriptor layer).",
+  "tested": "tests/test_files.py::test_fcntl_locks_and_invalid_descriptors, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor"
  },
  {
   "name": "__syscall_openat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The mode is ignored: os.open(p, O_CREAT, 0o600) then stat gives 0o100644 (Pyodide 0o100600).",
-   "'..' above the guest root fails: os.stat('/..') and os.stat('..') at cwd '/' give EPERM (WASI sandbox escape); Linux and Pyodide treat it as '/'.",
-   "If cwd + relative path exceeds 1024 bytes, resolve() (211-235) silently keeps the relative path and resolves it against '/', not the cwd: a wrong file, not ENAMETOOLONG (code read, not probed).",
-   "O_SYNC/O_DSYNC/O_RSYNC, O_NOATIME and O_TMPFILE are dropped silently.",
-   "The path record that dup() uses is skipped silently for paths over 1024 bytes, so dup of such an fd gives ENOSYS."
-  ],
-  "evidence": "adapter.c:364-395 (resolve 211-269); probe: O_NOFOLLOW link ELOOP, dirfd-relative, O_DIRECTORY file ENOTDIR, dir O_WRONLY EISDIR, O_EXCL EEXIST all match; mode 0600 → ours 0o100644 / Pyodide 0o100600; stat('/..') → EPERM / 0o40777",
-  "tested": "tests/test_basic.py::test_files_in_the_guest, ::test_dup_scandir_fwalk_and_rmtree"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c open_at: the mode of O_CREAT (the variable argument) minus the umask is recorded for a file made now (checked with a stat before the open); an existing file with a recorded mode is opened only if that mode allows the access (EACCES, as Pyodide's mayOpen); a file made now needs the directory to allow write and search (dir_denies); the path record of dup() is malloc'd and has no length limit. The ABI's '..' above the root is clamped in resolve()/fixpath (stat('/..') is the root); cwd + relative paths are composed in growing buffers (no 1024-byte limit, no silent resolution against '/'). O_SYNC/O_DSYNC/O_RSYNC/O_NOATIME are no-ops in Pyodide as well. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: open mode, umask, chmod 0 + open -> EACCES, long paths match.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_long_paths_have_no_wrong_answer"
  },
  {
   "name": "_tzset_js",
@@ -1545,45 +1532,34 @@
  {
   "name": "__syscall_faccessat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "amode is ignored: on a chmod 0 file, os.access(W_OK) and os.access(X_OK) are True (Pyodide False, False).",
-   "An invalid amode (0o10) is not EINVAL: it returns True (Pyodide False)."
-  ],
-  "evidence": "adapter.c:461-469; probe: access nope → False/False; W,X on 000 → (True,True)/(False,False); access mode 0o10 → True/False",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_faccessat: amode & ~7 is EINVAL; the recorded (or default) mode bits give EACCES as Pyodide's nodePermissions (any of the user/group/other bits, whoever asks); a missing path or an empty one is ENOENT. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chmod 0 file -> (R, W, X, F) = (False, False, False, True), amode 8 -> EINVAL.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_chdir",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Lexical, not physical: after chdir('/tmp/y/ln2') (ln2 → real/sub), getcwd() gives '/tmp/y/ln2' (Pyodide/Linux '/tmp/y/real/sub'), and chdir('..') goes to '/tmp/y' instead of '/tmp/y/real'.",
-   "Too long returns -36, which is EMULTIHOP in WASI numbering (ENAMETOOLONG is 37): os.chdir('/'+'a/'*600) raises EMULTIHOP."
-  ],
-  "evidence": "adapter.c:314-357; probe: chdir file ENOTDIR / nope ENOENT match; symlink getcwd ours '/tmp/y/ln2' vs '/tmp/y/real/sub'; long → EMULTIHOP vs ENOENT",
-  "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c phys() + sc_chdir: physical, an iterative readlink walk of the components (loop limit 40 -> ELOOP, '..' is the real parent), the target must be a directory (ENOTDIR) it may search (EACCES for a recorded mode without x); the path is not limited in length. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chdir through a link, chdir('..') after it, chdir('/'+'a/'*600) -> ENOENT, empty -> ENOENT match.",
+  "tested": "tests/test_files.py::test_chdir_is_physical, tests/test_files.py::test_long_paths_have_no_wrong_answer"
  },
  {
   "name": "__syscall_chmod",
   "class": "os",
-  "verdict": "stub",
-  "gaps": [
-   "Exported, returns 0 and does nothing. This is a lie: os.chmod(f, 0o751) then stat gives 0o100644 (Pyodide 0o100751), and os.chmod on a missing path succeeds (Pyodide ENOENT)."
-  ],
-  "evidence": "adapter.c:1009; probe: chmod → 0o100644 / 0o100751; chmod nope → None / ENOENT",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_chmod -> set_mode: the permission bits (& 07777) are recorded for the file the path names (links followed), for the interpreter's lifetime; a missing path is ENOENT. stat, access and open honour them. Not written to the host file (WASI has no chmod). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chmod 0o751, missing path, high bits match.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_fchownat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Any uid/gid other than 0/-1 gives EPERM; Pyodide (and Linux as root, the uid we report) succeed: os.chown(f, 1000, 1000).",
-   "Ownership is never recorded (Pyodide doesn't record it either)."
-  ],
-  "evidence": "adapter.c:1408-1417; probe: chown 1000 → EPERM / None; chown 0 and chown missing (ENOENT) match",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchownat -> set_owner: any uid/gid is accepted and recorded in the metadata table (-1 leaves one as it is) for the interpreter's lifetime, not written to the host file; a missing path is ENOENT; AT_SYMLINK_NOFOLLOW honoured. stat/fstat report the recorded uid/gid. (Pyodide accepts the call and records nothing; recording is the Linux behaviour and the decision.)",
+  "tested": "tests/test_files.py::test_chown_is_recorded_and_stat_shows_it"
  },
  {
   "name": "__syscall_dup",
@@ -1595,7 +1571,7 @@
    "An invalid fd gives ENOSYS, not EBADF.",
    "It reopens by the recorded path, so after a rename or unlink of the file the dup fails or opens a different file (code read)."
   ],
-  "evidence": "adapter.c:398-409; probe: dup shares offset → (b'34',3)/(b'34',5); dup(1) → ENOSYS/5; dup(999) → ENOSYS/EBADF",
+  "evidence": "adapter.c:398-409; probe: dup shares offset \u2192 (b'34',3)/(b'34',5); dup(1) \u2192 ENOSYS/5; dup(999) \u2192 ENOSYS/EBADF",
   "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree, ::test_chdir_symlink_and_honest_enosys"
  },
  {
@@ -1608,7 +1584,7 @@
    "Inherits dup's gaps: no shared offset (dup2 onto an open fd: lseek gives 3, Pyodide 5); stdio and sockets give ENOSYS, so os.dup2(file, 1) redirection fails.",
    "The readdir cookie of newfd is not reset or moved (code read, 423-427)."
   ],
-  "evidence": "adapter.c:411-429; probe: dup2(fd,50) → EBADF/50; dup2(fd,60) → EBADF/60; dup2 onto an open fd works with a non-shared offset",
+  "evidence": "adapter.c:411-429; probe: dup2(fd,50) \u2192 EBADF/50; dup2(fd,60) \u2192 EBADF/60; dup2 onto an open fd works with a non-shared offset",
   "tested": "no"
  },
  {
@@ -1747,107 +1723,81 @@
  {
   "name": "__syscall_fchdir",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Only fds opened by openat and preopens work; fchdir(1) ends in ENOENT (musl's /proc fallback), not ENOTDIR as in Pyodide.",
-   "It uses the path recorded at open time, so a directory renamed since then gives a stale cwd.",
-   "Inherits chdir's lexical normalisation."
-  ],
-  "evidence": "adapter.c:359-362; probe: fchdir(dirfd) → /tmp/y/real both; fchdir(file) ENOTDIR both; fchdir(1) → ENOENT/ENOTDIR",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchdir: the path the descriptor was opened with (Pyodide: stream.path as well) through the same physical chdir; a stream or a socket is ENOTDIR, a closed descriptor EBADF, a file ENOTDIR. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match (fchdir(1) ENOTDIR, fchdir(5000) EBADF).",
+  "tested": "tests/test_files.py::test_chdir_is_physical"
  },
  {
   "name": "__syscall_fchmod",
   "class": "os",
-  "verdict": "stub",
-  "gaps": [
-   "Returns 0 and does nothing (a lie); os.fchmod(999, 0o600) succeeds (Pyodide EBADF)."
-  ],
-  "evidence": "adapter.c:1010; probe: fchmod bad → None / EBADF",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchmod: as chmod for a descriptor; EBADF for a closed one. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_fchmodat2",
   "class": "os",
-  "verdict": "stub",
-  "gaps": [
-   "Returns 0 and does nothing (a lie), even for a missing path."
-  ],
-  "evidence": "adapter.c:1011; not probed directly (os.chmod went through chmod; same code shape)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchmodat2: as chmod; AT_SYMLINK_NOFOLLOW (256) changes the link's own record, as Pyodide's JS does; a missing or empty path is ENOENT.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_fchown32",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "uid/gid other than 0/-1 give EPERM where Pyodide succeeds."
-  ],
-  "evidence": "adapter.c:1419-1423; probe: fchown(999) → EBADF both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchown32 -> set_owner: as fchownat for a descriptor; EBADF for a closed one. fstat reports the recorded owners.",
+  "tested": "tests/test_files.py::test_chown_is_recorded_and_stat_shows_it"
  },
  {
   "name": "__syscall_fdatasync",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "os.fdatasync(1) gives EBADF; Pyodide returns 0 for any valid stream."
-  ],
-  "evidence": "adapter.c:970-973; probe: read-only fd → None both; stdout → EBADF/None; 999 → EBADF both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fdatasync: EBADF for a closed descriptor; a standard stream or a socket succeeds (Pyodide); other descriptors go to WASI's fd_datasync (EINVAL/ENOTSUP and the EBADF of a read-only descriptor's missing right are success). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: fdatasync(1) -> None, (5000) -> EBADF, file, directory.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "__syscall_fstat64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Permission bits are made up: files 0644, dirs 0755, links 0777, whatever the real or chmod'ed mode.",
-   "stdout reports S_IFREG 0o100644; Pyodide 0o20666 (a character device). Python then treats stdout as a regular file.",
-   "An unknown WASI filetype becomes S_IFREG; st_rdev, st_uid and st_gid are always 0; st_dev is truncated to 32 bits."
-  ],
-  "evidence": "adapter.c:434-446, put_stat 272-292; probe: fstat(1) → 0o100644/0o20666; fstat(fd) after chmod 751 → 0o100644/0o100751; nlink/uid/blksize/ino match; socket → 0o140777",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree (indirect)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c put_stat/sc_fstat64: the S_IF* type from the WASI filetype (char, block, socket, symlink, directory, regular), the permission bits, uid and gid from the metadata table (defaults 0644/0755/0777), st_dev/st_ino from WASI (st_dev is 32 bits in this ABI: the two halves are folded, st_ino is the full 64 bits), a symlink's size is the length of the target it holds; fd 0-2 are 0o20666 character devices as Pyodide's fstat(1). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_stat64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "os.stat('') returns the stat of the root directory instead of ENOENT: resolve() turns an empty path into '.'.",
-   "Same made-up modes as fstat64.",
-   "'/..' gives EPERM."
-  ],
-  "evidence": "adapter.c:431, 294-303; probe: stat('') → stat_result(dir) / ENOENT; stat('/..') → EPERM / 0o40777",
-  "tested": "tests/test_basic.py::test_files_in_the_guest"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c stat_path/fx_lookup/put_stat: an empty path is ENOENT; '..' above the root is the root; modes, owners and types as fstat64. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths"
  },
  {
   "name": "__syscall_newfstatat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "An empty path is treated as AT_EMPTY_PATH even without flag 0x1000, so fstatat(AT_FDCWD, \"\", 0) does fstat(-100) and gives EBADF instead of ENOENT.",
-   "Same made-up modes and '..'-escape EPERM as stat64."
-  ],
-  "evidence": "adapter.c:448-451; covered by the stat('') / scandir probes above; which of stat64/newfstatat os.stat('') reached was not traced",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree (fwalk)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_newfstatat: an empty path is ENOENT unless AT_EMPTY_PATH (0x1000), which stats the descriptor (or the cwd for AT_FDCWD); a relative path with '..' to a directory descriptor is made absolute (WASI refuses a '..' out of a descriptor); the rest as stat64/lstat64.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths"
  },
  {
   "name": "__syscall_lstat64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "os.lstat('') returns the root directory instead of ENOENT.",
-   "Made-up modes."
-  ],
-  "evidence": "adapter.c:432; probe: lstat('') → dir / ENOENT; lstat(link) → 0o120777 both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_lstat64 -> stat_path(follow 0): an empty path is ENOENT, link types and sizes as stored. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {
   "name": "__syscall_ftruncate64",
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:948-951; probe: ftruncate -1 EINVAL, read-only EINVAL, 3 → 3, 5 GiB → 5368709120: identical in both",
+  "evidence": "adapter.c:948-951; probe: ftruncate -1 EINVAL, read-only EINVAL, 3 \u2192 3, 5 GiB \u2192 5368709120: identical in both",
   "tested": "no"
  },
  {
@@ -1855,27 +1805,23 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:305-311; probe: getcwd '/' both; getcwd(buf,1) → ERANGE both (size==0 gives ERANGE not EINVAL, but musl never passes 0); a symlinked cwd is chdir's gap",
+  "evidence": "adapter.c:305-311; probe: getcwd '/' both; getcwd(buf,1) \u2192 ERANGE both (size==0 gives ERANGE not EINVAL, but musl never passes 0); a symlinked cwd is chdir's gap",
   "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
   "name": "__syscall_getdents64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "lseek on a directory fd does not reset the per-fd WASI cookie, so rewinddir() then readdir() returns nothing; seekdir/telldir are ignored too.",
-   "The cookie table has 1024 entries: a directory fd ≥ 1024 gives EBADF.",
-   "After dup3 the target fd keeps a stale cookie (code read)."
-  ],
-  "evidence": "adapter.c:473-507; probe ctypes opendir/readdir/rewinddir/readdir: ours second listing [] / Pyodide ['.','..','e0','e1','e2']; listdir(fd) twice and scandir types match",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_getdents64 + x_fd_seek (fd_seek is routed through the adapter, WASI_ROUTED): lseek on a directory descriptor sets/reads the readdir cookie (rewinddir = SEEK_SET 0, seekdir/telldir use d_off); the cookie table grows with the descriptor number (no 1024 limit); dup3 resets the target's cookie. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: rewinddir/seekdir/telldir by musl's own code -> (7, 7, 4, 4) entries in both.",
+  "tested": "tests/test_files.py::test_directory_descriptors_seek_and_list_past_1024, tests/test_files.py::test_dup2_onto_a_directory_resets_its_listing"
  },
  {
   "name": "__syscall_getegid32",
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1001; probe ctypes getegid → 0 both",
+  "evidence": "adapter.c:1001; probe ctypes getegid \u2192 0 both",
   "tested": "no"
  },
  {
@@ -1883,7 +1829,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:999; probe ctypes geteuid → 0 both",
+  "evidence": "adapter.c:999; probe ctypes geteuid \u2192 0 both",
   "tested": "no"
  },
  {
@@ -1891,7 +1837,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1000; probe ctypes getgid → 0 both",
+  "evidence": "adapter.c:1000; probe ctypes getgid \u2192 0 both",
   "tested": "no"
  },
  {
@@ -1905,13 +1851,10 @@
  {
   "name": "__syscall_linkat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "AT_SYMLINK_FOLLOW (0x400) gives EINVAL from wasmtime; Linux follows the link.",
-   "Not reachable through os.link (absent in Pyodide's os); only ctypes. Pyodide's JS gives EMLINK for every link, so ours does more than the baseline."
-  ],
-  "evidence": "adapter.c:989-995; probe ctypes link: ours 0, nlink 2 / Pyodide EMLINK; link exists EEXIST / EMLINK; linkat FOLLOW EINVAL / EMLINK",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_linkat: AT_SYMLINK_FOLLOW is done here (phys() resolves the link, then the file is linked: wasmtime's own flag is EINVAL); other flags EINVAL. The directory of the new name must allow write and search (EACCES). A hard link to a directory is the host's EPERM. Ours really links where Pyodide's JS says EMLINK for every call (more than the baseline).",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "_emscripten_lookup_name",
@@ -1927,24 +1870,20 @@
  {
   "name": "__syscall_mkdirat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The mode is ignored: os.mkdir(d, 0o700) then stat gives 0o40755 (Pyodide 0o40700)."
-  ],
-  "evidence": "adapter.c:921-928; probe: mkdir mode → 0o40755/0o40700; exists EEXIST and missing parent ENOENT match",
-  "tested": "tests/test_basic.py::test_files_in_the_guest"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_mkdirat: the mode minus the umask (& 01777) is recorded for the new directory; the parent must allow write and search (dir_denies, EACCES as Pyodide). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: mkdir(d, 0o700) -> 0o40700.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files"
  },
  {
   "name": "__syscall_mknodat",
   "class": "os",
   "verdict": "partial",
   "gaps": [
-   "S_IFIFO/S_IFCHR/S_IFBLK/S_IFSOCK give ENOSYS (mkfifo fails); Pyodide's JS makes them (mknod chr succeeded).",
-   "Type 0 makes a regular file (as Linux), where Pyodide's JS gives EINVAL.",
-   "The mode is ignored."
+   "S_IFIFO/S_IFCHR/S_IFBLK/S_IFSOCK give ENOSYS (os.mkfifo fails); Pyodide's in-memory file system makes them. WASI preview1 has no mknod/mkfifo and wasmtime cannot make a node on the host."
   ],
-  "evidence": "adapter.c:1426-1434; probe ctypes: mknod reg ok both; mknod 0 → created / EINVAL; mknod chr → ENOSYS / 0; mkfifo → ENOSYS / -1",
-  "tested": "no"
+  "evidence": "adapter.c sc_mknodat: a regular file is made like open(O_CREAT|O_EXCL) with the mode and the umask recorded; a mode with no type is EINVAL (Pyodide's JS); FIFOs, character and block devices and sockets are ENOSYS: WASI preview1 and wasmtime have no call that makes them.",
+  "tested": "tests/test_files.py::test_mknod_makes_regular_files_only"
  },
  {
   "name": "_timegm_js",
@@ -1980,7 +1919,7 @@
    "|t| between 8.64e12 and about 6.7e16 returns a date where JS returns an error (OSError).",
    "t=-2^63 overflows in fill_tm (-t)."
   ],
-  "evidence": "adapter.c:1356-1382; probe: 14 edge values: identical within ±8.64e12 except year 1-99 yday (JS bug: -693959); outside that range ours computes and real raises OSError 28",
+  "evidence": "adapter.c:1356-1382; probe: 14 edge values: identical within \u00b18.64e12 except year 1-99 yday (JS bug: -693959); outside that range ours computes and real raises OSError 28",
   "tested": "suite test_time / test_datetime (test_datetime passes)"
  },
  {
@@ -1991,7 +1930,7 @@
    "No range error, and the year is truncated to i32: time.gmtime(1e17) -> year -1126091476, gmtime(-2**63) -> year -219246529 (signed overflow in fill_tm). Real raises OSError EINVAL beyond 8.64e12.",
    "Years 1-99 have the correct yday in ours; JS gives yday -693959 (a JS bug)."
   ],
-  "evidence": "adapter.c:1356-1376; probe: gmtime at 0, -1, -86401, 1e9, ±2^31, 9999/10000, 8.64e12, 1e13, 1e15, 1e17, ±2^63, year 1/0 -> equal within range, differences as listed",
+  "evidence": "adapter.c:1356-1376; probe: gmtime at 0, -1, -86401, 1e9, \u00b12^31, 9999/10000, 8.64e12, 1e13, 1e15, 1e17, \u00b12^63, year 1/0 -> equal within range, differences as listed",
   "tested": "tests/test_checks.py::test_the_guests_own_tls (network); suite test_time"
  },
  {
@@ -2013,7 +1952,7 @@
   "gaps": [
    "os.pipe() gives ENOSYS; Pyodide's JS has PIPEFS (returned (9, 10))."
   ],
-  "evidence": "not exported; probe: os.pipe() → ENOSYS / (9,10)",
+  "evidence": "not exported; probe: os.pipe() \u2192 ENOSYS / (9,10)",
   "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
@@ -2029,24 +1968,18 @@
  {
   "name": "__syscall_fadvise64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Returns 0 for anything: os.posix_fadvise(999, …) succeeds (Pyodide EBADF); no ESPIPE for non-seekable fds."
-  ],
-  "evidence": "adapter.c:976-979; probe: fadvise bad → None / EBADF; valid fd → None both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fadvise64: EBADF for a closed descriptor, ESPIPE for a standard stream, socket or character device (Pyodide's stream.seekable), else 0. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "__syscall_fallocate",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "mode is ignored: FALLOC_FL_KEEP_SIZE/PUNCH_HOLE are treated as a plain allocate (Pyodide gives EOPNOTSUPP for mode≠0).",
-   "No EINVAL for negative offset/len before WASI.",
-   "posix_fallocate(fd,0,100) through ctypes left the size at 0 (Pyodide 100); wasmtime's fd_allocate probably fails, but the return value could not be read (see the ffi_call_js bug)."
-  ],
-  "evidence": "adapter.c:964-968; probe ctypes posix_fallocate: ours size 0, ret garbage / Pyodide ret 0, size 100 (os.posix_fallocate absent in both)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fallocate, as Pyodide's JS: |offset|,|len| > 2^53 -> EFBIG, mode != 0 -> EOPNOTSUPP, negative -> EINVAL, closed fd EBADF, non-seekable ESPIPE, otherwise the size grows to offset+len if it is smaller (fd_filestat_set_size; EACCES if the recorded mode forbids writing, as Pyodide's ftruncate). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings (posix_fallocate through ctypes: mode is not reachable from Python).",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "_emscripten_get_progname",
@@ -2082,18 +2015,16 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:453-459; probe: relative-link read, not-a-link EINVAL, missing ENOENT, bufsize 0 all match (absolute links cannot be made: symlinkat gap)",
-  "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
+  "evidence": "adapter.c sc_readlinkat: WASI's path_readlink; for a link made with an absolute target (symlinkat) the original string from the metadata table. Relative links, not-a-link EINVAL, missing ENOENT match Pyodide.",
+  "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored, tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
   "name": "__syscall_unlinkat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Flags other than 0/AT_REMOVEDIR are not rejected: unlinkat(AT_FDCWD, f, 0x1) deletes the file (Pyodide EINVAL, file kept)."
-  ],
-  "evidence": "adapter.c:930-936; probe: unlink dir EISDIR and rmdir(dir_fd) match; bad flag → 0, file gone / EINVAL, file kept",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_unlinkat: flags other than 0 and AT_REMOVEDIR (0x200) are EINVAL before anything is removed; the record of the last name of a file (or of a removed directory) is dropped, so a new file with the same inode gets its own; the parent directory must allow write and search (dir_denies, EACCES as Pyodide's mayDelete). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: unlinkat(f, 1) -> EINVAL, file kept.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat, tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record"
  },
  {
   "name": "__syscall_rmdir",
@@ -2108,8 +2039,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:940-946; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match",
-  "tested": "no"
+  "evidence": "adapter.c sc_renameat; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match; the record of a replaced file is dropped, and a link made with an absolute target is made again for its new directory.",
+  "tested": "tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {
   "name": "_setitimer_js",
@@ -2124,32 +2055,26 @@
  {
   "name": "__syscall_statfs64",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "os.statvfs('/') and shutil.disk_usage give ENOSYS; Pyodide returns made-up values (f_bsize 4096)."
-  ],
-  "evidence": "not exported; probe: statvfs → ENOSYS / 4096",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_statfs64 + _host.py _fs_statvfs (host operation fs.statvfs): the host answers with os.statvfs of the host folder that backs the guest path (the guest root, or the mounted folder with the longest matching prefix), written as Emscripten's statfs64; ENOENT for a missing path. Pyodide answers made-up numbers.",
+  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host"
  },
  {
   "name": "__syscall_fstatfs64",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "os.fstatvfs gives ENOSYS; Pyodide gives values."
-  ],
-  "evidence": "not exported; probe: fstatvfs → ENOSYS / 4096",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fstatfs64 + fs.statvfs: the path the descriptor was opened with; a stream, a socket or a file deleted since: the guest root; EBADF for a closed descriptor.",
+  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host"
  },
  {
   "name": "__syscall_symlinkat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "An absolute target is refused by wasmtime: os.symlink('/tmp/y/real/sub', link) gives EPERM (Pyodide succeeds). Relative targets work."
-  ],
-  "evidence": "adapter.c:981-987; probe: absolute → EPERM / None; relative and EEXIST match",
-  "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys (relative only)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_symlinkat/rel_target: wasmtime refuses an absolute target (EPERM), so the link is made with the target relative to the link's real directory (phys()) and the original string is kept in the metadata table: readlink returns exactly what the program stored, lstat's size is its length, opening through the link reaches the same file; rename makes the link again for its new directory (relink), copytree(symlinks=True) round-trips. The directory of the new link must allow write and search (EACCES). A link and a target under different preopens (a --mount) cannot be expressed: EXDEV. Relative targets are stored as they are.",
+  "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {
   "name": "emscripten_get_heap_max",
@@ -2184,12 +2109,12 @@
  {
   "name": "__syscall_utimensat",
   "class": "os",
-  "verdict": "stub",
+  "verdict": "partial",
   "gaps": [
-   "Returns 0 and does nothing (a lie): after os.utime(f, (1e9, 1e9)) mtime is unchanged (Pyodide 1000000000.0); os.utime on a missing path succeeds (Pyodide ENOENT). WASI has path_filestat_set_times. The suite skips test_utime*, so nothing catches it."
+   "WASI timestamps are unsigned nanoseconds since 1970 (u64): a time before 1970 or after the year 2554 is EINVAL, where Pyodide's JavaScript Date accepts it (os.utime(f, (-5, 10)) and (2**40, 10))."
   ],
-  "evidence": "adapter.c:1008; probe: utime → 1794291630.37 / 1e9; utime nope → None / ENOENT; utime ns → unchanged / 1234567000000",
-  "tested": "no"
+  "evidence": "adapter.c sc_utimensat: path_filestat_set_times / fd_filestat_set_times (a null or empty path is the descriptor, futimens), UTIME_NOW and UTIME_OMIT per time, AT_SYMLINK_NOFOLLOW, ENOENT for a missing path, EINVAL for a bad nanosecond. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match for ordinary times. (CPython's os.utime here goes through utimes(), so a time set from Python has microsecond precision.)",
+  "tested": "tests/test_files.py::test_utimensat_sets_the_times"
  },
  {
   "name": "emscripten_resize_heap",
@@ -2218,7 +2143,7 @@
   "gaps": [
    "socket().bind(...) gives ENOSYS, so socket.socketpair() (its fallback uses bind/listen/accept) gives ENOSYS, and asyncio.run()/SelectorEventLoop() fail with OSError 52."
   ],
-  "evidence": "not exported; probe: bind → ENOSYS; socketpair → ENOSYS; asyncio.run → OSError(52); Pyodide: socketpair is fatal 'Cannot find module ws'",
+  "evidence": "not exported; probe: bind \u2192 ENOSYS; socketpair \u2192 ENOSYS; asyncio.run \u2192 OSError(52); Pyodide: socketpair is fatal 'Cannot find module ws'",
   "tested": "no"
  },
  {
@@ -2240,7 +2165,7 @@
    "Always an AF_INET sockaddr. For an AF_INET6 socket the host's socket.inet_aton(ip) is outside the try (_host.py:412) and would raise in the host function, i.e. a trap (not verified: the host here has no IPv6).",
    "*lenp is read without a NULL check."
   ],
-  "evidence": "adapter.c:1204-1222; probe: unconnected → ENOTCONN; connected → ('127.0.0.1', 47811)",
+  "evidence": "adapter.c:1204-1222; probe: unconnected \u2192 ENOTCONN; connected \u2192 ('127.0.0.1', 47811)",
   "tested": "tests/test_checks.py::test_the_guests_own_tls (network, via ssl)"
  },
  {
@@ -2272,7 +2197,7 @@
   "gaps": [
    "No server sockets (Pyodide on Node: fatal without `ws`)."
   ],
-  "evidence": "not exported; probe: listen → ENOSYS",
+  "evidence": "not exported; probe: listen \u2192 ENOSYS",
   "tested": "no"
  },
  {
@@ -2324,7 +2249,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1198-1202; probe: shutdown(SHUT_WR) then recv → b'Eq', b'' (Linux semantics; Pyodide's JS returns ENOSYS, so ours does more); non-socket → ENOTSOCK",
+  "evidence": "adapter.c:1198-1202; probe: shutdown(SHUT_WR) then recv \u2192 b'Eq', b'' (Linux semantics; Pyodide's JS returns ENOSYS, so ours does more); non-socket \u2192 ENOTSOCK",
   "tested": "no"
  },
  {

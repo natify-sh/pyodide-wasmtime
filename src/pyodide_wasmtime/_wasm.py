@@ -8,7 +8,13 @@ dynamic build (what the adapter answers calls through a table; the rest are zero
 from __future__ import annotations
 
 LOADER: set = set()  # the loader is in the adapter now
-WASI_ROUTED = ("fd_read", "fd_write", "fd_close", "fd_fdstat_get")  # the adapter's first, for socket descriptors
+WASI_ROUTED = (
+    "fd_read",
+    "fd_write",
+    "fd_close",
+    "fd_fdstat_get",
+    "fd_seek",
+)  # the adapter's first: sockets, directories
 TRAMP = "_PyEM_TrampolineCall_JS"
 
 

@@ -17,6 +17,7 @@ import errno
 import json
 import logging
 import os
+import posixpath
 import select
 import shutil
 import socket
@@ -446,6 +447,31 @@ class Pyodide:
         self._wr(ap, socket.inet_aton(ip))
         return 0
 
+    # ------------------------------------------------------------------ the host's view of the files
+    def _host_path(self, guest: str) -> str:
+        """The host path behind an absolute guest path: under the longest mount that matches, else the guest's root."""
+        assert self.root is not None
+        path = posixpath.normpath("/" + guest)
+        best, host = "", str(self.root)
+        for g, h in self.mounts.items():
+            g = posixpath.normpath("/" + g)
+            if (path == g or path.startswith(g.rstrip("/") + "/")) and len(g) > len(best):
+                best, host = g, h
+        return os.path.join(host, path[len(best) :].lstrip("/"))
+
+    def _fs_statvfs(self, pp: int, n: int, buf: int) -> int:
+        """statfs of the folder behind a guest path -> Emscripten's (musl's) struct statfs64, 88 bytes at ``buf``."""
+        try:
+            st = os.statvfs(self._host_path(self._rd(pp, n).decode("utf-8", "surrogateescape")))
+        except OSError as e:
+            return self._werr(e)
+        b = bytearray(88)
+        struct.pack_into("<I", b, 4, st.f_bsize)
+        struct.pack_into("<5Q", b, 8, st.f_blocks, st.f_bfree, st.f_bavail, st.f_files, st.f_ffree)
+        struct.pack_into("<III", b, 56, st.f_namemax, st.f_frsize, st.f_flag)
+        self._wr(buf, bytes(b))
+        return 0
+
     def _wrap(self, fn, nres: int):
         def f(caller, *args):
             self.cur.append(caller)
@@ -457,7 +483,7 @@ class Pyodide:
 
         return f
 
-    def _ops(self) -> tuple[dict, dict]:
+    def _ops(self) -> tuple[dict, dict, dict]:
         wt = self._wt
         i32 = wt.ValType.i32()
 
@@ -482,7 +508,8 @@ class Pyodide:
             "name": (self._n_name, ft(4)),
             "resolve": (self._n_resolve, ft(3)),
         }
-        return loader, net
+        fs = {"statvfs": (self._fs_statvfs, ft(3))}
+        return loader, net, fs
 
     # ------------------------------------------------------------------ start
     def _start(self) -> None:
@@ -506,7 +533,7 @@ class Pyodide:
         wasi.inherit_stdout()
         wasi.inherit_stderr()
         store.set_wasi(wasi)
-        loader_ops, net_ops = self._ops()
+        loader_ops, net_ops, fs_ops = self._ops()
         I32 = wt.ValType.i32()  # noqa: N806
 
         def define_ops(linker):
@@ -514,6 +541,8 @@ class Pyodide:
                 linker.define_func("loader", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
             for name, (fn, ty) in net_ops.items():
                 linker.define_func("net", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
+            for name, (fn, ty) in fs_ops.items():
+                linker.define_func("fs", name, ty, self._wrap(fn, len(ty.results)), access_caller=True)
 
         if self.flavor == "fused":
             main_mod = _engine.load_module(self.data / "pyodide_fused.wasm")
@@ -543,7 +572,7 @@ class Pyodide:
                 "free",
             }
             for i in adapter_mod.imports:
-                assert i.module in ("wasi_snapshot_preview1", "loader", "aux", "net") or (
+                assert i.module in ("wasi_snapshot_preview1", "loader", "aux", "net", "fs") or (
                     i.module == "env" and i.name in allowed
                 ), (i.module, i.name)
             adapter_names = [
