@@ -131,9 +131,52 @@ static Pre *preopens(void) {
     return r;
 }
 
-// A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is "/".
+// ---- the current directory (chdir): kept as an absolute path in one malloc'd block, its address in a wasm global.
+// A relative path against AT_FDCWD is joined to it into one of two buffers (rename and link resolve two at once).
+#define PATHMAX 1024
+typedef struct {
+    char cwd[PATHMAX];
+    char buf[2][PATHMAX];
+    i32 flip;
+} Cwd;
+__asm__(".globaltype cwd_state, i32\ncwd_state:\n");
+static Cwd *cwdst(void) {
+    Cwd *r;
+    __asm__ volatile("global.get cwd_state\n\tlocal.set %0" : "=r"(r));
+    if (!r) {
+        r = (Cwd *)calloc(1, sizeof(Cwd));
+        r->cwd[0] = '/';
+        __asm__ volatile("local.get %0\n\tglobal.set cwd_state" : : "r"(r));
+    }
+    return r;
+}
+
+// A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
 static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot) {
     i32 fd = dirfd;
+    if (path[0] != '/' && dirfd == AT_FDCWD) {  // relative to the cwd: make it absolute
+        Cwd *C = cwdst();
+        if (!(C->cwd[0] == '/' && C->cwd[1] == 0)) {
+            char *o = C->buf[C->flip];
+            i32 k = 0, ok = 1;
+            for (const char *q = C->cwd; *q; q++) {
+                if (k >= PATHMAX - 2) { ok = 0; break; }
+                o[k++] = *q;
+            }
+            if (ok) {
+                o[k++] = '/';
+                for (const char *q = path; *q; q++) {
+                    if (k >= PATHMAX - 1) { ok = 0; break; }
+                    o[k++] = *q;
+                }
+            }
+            if (ok) {
+                o[k] = 0;
+                C->flip ^= 1;
+                path = o;
+            }
+        }
+    }
     if (path[0] == '/' || dirfd == AT_FDCWD) {
         Pre *P = preopens();
         i32 best = -1, bl = -1;
@@ -204,10 +247,57 @@ static i32 stat_path(i32 dirfd, const char *path, void *buf, i32 follow) {
 }
 
 EXPORT("__syscall_getcwd") i32 sc_getcwd(char *buf, i32 size) {
-    if (size < 2) return -ERANGE;
-    buf[0] = '/';
-    buf[1] = 0;
-    return 2;
+    Cwd *C = cwdst();
+    i32 n = slen(C->cwd);
+    if (n + 1 > size) return -ERANGE;
+    for (i32 k = 0; k <= n; k++) buf[k] = C->cwd[k];
+    return n + 1;
+}
+
+// chdir: the absolute path, lexically normalized ('.' and '..'), must name a directory
+EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
+    Cwd *C = cwdst();
+    char full[PATHMAX], out[PATHMAX];
+    i32 k = 0;
+    if (path[0] != '/') {
+        for (const char *q = C->cwd; *q; q++) {
+            if (k >= PATHMAX - 2) return -36;  // ENAMETOOLONG
+            full[k++] = *q;
+        }
+        full[k++] = '/';
+    }
+    for (const char *q = path; *q; q++) {
+        if (k >= PATHMAX - 1) return -36;
+        full[k++] = *q;
+    }
+    full[k] = 0;
+    i32 len = 1;
+    out[0] = '/';
+    for (i32 i = 0; full[i];) {
+        while (full[i] == '/') i++;
+        i32 st = i;
+        while (full[i] && full[i] != '/') i++;
+        i32 cl = i - st;
+        if (cl == 0 || (cl == 1 && full[st] == '.')) continue;
+        if (cl == 2 && full[st] == '.' && full[st + 1] == '.') {
+            while (len > 1 && out[len - 1] != '/') len--;
+            if (len > 1) len--;  // drop the '/' before it
+            continue;
+        }
+        if (len + cl + 1 >= PATHMAX) return -36;
+        if (len > 1) out[len++] = '/';
+        for (i32 j = 0; j < cl; j++) out[len++] = full[st + j];
+    }
+    out[len] = 0;
+    u64 fs[8];
+    char dot[2];
+    const char *p;
+    i32 n, fd = resolve(AT_FDCWD, out, &p, &n, dot);
+    i32 e = w_path_filestat_get(fd, 1, p, n, fs);
+    if (e) return -e;
+    if (*((u8 *)fs + 16) != 3) return -54;  // ENOTDIR: the filetype is not "directory"
+    for (i32 j = 0; j <= len; j++) C->cwd[j] = out[j];
+    return 0;
 }
 
 EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
