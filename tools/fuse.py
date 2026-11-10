@@ -132,7 +132,7 @@ def main(pyodide_wasm, adapter_wasm, out):
         for m, n, ps, rs in imports:
             if m == "env" and n not in answered:
                 sig = " ".join(f"(param {p})" for p in ps) + " " + " ".join(f"(result {r})" for r in rs)
-                stub_lines.append(f'  (func (export "{n}") {sig} {" ".join(R.zero(r) for r in rs)})')
+                stub_lines.append(f'  (func (export "{n}") {sig} {R.stub_results(n, rs)})')
         open(f"{td}/stubs.wasm", "wb").write(wat2wasm("\n".join(stub_lines + [")"])))
         open(f"{td}/got.wasm", "wb").write(
             wat2wasm("(module\n" + "\n".join(f'  (global (export "{g}") (mut i32) (i32.const 0))' for g in got) + ")")

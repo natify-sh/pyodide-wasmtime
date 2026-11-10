@@ -58,4 +58,4 @@ def main(argv: list[str] | None = None) -> int:
     else:
         code = sys.stdin.read()
     with Pyodide(ns.flavor, site=ns.site, mounts=mounts, data=ns.data, preopen_dev=ns.dev or None) as py:
-        return 0 if py.run(code, argv0) == 0 else 1
+        return py.run(code, argv0)  # 0, 1 for an uncaught error, or the code of sys.exit()/os._exit()
