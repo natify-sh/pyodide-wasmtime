@@ -520,15 +520,12 @@ def test_a_wild_string_pointer_is_a_name_error(guest: Guest, port: int):
         port,
         "import ctypes, struct\n"
         "libc = ctypes.CDLL(None, use_errno=True)\n"
-        "if not hasattr(libc, 'getaddrinfo'): print('SKIP'); raise SystemExit\n"
         "res = ctypes.c_void_p()\n"
         "print('past the end:', libc.getaddrinfo(ctypes.c_void_p(0x7FFFFF00), None, None, ctypes.byref(res)))\n"
         "sa = bytes([10, 0, 0, 80]) + (0x7FFFFFFF).to_bytes(4, 'big') + bytes(15) + b'\\1' + bytes(4)\n"
         "host, serv = ctypes.create_string_buffer(64), ctypes.create_string_buffer(16)\n"
         "print('flow label:', libc.getnameinfo(sa, 28, host, 64, serv, 16, 3), host.value)\n",
     )
-    if out == ["SKIP"]:
-        pytest.skip("getaddrinfo is not an export of the main module in this build (dynamic): not reachable by ctypes")
     assert out == ["past the end: -11", "flow label: 0 b'::1'"]
 
 

@@ -1391,12 +1391,10 @@
  {
   "name": "emscripten_log_impl_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "The message is dropped; JS prints it with console.warn (stderr). The caller is reached only through the table and was not identified."
-  ],
-  "evidence": "stub (lie: a warning silently vanishes; low impact)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c log_impl_js: the message and a newline to stderr (console.warn). Probe: CDLL(None).emscripten_log_impl_js(b'x').",
+  "tested": "tests/test_loader.py::test_emscripten_log_goes_to_stdout_or_stderr"
  },
  {
   "name": "ffi_call_js",
@@ -1552,10 +1550,9 @@
   "gaps": [
    "The file offset is not shared: after d=dup(fd) and read(d,2), lseek(fd,0,1) gives 3 (Pyodide 5).",
    "dup(0/1/2) and dup of sockets give ENOSYS (Pyodide returns a new fd); socket.dup() fails.",
-   "An invalid fd gives ENOSYS, not EBADF.",
    "It reopens by the recorded path, so after a rename or unlink of the file the dup fails or opens a different file (code read)."
   ],
-  "evidence": "adapter.c:398-409; probe: dup shares offset \u2192 (b'34',3)/(b'34',5); dup(1) \u2192 ENOSYS/5; dup(999) \u2192 ENOSYS/EBADF",
+  "evidence": "adapter.c:398-409; probe: dup shares offset → (b'34',3)/(b'34',5); dup(1) → ENOSYS/5; dup(999) → ENOSYS/EBADF; dup(999) and mmap.mmap(99, 10) give EBADF as Pyodide (tests/test_mmap.py::test_errors_are_the_ones_pyodide_gives)",
   "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree, ::test_chdir_symlink_and_honest_enosys"
  },
  {
@@ -1568,32 +1565,24 @@
    "Inherits dup's gaps: no shared offset (dup2 onto an open fd: lseek gives 3, Pyodide 5); stdio and sockets give ENOSYS, so os.dup2(file, 1) redirection fails.",
    "The readdir cookie of newfd is not reset or moved (code read, 423-427)."
   ],
-  "evidence": "adapter.c:411-429; probe: dup2(fd,50) \u2192 EBADF/50; dup2(fd,60) \u2192 EBADF/60; dup2 onto an open fd works with a non-shared offset",
+  "evidence": "adapter.c:411-429; probe: dup2(fd,50) → EBADF/50; dup2(fd,60) → EBADF/60; dup2 onto an open fd works with a non-shared offset",
   "tested": "no"
  },
  {
   "name": "_dlopen_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "No dlerror message: ctypes.CDLL('/nonexistent.so') -> OSError 'dlopen() error' (real: 'could not load dynamic lib: /nonexistent.so ...'). The loader also prints '[loader] instantiate failed' to stderr, twice for each ctypes attempt.",
-   "RTLD_LOCAL is not honoured: the GOT of a later library resolves against every library already loaded.",
-   "At most 256 libraries (MAXLIB) and NEEDED depth 8, then failure; JS has no such limit.",
-   "The dylink and section parser has no bounds checks against the file size: a truncated or crafted file is parsed past its buffer.",
-   "The host compiles the bytes with wasmtime.Module, which also accepts WAT text: a text file is parsed as WAT ('expected `(`')."
-  ],
-  "evidence": "adapter.c:582-878 + _host.py:215-306; probe: CDLL of nonexistent/junk/text files and of cffi's .so twice and by a relative path -> loading works and the handle is shared as in real; failure messages differ as listed",
-  "tested": "tests/test_checks.py::test_numpy, ::test_openssl_through_ctypes, ::test_numpy_wheel_from_the_cdn_is_converted_at_dlopen"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c load_lib / dl_open (the section 'the loader') + _host.py _dl_instantiate / _dl_scope / _dl_error. Probes on Pyodide 315.0.0a2 and on ours, both packagings, identical dlerror text for: missing file, relative name, empty file, 13-byte file, a file with no dylink first, a directory; ctypes.CDLL('/nonexistent.so') -> \"could not load dynamic lib: /nonexistent.so\\nError: Failed to find dynamic library \\\"/nonexistent.so\\\"\". Differences that remain are the engine's own words for a module it rejects (CompileError / LinkError: wasmtime's reason, not V8's) and WAT text: a text file is refused with the glue's 'need to see wasm magic number'. Every offset of dylink.0, the imports and NEEDED is checked against the file (Rd in adapter.c); libraries and NEEDED depth are not limited (a vector; depth 512 against the native stack, then a dlerror); the GOT is first-definition-wins and a missing non-weak symbol fails the load as the glue does; env functions see the main module, RTLD_GLOBAL libraries, then the dlopen call's scope and the module's own exports; NEEDED: rpath ($ORIGIN) and LD_LIBRARY_PATH by the main module's _emscripten_find_dylib, then next to the module and /lib; side modules may import WASI. dlclose is the C library's in the glue as here (never unloads).",
+  "tested": "tests/test_loader.py (test_dlerror_is_the_glues_text, test_a_failed_load_prints_nothing_on_stderr, test_engine_errors_are_the_dlerror, test_the_got_takes_the_first_definition_and_env_functions_see_the_scope, test_a_local_library_is_not_visible_to_an_unrelated_one, test_there_is_no_limit_of_libraries_or_of_needed_depth, test_truncated_and_corrupt_files_fail_cleanly, test_a_real_wheels_library_cut_at_every_section_boundary, test_needed_libraries_are_searched_as_the_glue_does, test_a_side_module_may_import_wasi); tests/test_checks.py::test_numpy, ::test_openssl_through_ctypes"
  },
  {
   "name": "_emscripten_dlopen_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A lie: emscripten_dlopen (async) never calls onsuccess or onerror, so the caller waits forever. Python's stdlib does not use it."
-  ],
-  "evidence": "stub; its only caller is the export emscripten_dlopen (func $13667)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c emscripten_dlopen_js over the same dl_open: the load is made at once and onsuccess(handle, user_data) or onerror(handle, user_data) is called through the table, the glue's order, after the dlerror text ('Could not load dynamic lib: <name as written>' with the leading quote the glue has). The glue calls back from a promise, after the caller has returned; here the callback runs before emscripten_dlopen returns. Tested with a side module's own functions as callbacks (no ffi closure needed).",
+  "tested": "tests/test_loader.py::test_emscripten_dlopen_calls_back"
  },
  {
   "name": "emscripten_promise_create",
@@ -1622,55 +1611,42 @@
  {
   "name": "_dlsym_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Function-pointer identity is broken: dlsym of a main-module function grows a new table slot, so the address differs from the one C uses. object.tp_alloc == pythonapi.PyType_GenericAlloc is False (279 vs 9443) on ours and True (279 == 279) on real.",
-   "Dynamic flavor only: names answered by the adapter (exit, getaddrinfo, getnameinfo, _emscripten_system, __assert_fail, _gmtime_js, emscripten_get_heap_max) are not found. Fused and real find them.",
-   "No dlerror text: 'function 'x' not found' instead of 'Tried to lookup unknown symbol \"x\" in dynamic lib: ...'.",
-   "A miss on a known handle returns 0 without looking further (correct for a local handle)."
-  ],
-  "evidence": "adapter.c:880-907 + _host.py:284-299; probes: tp_alloc identity; CDLL(None).<10 names> on fused, dynamic and real; missing-symbol messages",
-  "tested": "tests/test_checks.py::test_openssl_through_ctypes, ::test_numpy"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c dlsym_js + _host.py _dl_sym / _table_slot. Probes: object.tp_alloc == ctypes.pythonapi.PyType_GenericAlloc is 279 == 279 on ours too (was 9039 vs 279); CDLL(None).exit / getaddrinfo / getnameinfo / __assert_fail / emscripten_get_heap_max / _emscripten_system / _gmtime_js found on fused and dynamic, the stubs of the JavaScript bridge (JsArray_count_js) are not, as the glue's `stub` mark; the miss text is 'Tried to lookup unknown symbol \"x\" in dynamic lib: __main__' (or the library's path). dlsym(handle) sees that library's own exports; dlsym(NULL) the main module and the RTLD_GLOBAL libraries.",
+  "tested": "tests/test_loader.py (test_dlsym_and_function_pointers, test_a_main_module_function_has_one_address, test_the_main_modules_symbols_are_the_same_on_both_builds)"
  },
  {
   "name": "_emscripten_log_formatted",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "emscripten_log() output is dropped; JS writes it to stdout or stderr according to the flags."
-  ],
-  "evidence": "stub (lie, low impact); its caller is the export emscripten_log (func $13682)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c log_formatted: error and warn (flags & 6) to stderr, everything else to stdout, one line each, as console.error/warn and console.log/info/debug/out/err. n/a per flag: EM_LOG_C_STACK, EM_LOG_JS_STACK (and with them DEMANGLE, NO_PATHS, FUNC_PARAMS) ask for a JavaScript stack (new Error().stack), which does not exist here: the message is printed without it (trailing white space stripped, as the glue does before it adds a stack). Probe: emscripten_log() with flags 0, 1, 1|2, 1|4, 1|512, 1|256, 2, 4, 512, 8.",
+  "tested": "tests/test_loader.py::test_emscripten_log_goes_to_stdout_or_stderr"
  },
  {
   "name": "_munmap_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A lie: no write-back for MAP_SHARED writable mappings. Because _mmap_js leaves info->allocated uninitialized, __syscall_munmap may free() a garbage pointer."
-  ],
-  "evidence": "stub; __syscall_munmap (func $13691) calls it and then frees info->addr when info->allocated is set",
-  "tested": "suite test_mmap passes but does not catch the defect"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c munmap_js: a shared writable mapping is written back (pwrite, up to the file's present end) and its private descriptor closed; private and read-only mappings return 0. Probe: write without flush then close, file has the bytes.",
+  "tested": "tests/test_mmap.py::test_writes_reach_the_file_on_flush_and_close, ::test_a_mapping_outlives_the_descriptor_it_was_made_from"
  },
  {
   "name": "_msync_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A lie: mmap.flush() reports success and writes nothing."
-  ],
-  "evidence": "stub",
-  "tested": "suite test_mmap (passes, does not catch it)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c msync_js: write-back of a shared writable mapping (pwrite); MAP_PRIVATE and read-only mappings return 0 after the descriptor check. Probe: write, flush(), the file on disk has the change (Pyodide prints the same).",
+  "tested": "tests/test_mmap.py::test_writes_reach_the_file_on_flush_and_close, ::test_private_mappings_never_write_back"
  },
  {
   "name": "_mmap_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A severe lie: it returns 0 without writing *addr or *allocated, so file-backed mmap returns an uninitialized pointer taken from malloc. Reads give garbage, and writes corrupt the heap and then trap. Anonymous mmap does not call this import and works."
-  ],
-  "evidence": "stub; __syscall_mmap2 (func $13694); probe: mmap of a 1000-byte file -> ours m[:10]=b'x-\"\\x011\\x00..' then a trap on write (rc 134), read-only -> garbage; real b'HELLO-MMAP', write-back b'howdy-MMAP'",
-  "tested": "suite test_mmap (passes on fused, does not catch it)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c mmap_js: the glue's NODEFS mmap. EBADF, EACCES (shared + writable needs O_RDWR; O_WRONLY), ENODEV (not a regular file), EINVAL (length 0, offset < 0), ENOMEM; a block of whole 64 KiB pages from the main module's memalign, zeroed, filled by pread in 8 MiB pieces (wasmtime refuses a big read); allocated = 1. Probe (mm.py) on Pyodide and ours prints the same lines for read, slice, find, write + flush + close, MAP_PRIVATE, ACCESS_COPY, read-only, empty file, directory, unaligned offset, write-only fd, anonymous, dup'd fd, offset past 4 GiB. A shared writable mapping gets a descriptor of its own (a dup) so that it outlives close() of the first (the glue returns EBADF there; POSIX does not).",
+  "tested": "tests/test_mmap.py (all but test_cpythons_test_mmap), test_cpythons_test_mmap (CPython's test_mmap with its Emscripten skip removed: only mremap/resize and msync(addr inside a mapping), which are the libc's, still fail)"
  },
  {
   "name": "emscripten_date_now",
@@ -1781,7 +1757,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:948-951; probe: ftruncate -1 EINVAL, read-only EINVAL, 3 \u2192 3, 5 GiB \u2192 5368709120: identical in both",
+  "evidence": "adapter.c:948-951; probe: ftruncate -1 EINVAL, read-only EINVAL, 3 → 3, 5 GiB → 5368709120: identical in both",
   "tested": "no"
  },
  {
@@ -1789,7 +1765,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:305-311; probe: getcwd '/' both; getcwd(buf,1) \u2192 ERANGE both (size==0 gives ERANGE not EINVAL, but musl never passes 0); a symlinked cwd is chdir's gap",
+  "evidence": "adapter.c:305-311; probe: getcwd '/' both; getcwd(buf,1) → ERANGE both (size==0 gives ERANGE not EINVAL, but musl never passes 0); a symlinked cwd is chdir's gap",
   "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
@@ -1805,7 +1781,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1001; probe ctypes getegid \u2192 0 both",
+  "evidence": "adapter.c:1001; probe ctypes getegid → 0 both",
   "tested": "no"
  },
  {
@@ -1813,7 +1789,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:999; probe ctypes geteuid \u2192 0 both",
+  "evidence": "adapter.c:999; probe ctypes geteuid → 0 both",
   "tested": "no"
  },
  {
@@ -1821,7 +1797,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1000; probe ctypes getgid \u2192 0 both",
+  "evidence": "adapter.c:1000; probe ctypes getgid → 0 both",
   "tested": "no"
  },
  {
@@ -1900,7 +1876,7 @@
    "|t| between 8.64e12 and about 6.7e16 returns a date where JS returns an error (OSError).",
    "t=-2^63 overflows in fill_tm (-t)."
   ],
-  "evidence": "adapter.c:1356-1382; probe: 14 edge values: identical within \u00b18.64e12 except year 1-99 yday (JS bug: -693959); outside that range ours computes and real raises OSError 28",
+  "evidence": "adapter.c:1356-1382; probe: 14 edge values: identical within ±8.64e12 except year 1-99 yday (JS bug: -693959); outside that range ours computes and real raises OSError 28",
   "tested": "suite test_time / test_datetime (test_datetime passes)"
  },
  {
@@ -1911,7 +1887,7 @@
    "No range error, and the year is truncated to i32: time.gmtime(1e17) -> year -1126091476, gmtime(-2**63) -> year -219246529 (signed overflow in fill_tm). Real raises OSError EINVAL beyond 8.64e12.",
    "Years 1-99 have the correct yday in ours; JS gives yday -693959 (a JS bug)."
   ],
-  "evidence": "adapter.c:1356-1376; probe: gmtime at 0, -1, -86401, 1e9, \u00b12^31, 9999/10000, 8.64e12, 1e13, 1e15, 1e17, \u00b12^63, year 1/0 -> equal within range, differences as listed",
+  "evidence": "adapter.c:1356-1376; probe: gmtime at 0, -1, -86401, 1e9, ±2^31, 9999/10000, 8.64e12, 1e13, 1e15, 1e17, ±2^63, year 1/0 -> equal within range, differences as listed",
   "tested": "tests/test_checks.py::test_the_guests_own_tls (network); suite test_time"
  },
  {
@@ -1929,7 +1905,7 @@
   "gaps": [
    "os.pipe() gives ENOSYS; Pyodide's JS has PIPEFS (returned (9, 10))."
   ],
-  "evidence": "not exported; probe: os.pipe() \u2192 ENOSYS / (9,10)",
+  "evidence": "not exported; probe: os.pipe() → ENOSYS / (9,10)",
   "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
