@@ -5,12 +5,10 @@ same scripts (tests/checks/ffi_*.py, cffi_callbacks.py)."""
 from __future__ import annotations
 
 import struct
-import zipfile
-from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import Guest, check_file, missing, work_dir
+from conftest import Guest, check_file, missing, testenv
 
 from pyodide_wasmtime import Pyodide
 
@@ -81,15 +79,12 @@ print(*[tr(idx(f), a, b, 0) for f, a, b in calls])
     assert lines(r.stdout) == ["4 5 0 12"]
 
 
-def test_cffi_callbacks(guest: Guest, tmp_path: Path) -> None:
+def test_cffi_callbacks(guest: Guest) -> None:
     """cffi's own wheel, loaded by dlopen: callback() makes a closure (it was SystemError 'bad user_data')."""
-    dist = work_dir() / "dl" / "dist"
-    wheels = [dist / "cffi-2.0.0-cp315-cp315-pyemscripten_2026_5_wasm32.whl", dist / "pycparser-3.0-py3-none-any.whl"]
-    if not all(w.exists() for w in wheels):
-        missing(f"the cffi and pycparser wheels are not in {dist}")
-    for w in wheels:
-        zipfile.ZipFile(w).extractall(tmp_path)
-    r = guest.run(check_file("cffi_callbacks.py"), None, "--site", str(tmp_path))
+    site = testenv() / "site_cffi"
+    if not (site / "cffi").is_dir() or not (site / "pycparser").is_dir():
+        missing(f"the unpacked cffi and pycparser wheels are not in {site}")
+    r = guest.run(check_file("cffi_callbacks.py"), None, "--site", str(site))
     assert r.returncode == 0, r.stderr
     assert lines(r.stdout) == lines(check_file("cffi_callbacks.expected"))
 

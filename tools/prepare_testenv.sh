@@ -4,6 +4,7 @@
 #   site         numpy (its two legacy-exception modules converted)       numpy_check
 #   site_net     micropip                                                  net_check, numpy_wheel (the host's fetch)
 #   site_ssl     openssl/ (libopenssl 1.1.1w of the lock)                  openssl_check
+#   site_cffi    cffi and pycparser (their wheels unpacked)                 cffi_callbacks
 #   site_tls     real _ssl (built here with wasi-sdk), libssl, libcrypto, ssl.py, micropip    tls_*  (the guest's TLS)
 #   suite, suite_ext   the `test` wheel: CPython's Lib/test (mounted) and its side modules (a site folder), for Pyodide's official suite
 #   python_tests.yaml   the suite's list of CPython tests (Pyodide 315.0.0a2: skips, xfails, timeouts)
@@ -15,7 +16,7 @@ W=$(cd "${1:-work}" && pwd)
 sh "$H/tools/fetch.sh" "$W" >/dev/null
 D=$W/dl/dist
 T=$W/testenv
-mkdir -p "$T/site" "$T/site_net" "$T/site_ssl/openssl" "$T/site_tls" "$W/ref"
+mkdir -p "$T/site" "$T/site_net" "$T/site_ssl/openssl" "$T/site_tls" "$T/site_cffi" "$W/ref"
 OPT="node $W/dl/binaryen/package/bin/wasm-opt"
 EXNREF="--all-features --disable-compact-imports --translate-to-exnref"
 unz() { python3 -m zipfile -e "$1" "$2"; }
@@ -23,6 +24,7 @@ unz() { python3 -m zipfile -e "$1" "$2"; }
 [ -f "$T/site/.done" ] || { unz "$D"/numpy-2.4.3-*.whl "$T/site"
   for f in "$T"/site/numpy/_core/_multiarray_umath*.so "$T"/site/numpy/fft/_pocketfft_umath*.so; do $OPT "$f" $EXNREF -o "$f"; done
   touch "$T/site/.done"; }
+[ -d "$T/site_cffi/cffi" ] || { unz "$D"/cffi-2.0.0-*.whl "$T/site_cffi"; unz "$D"/pycparser-3.0-*.whl "$T/site_cffi"; }
 [ -d "$T/site_net/micropip" ] || unz "$D"/micropip-0.11.1-py3-none-any.whl "$T/site_net"
 [ -d "$T/site_ssl/openssl/libssl.so" ] || [ -f "$T/site_ssl/openssl/libssl.so" ] || unz "$D"/libopenssl-1.1.1w.zip "$T/site_ssl/openssl"
 # the `test` wheel: the package is mounted into the guest as it is (1 800 files: copying it per run would cost), the
