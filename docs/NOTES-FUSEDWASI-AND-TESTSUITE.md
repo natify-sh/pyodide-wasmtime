@@ -98,3 +98,17 @@ The question was whether to aim at hosts that run WASI 0.2 components (Fastly Co
 **What is open (an idea, not done).** `pyodide_fused.wasm` is already a wrapper that shows the `env` imports differently outward: it has its own memory and table and imports only WASI, `loader` and `net`. To become a component it would need (1) `net` replaced by `wasi:sockets`/`wasi:http` (section 1 above), (2) `loader` removed by **baking the chosen wheels into the module at build time** (the technique of `tools/fuse.py`: assign `__memory_base`/`__table_base` and table slots, fill the GOT, run relocations and constructors at start, `_dlopen_js` answered from a built-in registry), and (3) a `wit-component` wrapper with a small `wasi:cli/run` or `wasi:http` entry. Unknown until tried: whether `wit-component` accepts a core module with GC and function references (the trampoline uses `ref.test`/`call_ref`) and `exnref` exceptions; whether the table has room; the size against a host's limits. A quick check that costs minutes: `wasm-tools component new` on `pyodide_fused.wasm` with `loader`/`net` stubbed, to see what it rejects. The result would still be a build-time set of wheels, with no `dlopen` in the run time on those hosts.
 
 For a CPython that components can run (`wasm32-wasip2`, wheels built for WASI), see the tip in the numpy PoC notes of wasmhost (`examples/pyodide_wasmtime/NUMPY.md`): a different project with its own wheels, not this one.
+
+### Result of the quick check (2026-11-10, branch `claude/wasip2-component`, `tools/wasip2/build.sh`)
+
+**It works for the part that does not need `dlopen`.** `pyodide_fused.wasm` with `loader.*` and `net.*` stubbed out (they fail: -1 and ENOSYS), a `_start` that hands WASI arguments to `Py_BytesMain`, and a `cabi_realloc`, merged by Binaryen's `wasm-merge`
+(`--rename-export-conflicts`: the stubs' names `close`, `socket`... collide with libc exports of Pyodide) and passed to `wasm-tools component new` with Wasmtime's preview1 command adapter, gives **a valid 10 MB component** (`wasm-tools validate --features all`):
+
+* its world imports only `wasi:cli` (environment, exit, stdin/out/err, terminals), `wasi:io`, `wasi:clocks`, `wasi:filesystem` (types, preopens), `wasi:random` (all 0.2.12) and exports `wasi:cli/run`;
+* **stock `wasmtime run` 50.0.1 runs it**: `python 3.15.0rc1 ... emscripten`, `json`, `hashlib`, `decimal`, files through a preopen, `2**100`; about 0.1 s for `print(1 + 1)` (0.05 s from a precompiled `.cwasm`);
+* so `wit-component` accepts a core module with GC, function references and `exnref` exceptions (the trampoline's `ref.test`/`call_ref`), which was the main unknown.
+
+**Not working, as expected or not yet:** `import socket` -> `OSError 52` (the stubs; `wasi:sockets` is the next step); `dlopen` of a wheel (no `loader`: wheels would have to be baked in at build time, see above); `sys.exit(3)` gives exit status 1, because Pyodide's `exit()` ends in `unreachable` (the host-run build catches it in `Pyodide.run`; here it needs a hook).
+**Not tried:** Fastly Compute, Spin and wasmCloud themselves (they pin their own WASI 0.2.x versions; this component imports 0.2.12), the size limits of hosts, numpy baked in.
+
+This does not change the decision above: the project's reason to exist is loading wheels at run time through a host we control.
