@@ -134,8 +134,9 @@ def test_key_changes_with_stdlib_stamp_and_dev(flavor, cache, monkeypatch):
         "import os\nos.mkdir('/w')\nos.chdir('/w')\n",
         "import mmap\nopen('/mm', 'wb').write(b'x' * 10)\nf = open('/mm', 'r+b')\n"
         "m = mmap.mmap(f.fileno(), 10)\nf.close()\n",
+        "open('/tmp/pre.txt', 'w').write('x')\n",
     ],
-    ids=["ctypes-slot", "open-file", "chdir", "mmap-kept"],
+    ids=["ctypes-slot", "open-file", "chdir", "mmap-kept", "file-in-tmp"],
 )
 def test_preload_with_unsnapshotable_state_is_not_saved(flavor, cache, pre):
     for _ in range(2):  # the program works on both starts

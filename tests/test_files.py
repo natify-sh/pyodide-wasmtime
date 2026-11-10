@@ -724,3 +724,18 @@ assert oct(os.stat('/').st_mode) == '0o40777' and oct(os.stat('/..').st_mode) ==
 assert oct(os.stat(B).st_mode) == '0o40755'
 """,
     )
+
+
+def test_tmp_is_in_the_root_with_mode_777_and_tempfile_works(guest: Guest):
+    # Pyodide: stat('/tmp') is 0o40777, tempfile.gettempdir() is '/tmp'
+    p = guest.run(
+        "import os, tempfile\n"
+        "print(oct(os.stat('/tmp').st_mode), tempfile.gettempdir())\n"
+        "with tempfile.NamedTemporaryFile() as f:\n"
+        "    f.write(b'x'); f.flush()\n"
+        "    n = os.path.basename(f.name)\n"
+        "    print(os.path.dirname(f.name), os.path.getsize(f.name), os.listdir('/tmp') == [n])\n"
+        "print(os.listdir('/tmp'))\n"
+    )
+    assert p.returncode == 0, p.stderr[-3000:]
+    assert p.stdout.splitlines() == ["0o40777 /tmp", "/tmp 1 True", "[]"]

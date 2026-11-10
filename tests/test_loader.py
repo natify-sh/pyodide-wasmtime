@@ -390,28 +390,51 @@ print("sections", len(cuts), "failed", fails > len(cuts) // 2, "survived", True)
 
 
 def test_emscripten_dlopen_calls_back(guest: Guest):
-    files = {"/m/cb.so": sidemod.lib(1, fn="cb", callbacks=True), "/m/a.so": sidemod.lib(1, fn="val")}
+    # The glue calls back from a promise, after the caller returned; here from a pending call of the interpreter, at its
+    # next safe point after emscripten_dlopen returned (a loop that polls sees it). A bad file that exists goes to
+    # onerror with the glue's text. A missing top-level file is a DELIBERATE difference (owner): Pyodide is fatal there
+    # ("Failed to find dynamic library"), here it is onerror as well.
+    files = {
+        "/m/cb.so": sidemod.lib(1, fn="cb", callbacks=True),
+        "/m/a.so": sidemod.lib(1, fn="val"),
+        "/m/junk.so": b"junk-not-wasm",
+    }
     out = ok(
         guest,
         files,
         r"""
+import itertools, operator, time
 L = ctypes.CDLL("/m/cb.so")
 m = ctypes.CDLL(None)
 m.emscripten_dlopen.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
 m.emscripten_dlopen.restype = None
-m.emscripten_dlopen(b"/m/a.so", 2, 1234, P(L.on_ok), P(L.on_err))
-print("success", L.peek(0), L.peek(1) != 0, L.peek(2), L.peek(6))
 m.dlerror.restype = ctypes.c_char_p
+def wait(slot, n):
+    t = time.time()
+    while L.peek(slot) < n and time.time() - t < 10: time.sleep(0.001)
+call = (m.emscripten_dlopen, b"/m/a.so", 2, 1234, P(L.on_ok), P(L.on_err))
+# two C calls with no bytecode between them (no safe point): not called back inside, nor right after, emscripten_dlopen
+print("atomic", list(itertools.starmap(operator.call, [call, (L.peek, 2)]))[1])
+wait(2, 1)
+print("success", L.peek(0), L.peek(1) != 0, L.peek(2), L.peek(6))
+m.emscripten_dlopen(b"/m/junk.so", 2, 7, P(L.on_ok), P(L.on_err))
+wait(6, 1)
+print("junk", L.peek(4), L.peek(6), L.peek(2))
+print(m.dlerror().decode().split("\n")[0])
 m.emscripten_dlopen(b"/m/none.so", 2, 99, P(L.on_ok), P(L.on_err))
-err = m.dlerror()                                # before another dlsym clears it
+wait(6, 2)
+err = m.dlerror()
 print("failure", L.peek(4), L.peek(6), L.peek(2))
 print(err.decode().replace("\n", "|"))
 """,
     )
     # the C library calls onsuccess(user_data, handle) and onerror(user_data); the glue calls (handle, user_data)
-    assert out[0] == "success 1234 True 1 0"
-    assert out[1] == "failure 99 1 1"
-    assert out[2] == '\'Could not load dynamic lib: /m/none.so|Error: Failed to find dynamic library "/m/none.so"'
+    assert out[0] == "atomic 0"
+    assert out[1] == "success 1234 True 1 0"
+    assert out[2] == "junk 7 1 1"
+    assert out[3] == "'Could not load dynamic lib: /m/junk.so"
+    assert out[4] == "failure 99 2 1"
+    assert out[5] == '\'Could not load dynamic lib: /m/none.so|Error: Failed to find dynamic library "/m/none.so"'
 
 
 def test_emscripten_log_goes_to_stdout_or_stderr(guest: Guest):
