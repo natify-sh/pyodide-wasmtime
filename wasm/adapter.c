@@ -1126,15 +1126,17 @@ typedef struct {  // a growable vector of pointers (the allocator we are given h
     void **v;
 } Vec;
 
-static void vec_push(Vec *a, void *x) {
+static i32 vec_push(Vec *a, void *x) {  // 0 when there is no memory for it
     if (a->n == a->cap) {
         i32 cap = a->cap ? a->cap * 2 : 16;
         void **nv = (void **)malloc((u32)cap * sizeof(void *));
+        if (!nv) return 0;
         for (i32 i = 0; i < a->n; i++) nv[i] = a->v[i];
         free(a->v);
         a->v = nv, a->cap = cap;
     }
     a->v[a->n++] = x;
+    return 1;
 }
 
 typedef struct {
@@ -1142,6 +1144,7 @@ typedef struct {
     u32 base, memsize, tbase, tsize;
     char *name;  // the normalized path
     i32 global, ready;
+    u32 gseq;  // the order in which libraries became RTLD_GLOBAL (the glue's mergeLibSymbols): the first one wins
 } Lib;
 typedef struct {
     i32 handle;
@@ -1151,6 +1154,7 @@ typedef struct {
     Vec libs;  // Lib *, in load order
     Vec hnds;  // Hnd *: dlopen handle -> library (the latest dlopen of a handle wins)
     u32 scopes;  // dlopen calls so far: the number of a call's scope
+    u32 gcount;  // libraries made global so far
     u32 code;  // why the load in progress failed (an error code of loader.error) and its argument
     char *arg;
     i32 argn;
@@ -1224,7 +1228,7 @@ static i32 is8(const u8 *p, i32 n, u64 v) {  // a name of 8 bytes equal to the l
 #define N_GOTFUNC 0x636e75662e544f47ull   // "GOT.func"
 static i32 is_gotmem(const u8 *p, i32 n) { return n == 7 && p[0] == 'G' && p[1] == 'O' && p[2] == 'T' && p[3] == '.' && p[4] == 'm' && p[5] == 'e' && p[6] == 'm'; }
 
-// read a whole file into malloc'd memory -> 0, or 1 (no such file) or 8 (cannot be read: a directory, no access)
+// read a whole file into malloc'd memory -> 0, or 1 (no such file), 8 (cannot be read: a directory, no access) or 9 (no memory)
 static i32 read_file(const char *path, u8 **buf, i32 *size) {
     char dot[2];
     const char *p;
@@ -1238,6 +1242,10 @@ static i32 read_file(const char *path, u8 **buf, i32 *size) {
     }
     i32 len = (i32)fs[4];
     u8 *b = (u8 *)malloc((u32)len + 1);
+    if (!b) {
+        w_fd_close(h);
+        return 9;  // out of memory
+    }
     i32 got = 0;
     while (got < len) {
         u32 iov[2];
@@ -1252,10 +1260,11 @@ static i32 read_file(const char *path, u8 **buf, i32 *size) {
     return 0;
 }
 
-// PATH.normalize of the glue: the key of a library ("a//b/../c.so" -> "a/c.so"); malloc'd
+// PATH.normalize of the glue: the key of a library ("a//b/../c.so" -> "a/c.so"); malloc'd, 0 without memory
 static char *norm_path(const char *s) {
     i32 n = slen(s), abs = n > 0 && s[0] == '/', trail = n > 0 && s[n - 1] == '/', len = 0, i = 0;
     char *o = (char *)malloc((u32)n + 4);
+    if (!o) return 0;
     while (i < n) {
         while (i < n && s[i] == '/') i++;
         i32 st = i;
@@ -1275,6 +1284,10 @@ static char *norm_path(const char *s) {
         for (i32 j = 0; j < l; j++) o[len++] = s[st + j];
     }
     char *r = (char *)malloc((u32)len + 4);
+    if (!r) {
+        free(o);
+        return 0;
+    }
     i32 k = 0;
     if (abs) r[k++] = '/';
     for (i32 j = 0; j < len; j++) r[k++] = o[j];
@@ -1304,8 +1317,10 @@ static Lib *fail(Libs *L, u32 code, const u8 *arg, i32 n) {
     L->code = code, L->arg = 0, L->argn = 0;
     if (arg) {
         L->arg = (char *)malloc((u32)n + 1);
-        for (i32 i = 0; i < n; i++) L->arg[i] = (char)arg[i];
-        L->arg[n] = 0, L->argn = n;
+        if (L->arg) {
+            for (i32 i = 0; i < n; i++) L->arg[i] = (char)arg[i];
+            L->arg[n] = 0, L->argn = n;
+        }
     }
     return 0;
 }
@@ -1396,11 +1411,12 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
 // ($ORIGIN is its folder), LD_LIBRARY_PATH
 char *_emscripten_find_dylib(char *buf, const char *rpath, const char *name, u32 size);
 
-// the module's runtime paths as one "a:b" string, $ORIGIN replaced by the module's folder; malloc'd
+// the module's runtime paths as one "a:b" string, $ORIGIN replaced by the module's folder; malloc'd, 0 without memory
 static char *runtime_paths(const u8 *b, const DyMeta *m, const char *path) {
     i32 dl = 0;
     for (i32 i = 0; path[i]; i++) if (path[i] == '/') dl = i;
     char *out = (char *)malloc(1);
+    if (!out) return 0;
     out[0] = 0;
     if (!m->rpath) return out;
     Rd r = {b, m->rpath, m->rpath_end, 0};
@@ -1412,6 +1428,10 @@ static char *runtime_paths(const u8 *b, const DyMeta *m, const char *path) {
         if (r.bad) break;
         i32 origin = n >= 7 && p[0] == '$' && p[1] == 'O' && p[2] == 'R' && p[3] == 'I' && p[4] == 'G' && p[5] == 'I' && p[6] == 'N';
         char *o = (char *)malloc((u32)len + n + (u32)dl + 3);
+        if (!o) {
+            free(out);
+            return 0;
+        }
         for (i32 i = 0; i < len; i++) o[i] = out[i];
         free(out);
         out = o;
@@ -1427,50 +1447,57 @@ static char *runtime_paths(const u8 *b, const DyMeta *m, const char *path) {
     return out;
 }
 
-// a NEEDED library: already loaded (by file name), or next to the module that needs it, or in /lib
+// A NEEDED library, as the glue finds it: the main module's search (runtime paths with $ORIGIN, LD_LIBRARY_PATH), else
+// the name as written; the library is then the one with that full (normalized) name. Beyond the glue: next to the
+// module that needs it, then /lib, then a loaded library of that file name.
 static Lib *load_needed(Libs *L, const char *from, const char *rpath, const u8 *name, i32 n, i32 global, u32 scope,
                         i32 depth) {
     char *nm = (char *)malloc((u32)n + 1);
-    for (i32 i = 0; i < n; i++) nm[i] = (char)name[i];
-    nm[n] = 0;
-    Lib *x = 0;
-    for (i32 k = 0; k < L->libs.n && !x; k++)
-        if (base_eq(((Lib *)L->libs.v[k])->name, nm)) x = (Lib *)L->libs.v[k];
-    if (x) {
-        free(nm);
-        return load_lib(L, x->name, global, scope, depth + 1, 0);  // joins the scope, or the global namespace
-    }
-    if (nm[0] != '/') {  // the glue's search first; what it finds is the library
-        char *buf = (char *)malloc(512);
-        char *found = _emscripten_find_dylib(buf, rpath, nm, 512);
-        if (found) {
-            char *q = norm_path(found);
-            x = load_lib(L, q, global, scope, depth + 1, 0);
-            free(q);
-        }
-        free(buf);
-        if (x || (found && L->code != 1)) {
-            free(nm);
-            return x;
-        }
-    }
-    // and beyond it, where wheels put their libraries: next to the module that needs it, then /lib
+    char *buf = (char *)malloc(512);
     i32 dl = 0;
     for (i32 i = 0; from[i]; i++) if (from[i] == '/') dl = i + 1;
-    if (nm[0] == '/') dl = 0;  // an absolute name is used as it is
+    if (nm && nm[0] == '/') dl = 0;
     char *p = (char *)malloc((u32)(dl + n + 8));
-    for (i32 i = 0; i < dl; i++) p[i] = from[i];
-    for (i32 i = 0; i <= n; i++) p[dl + i] = nm[i];
-    char *q = norm_path(p);
+    Lib *x = 0;
+    if (!nm || !buf || !p) {
+        free(nm), free(buf), free(p);
+        return fail(L, 9, 0, 0);
+    }
+    for (i32 i = 0; i < n; i++) nm[i] = (char)name[i];
+    nm[n] = 0;
+    if (nm[0] == '/') dl = 0;  // an absolute name is used as it is
+    char *found = nm[0] != '/' ? _emscripten_find_dylib(buf, rpath, nm, 512) : 0;
+    char *q = norm_path(found ? found : nm);  // the glue's candidate
+    if (!q) {
+        free(nm), free(buf), free(p);
+        return fail(L, 9, 0, 0);
+    }
     x = load_lib(L, q, global, scope, depth + 1, 0);
     free(q);
-    if (!x && L->code == 1) {  // /lib/<name>
+    if (!x && (found || L->code != 1)) goto done;  // a library that was found but is bad, or no memory...
+    if (!x) {                                      // next to the module that needs it, then /lib
+        for (i32 i = 0; i < dl; i++) p[i] = from[i];
+        for (i32 i = 0; i <= n; i++) p[dl + i] = nm[i];
+        q = norm_path(p);
+        if (!q) {
+            fail(L, 9, 0, 0);
+            goto done;
+        }
+        x = load_lib(L, q, global, scope, depth + 1, 0);
+        free(q);
+    }
+    if (!x && L->code == 1) {
         p[0] = '/', p[1] = 'l', p[2] = 'i', p[3] = 'b', p[4] = '/';
         for (i32 i = 0; i <= n; i++) p[5 + i] = nm[i];
         x = load_lib(L, p, global, scope, depth + 1, 0);
-        if (!x && L->code == 1) fail(L, 1, name, n);  // the glue names the NEEDED library, as it was written
     }
-    free(p), free(nm);
+    if (!x && L->code == 1) {  // a library of that file name that is loaded already
+        for (i32 k = 0; k < L->libs.n && !x; k++)
+            if (base_eq(((Lib *)L->libs.v[k])->name, nm)) x = load_lib(L, ((Lib *)L->libs.v[k])->name, global, scope, depth + 1, 0);
+    }
+    if (!x && L->code == 1) fail(L, 1, name, n);  // the glue names the NEEDED library, as it was written
+done:
+    free(p), free(nm), free(buf);
     return x;
 }
 
@@ -1498,7 +1525,7 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
             if (scope && x->ready) dl_scope(x->id, scope);
         } else if (!x->global) {
             x->global = 1;
-            if (x->ready) dl_scope(x->id, 0);
+            if (x->ready) x->gseq = ++L->gcount, dl_scope(x->id, 0);
         }
         return x;
     }
@@ -1521,10 +1548,15 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
     }
 
     Lib *x = (Lib *)calloc(1, sizeof(Lib));  // registered before its NEEDED libraries load: a cycle finds it
+    if (x) x->name = (char *)malloc((u32)plen + 1);
+    if (!x || !x->name || !vec_push(&L->libs, x)) {
+        if (x) free(x->name);
+        free(x);
+        if (own) free(b);
+        return fail(L, 9, 0, 0);
+    }
     x->id = -1, x->global = global;
-    x->name = (char *)malloc((u32)plen + 1);
     for (i32 k = 0; k <= plen; k++) x->name[k] = path[k];
-    vec_push(&L->libs, x);
 
     // the libraries it needs come first (their symbols resolve its imports)
     GotImp *got = 0;
@@ -1533,6 +1565,10 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
     char *rpath = 0;
     if (m.needed) {
         rpath = runtime_paths(b, &m, path);
+        if (!rpath) {
+            fail(L, 9, 0, 0);
+            goto failed;
+        }
         Rd r = {b, m.needed, m.needed_end, 0};
         u32 cnt = rd_leb(&r);
         for (u32 k = 0; k < cnt && !r.bad; k++) {
@@ -1569,6 +1605,10 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
                 goto failed;
             }
             got = (GotImp *)malloc(cnt * sizeof(GotImp) + 1);
+            if (!got) {
+                fail(L, 9, 0, 0);
+                goto failed;
+            }
             for (u32 k = 0; k < cnt && !imp.bad; k++) {
                 u32 ml, fl;
                 const u8 *mod = rd_name(&imp, &ml);
@@ -1663,7 +1703,7 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
 
     x->base = base, x->memsize = m.memsize, x->tbase = tbase, x->tsize = m.tsize;
     x->ready = 1;
-    if (x->global) dl_scope(id, 0);
+    if (x->global) x->gseq = ++L->gcount, dl_scope(id, 0);
     else if (scope) dl_scope(id, scope);
     if (own) free(b);
     free(got), free(rpath);
@@ -1678,7 +1718,12 @@ failed:
 
 static i32 dl_open(u8 *handle, i32 async) {
     Libs *L = libs();
+    if (!L) return 0;
     char *name = norm_path((const char *)(handle + 36));
+    if (!name) {
+        dl_error(9 | (async ? 256 : 0), (const char *)(handle + 36), slen((const char *)(handle + 36)), 0, 0);
+        return 0;
+    }
     i32 global = (((const i32 *)(handle + 4))[0] & 256) != 0;
     u32 scope = global ? 0 : ++L->scopes;
     free(L->arg);
@@ -1696,8 +1741,12 @@ static i32 dl_open(u8 *handle, i32 async) {
         if (((Hnd *)L->hnds.v[k])->handle == (i32)handle) h = (Hnd *)L->hnds.v[k];
     if (!h) {
         h = (Hnd *)malloc(sizeof(Hnd));
-        h->handle = (i32)handle;
-        vec_push(&L->hnds, h);
+        if (h) h->handle = (i32)handle;
+        if (!h || !vec_push(&L->hnds, h)) {
+            free(h);
+            dl_error(9 | (async ? 256 : 0), (const char *)(handle + 36), slen((const char *)(handle + 36)), 0, 0);
+            return 0;
+        }
     }
     h->lib = x;
     handle[8] = 1;
@@ -1717,6 +1766,7 @@ EXPORT("_emscripten_dlopen_js") void emscripten_dlopen_js(u8 *handle, u32 onsucc
 
 EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
     Libs *L = libs();
+    if (!L) return 0;
     Lib *lib = 0;
     for (i32 k = L->hnds.n - 1; k >= 0 && !lib; k--)
         if (((Hnd *)L->hnds.v[k])->handle == handle) lib = ((Hnd *)L->hnds.v[k])->lib;
@@ -1726,10 +1776,11 @@ EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
         v = sym_of(lib->id, lib->base, (const u8 *)sym, n, out);
     } else {  // not a library loaded by dlopen: the main module (dlopen(NULL), RTLD_DEFAULT), then the RTLD_GLOBAL libraries
         v = sym_of(0, 0, (const u8 *)sym, n, out);
-        for (i32 k = 0; out[0] == 0 && k < L->libs.n; k++) {
-            Lib *o = (Lib *)L->libs.v[k];
-            if (o->ready && o->global) v = sym_of(o->id, o->base, (const u8 *)sym, n, out);
-        }
+        for (u32 seq = 1; out[0] == 0 && seq <= L->gcount; seq++)  // in the order they became global
+            for (i32 k = 0; out[0] == 0 && k < L->libs.n; k++) {
+                Lib *o = (Lib *)L->libs.v[k];
+                if (o->ready && o->global && o->gseq == seq) v = sym_of(o->id, o->base, (const u8 *)sym, n, out);
+            }
     }
     if (out[0] == 0) {
         dl_error(12, lib ? lib->name : 0, lib ? slen(lib->name) : 0, sym, n);
@@ -1821,9 +1872,15 @@ EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset,
     for (u64 i = got; i < size; i++) ptr[i] = 0;
     if ((prot & PROT_WRITE) && !(flags & MAP_PRIVATE)) {
         Map *m = (Map *)malloc(sizeof(Map));
-        m->addr = (u32)ptr, m->fd = sc_dup(fd);
+        Vec *M = maps();
+        if (m) m->addr = (u32)ptr, m->fd = sc_dup(fd);
+        if (!m || !M || !vec_push(M, m)) {
+            if (m && m->fd >= 0) x_fd_close(m->fd);
+            free(m);
+            free(ptr);
+            return -48;  // ENOMEM
+        }
         if (m->fd < 0) m->fd = -1;
-        vec_push(maps(), m);
     }
     *allocated = 1, *addr = (u32)ptr;
     return 0;
