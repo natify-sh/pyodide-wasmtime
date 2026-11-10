@@ -26,7 +26,7 @@ takes ~0.2 s instead of ~2 s when P imports `asyncio`. The preload must only imp
 It is meant to run anything Pyodide runs without the browser's JavaScript: the standard library, binary Emscripten wheels
 (numpy and the rest of Pyodide's lock: `site=` folders, or `micropip` over the host's fetch or the guest's own TLS),
 files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs the JavaScript bridge (`js`, `pyodide.ffi`,
-`pyodide.http` outside `hostnet`) does not exist here: those 214 `env` imports are zero/null stubs.
+`pyodide.http` outside `hostnet`) does not exist here: those 169 `env` imports (158 of the bridge, 11 hooks that mean nothing here) are not answered: zero/null stubs, and hidden from `dlsym` in the fused build ([docs/IMPORT_AUDIT.md](docs/IMPORT_AUDIT.md)).
 
 | | |
 |---|---|

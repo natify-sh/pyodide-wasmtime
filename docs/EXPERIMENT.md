@@ -67,8 +67,8 @@ GL and the like, zero/null stubs):
 * **`ffi_call_js`** (ctypes and cffi calls) and **`ffi_prep_closure_loc_js`** (callbacks): host operations (`loader.ffi_call`,
   `ffi_prep`, `ffi_slot`, `ffi_free`). The host calls the table function with its real wasm type (any arity, 64-bit, floats,
   structs, variadic calls) as `wasmTable.get(fn)(...args)` does, and a callback is a host function of the closure's signature
-  in a table slot (freed slots are reused). The earlier `call_indirect` dispatch (`tools/gen_ffi.py`) is kept behind
-  `FFI_STATIC=1` for a build without a host;
+  in a table slot (freed slots are reused). The earlier `call_indirect` dispatch (`tools/gen_ffi.py`, `FFI_STATIC=1`) was
+  removed: it still needed the host for closures and time, so it was no build without a host;
 * **sockets**: `socket`, `connect`, `sendto`, `recvfrom`, `shutdown`, `getpeername`/`getsockname`,
   `getsockopt` (`SO_TYPE` is a stream: ssl checks it), `poll`, `ioctl(FIONBIO)`, `getaddrinfo` and
   `_emscripten_lookup_name` (IPv4, as Emscripten's own: one `addrinfo`); a socket is a guest descriptor from
@@ -255,7 +255,7 @@ The fused module must be made again after every change to `adapter.c`; the dynam
 * One engine (wasmtime-py). The dynamic build needs several instances sharing a memory and a table (the
   JavaScript engines and waboros can, pywasm3 cannot); the trampoline needs wasm GC. The fused module needs
   only WASI preview1 and the host's `loader`/`net` operations, but was run only here.
-* The loader: no `RTLD_LOCAL` scopes (every library's exports are global).
+* The loader: `RTLD_LOCAL` scopes are honoured now (see docs/IMPORT_AUDIT.md for what still differs).
 * A ctypes call or callback goes through the host (a Python function per call): slower than a call in wasm, as exact in types as JavaScript's.
 * Sockets: IPv4 lookups, blocking host sockets (timeouts kept by `poll`), no `bind`/`listen`/`accept`, no UDP
   tested, no `select` on mixed descriptors.
