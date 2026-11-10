@@ -117,6 +117,68 @@ print(disk(p)[:10])
     assert out == ["b'XXXLO-MMAP'", "b'YYYLO-MMAP'", "b'HELLO-MMAP'"]
 
 
+def test_a_write_back_is_the_whole_mapping_and_extends_a_truncated_file(guest: Guest):
+    # MEMFS's msync writes the mapping's whole length through stream_ops.write (Pyodide prints b'01234567!9')
+    out = run(
+        guest,
+        r"""
+p = "/mm/t.bin"
+open(p, "wb").write(b"0123456789")
+f = open(p, "r+b")
+m = mmap.mmap(f.fileno(), 0)
+os.truncate(p, 4)
+m[8:9] = b"!"
+m.flush()
+print(disk(p))
+os.truncate(p, 2)
+m.close(); f.close()
+print(disk(p))
+""",
+    )
+    assert out == ["b'01234567!9'", "b'01234567!9'"]
+
+
+def test_msync_writes_a_read_only_shared_mapping_but_not_a_private_one(guest: Guest):
+    # reachable only through libc: Python's mmap.flush returns early for ACCESS_READ and ACCESS_COPY. On MEMFS the
+    # unchanged bytes are written even through an O_RDONLY stream (a truncated file grows again, mtime changes).
+    out = run(
+        guest,
+        r"""
+import ctypes
+libc = ctypes.CDLL(None)
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+libc.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+for name, prot, fl, mode in (("shared", 1, 1, "rb"), ("private", 1, 2, "rb"), ("private-rw", 3, 2, "r+b")):
+    p = "/mm/ro.bin"
+    open(p, "wb").write(b"0123456789")
+    with open(p, mode) as f:
+        a = libc.mmap(None, 10, prot, fl, f.fileno(), 0)
+        os.truncate(p, 4)
+        print(name, libc.msync(a, 10, 4), disk(p))
+""",
+    )
+    assert out == ["shared 0 b'0123456789'", "private 0 b'0123'", "private-rw 0 b'0123'"]
+
+
+def test_a_closed_descriptor_number_reused_by_another_file_is_not_written_to(guest: Guest):
+    # a deliberate difference (owner): Pyodide looks the descriptor number up again at msync and writes the mapping into
+    # the OTHER file that got the number; here the mapping keeps its own descriptor (POSIX)
+    out = run(
+        guest,
+        r"""
+open("/mm/b.bin", "wb").write(b"bbbbbbbb"); open("/mm/c.bin", "wb").write(b"cccccccccccc")
+f = open("/mm/b.bin", "r+b"); m = mmap.mmap(f.fileno(), 0); fd = f.fileno(); f.close()
+g = open("/mm/c.bin", "r+b")
+print(g.fileno() == fd)
+m[0:2] = b"ZZ"
+m.flush(); m.close(); g.close()
+print(disk("/mm/b.bin"), disk("/mm/c.bin"))
+""",
+    )
+    assert out == ["True", "b'ZZbbbbbb' b'cccccccccccc'"]
+
+
 def test_errors_are_the_ones_pyodide_gives(guest: Guest):
     out = run(
         guest,

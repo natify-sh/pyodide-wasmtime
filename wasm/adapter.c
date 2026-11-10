@@ -1749,11 +1749,34 @@ static i32 dl_open(u8 *handle, i32 async) {
 
 EXPORT("_dlopen_js") i32 dlopen_js(u8 *handle) { return dl_open(handle, 0); }
 
-// emscripten_dlopen: the glue loads asynchronously and calls back from a promise; here the load is done at once
-// and the callback follows (a callback is a table index: onsuccess(handle, user_data) or onerror(handle, user_data))
+// emscripten_dlopen: the glue loads asynchronously and calls back from a promise, after the caller returned. There is no
+// event loop here: the load and the callback are a pending call of the interpreter (Py_AddPendingCall), which runs at
+// its next safe point after emscripten_dlopen returned (a callback is a table index: onsuccess(handle, user_data) or
+// onerror(handle, user_data)). The pending call is this adapter's own export, looked up by name for its table slot.
+EXPORT("__emscripten_dlopen_async") i32 dlopen_async(u32 *job) {
+    u32 handle = job[0], onsuccess = job[1], onerror = job[2], user_data = job[3];
+    free(job);
+    u32 cb = dl_open((u8 *)handle, 1) ? onsuccess : onerror;
+    if (cb) ((void (*)(u32, u32))cb)(handle, user_data);
+    return 0;
+}
+
 EXPORT("_emscripten_dlopen_js") void emscripten_dlopen_js(u8 *handle, u32 onsuccess, u32 onerror, u32 user_data) {
-    u32 cb = dl_open(handle, 1) ? onsuccess : onerror;
-    if (cb) ((void (*)(u32, u32))cb)((u32)handle, user_data);
+    u32 *job = (u32 *)malloc(16);
+    u64 add[3], own[4];
+    u32 out[2], pend = 0, fn = 0;
+    add[0] = 0x65506464415f7950ull, add[1] = 0x6c6143676e69646eull, add[2] = 0x6cull;  // "Py_AddPendingCall"
+    own[0] = 0x697263736d655f5full, own[1] = 0x6f6c645f6e657470ull, own[2] = 0x6e7973615f6e6570ull, own[3] = 0x63ull;
+    // "__emscripten_dlopen_async"
+    if (job) {
+        job[0] = (u32)handle, job[1] = onsuccess, job[2] = onerror, job[3] = user_data;
+        pend = dl_sym(0, (const char *)add, 17, out);
+        if (out[0] == 2 || out[0] == 3) {
+            fn = dl_sym(0, (const char *)own, 25, out);
+            if ((out[0] == 2 || out[0] == 3) && ((i32(*)(u32, u32))pend)(fn, (u32)job) == 0) return;
+        }
+        dlopen_async(job);  // no pending calls (not the case in Pyodide's Python): at once
+    }
 }
 
 EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
@@ -1787,9 +1810,10 @@ EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
 // main module's memalign (zeroed past the end of the file), and a shared writable mapping is written back with
 // pwrite on msync and munmap. A private mapping never writes back. The copy is not live: a write(2) to the file
 // after the mmap is not seen through it (and the other way round, until msync). Anonymous mappings are the libc's.
-// The write-back stops at the end of the file as it is then (the glue would extend the file with zeros).
+// The write-back is the whole mapping, which extends a truncated file (as MEMFS does).
 // A shared writable mapping keeps a descriptor of its own (a dup, as POSIX lets the mapping outlive the descriptor
-// it was made from; the glue looks the descriptor up again at msync and munmap and fails with EBADF when it was closed).
+// it was made from; the glue looks the descriptor up again at msync and munmap and fails with EBADF when it was closed:
+// a deliberate difference, decided by the owner).
 WASI("fd_pread") i32 w_fd_pread(i32 fd, const void *iovs, i32 n, u64 offset, i32 *nread);
 WASI("fd_pwrite") i32 w_fd_pwrite(i32 fd, const void *iovs, i32 n, u64 offset, i32 *nwritten);
 void *emscripten_builtin_memalign(u32 align, u32 size);
@@ -1878,34 +1902,37 @@ EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset,
     return 0;
 }
 
-// the bytes of a shared writable mapping back to the file (up to its present end)
-static i32 mm_write_back(u32 addr, u32 len, i32 fd, i64 offset) {
-    u64 fs[8];
-    i32 e = w_fd_filestat_get(fd, fs);
-    if (e) return -e;
-    if (offset < 0 || (u64)offset >= fs[4]) return 0;
-    u64 left = fs[4] - (u64)offset;
-    u32 n = left < len ? (u32)left : len, done = 0;
-    while (done < n) {
-        u32 iov[2];
-        iov[0] = addr + done, iov[1] = n - done < MM_CHUNK ? n - done : MM_CHUNK;
-        i32 w = 0;
-        e = w_fd_pwrite(fd, iov, 1, (u64)offset + done, &w);
-        if (e) return -e;
-        if (w == 0) return -29;  // EIO
-        done += (u32)w;
+// the bytes of a mapping back to the file: the whole length, as MEMFS's msync writes it (a truncated file grows again).
+// A descriptor without write rights (a read-only shared mapping) is opened again for writing by its path.
+static i32 mm_write_back(u32 addr, u32 len, i32 fd, i64 offset, u64 rights) {
+    i32 wfd = fd, e = 0;
+    if (!(rights & (1ull << 6)) && fd < MAXFD && fds()->path[fd]) {
+        wfd = open_at(AT_FDCWD, fds()->path[fd], (fds()->flags[fd] & ~(3 | 0100 | 0200 | 01000)) | 2, 0, 1);
+        if (wfd < 0) return wfd;
     }
-    return 0;
+    for (u32 done = 0; done < len && !e;) {
+        u32 iov[2];
+        iov[0] = addr + done, iov[1] = len - done < MM_CHUNK ? len - done : MM_CHUNK;
+        i32 w = 0;
+        e = w_fd_pwrite(wfd, iov, 1, (u64)offset + done, &w);
+        if (e) e = -e;
+        else if (w == 0) e = -29;  // EIO
+        else done += (u32)w;
+    }
+    if (wfd != fd) x_fd_close(wfd);
+    return e;
 }
 
 EXPORT("_msync_js") i32 msync_js(u32 addr, u32 len, i32 prot, i32 flags, i32 fd, i64 offset) {
+    (void)prot;  // the glue does not look at it either
     if (offset < 0) return -28;
     Map *m = map_find(addr, 0);
     if (m && m->fd >= 0) fd = m->fd;
-    i32 e = mm_file(fd, 0);
+    u64 rights = 0;
+    i32 e = mm_file(fd, &rights);
     if (e) return e;
-    if ((flags & MAP_PRIVATE) || !(prot & PROT_WRITE)) return 0;  // nothing was changed that the file should get
-    return mm_write_back(addr, len, fd, offset);
+    if (flags & MAP_PRIVATE) return 0;  // the glue returns before it writes
+    return mm_write_back(addr, len, fd, offset, rights);
 }
 
 EXPORT("_munmap_js") i32 munmap_js(u32 addr, u32 len, i32 prot, i32 flags, i32 fd, i64 offset) {

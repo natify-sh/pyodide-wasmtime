@@ -204,6 +204,9 @@ SERVICES = {
 }
 
 
+# Run at every start: /tmp is 0o777 in Pyodide, and the guest's modes are the adapter's own records, not the host's.
+_AT_START = "__import__('os').chmod('/tmp', 0o777)\n"
+
 # What the guest runs for one `run()`: the user's code in __main__, SystemExit as an exit status (the interpreter must
 # survive it: Emscripten's exit() ends in `unreachable`), any other error as a traceback and status 1.
 _WRAPPER = """\
@@ -544,6 +547,7 @@ class Pyodide:
             shutil.copytree(s, sp, dirs_exist_ok=True)
         for guest in self.mounts:  # a placeholder, so that a directory listing of the parent shows the mount
             (root / guest.lstrip("/")).mkdir(parents=True, exist_ok=True)
+        (root / "tmp").mkdir(exist_ok=True)  # Pyodide has /tmp (mode 0o777, set at start by _boot): tempfile's default
         (root / "etc" / "ssl").mkdir(parents=True)
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
         (root / "etc" / "services").write_text("".join(f"{n} {p}/{pr}\n" for (n, pr), p in SERVICES.items()))
@@ -2306,12 +2310,13 @@ class Pyodide:
             if self._restore(path, slots):
                 self.restored = self._started = True
                 # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
-                self.run('import sys; "random" in sys.modules and __import__("random").seed()')
+                self.run(_AT_START + 'import sys; "random" in sys.modules and __import__("random").seed()')
                 return
         self.ex["emscripten_stack_init"](store)
         self.ex["__wasm_call_ctors"](store)
         self.ex["Py_Initialize"](store)
         self._started = True
+        self.run(_AT_START)
         if self.preload is not None and self.run(self.preload) == 0 and path is not None:
             self._save(path)
 
