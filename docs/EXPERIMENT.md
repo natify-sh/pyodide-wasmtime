@@ -64,8 +64,11 @@ GL and the like, zero/null stubs):
   **NEEDED**: the libraries a module needs are loaded first, next to it or in `/lib`), the GOT (its own
   symbols, the main module's, the libraries loaded before), memory from `calloc`, table slots, relocations,
   constructors;
-* **`ffi_call_js`** (ctypes and cffi calls): `call_indirect` with the type the cif describes, integer and
-  pointer signatures up to 8 arguments;
+* **`ffi_call_js`** (ctypes and cffi calls) and **`ffi_prep_closure_loc_js`** (callbacks): host operations (`loader.ffi_call`,
+  `ffi_prep`, `ffi_slot`, `ffi_free`). The host calls the table function with its real wasm type (any arity, 64-bit, floats,
+  structs, variadic calls) as `wasmTable.get(fn)(...args)` does, and a callback is a host function of the closure's signature
+  in a table slot (freed slots are reused). The earlier `call_indirect` dispatch (`tools/gen_ffi.py`) is kept behind
+  `FFI_STATIC=1` for a build without a host;
 * **sockets**: `socket`, `connect`, `sendto`, `recvfrom`, `shutdown`, `getpeername`/`getsockname`,
   `getsockopt` (`SO_TYPE` is a stream: ssl checks it), `poll`, `ioctl(FIONBIO)`, `getaddrinfo` and
   `_emscripten_lookup_name` (IPv4, as Emscripten's own: one `addrinfo`); a socket is a guest descriptor from
@@ -253,7 +256,7 @@ The fused module must be made again after every change to `adapter.c`; the dynam
   JavaScript engines and waboros can, pywasm3 cannot); the trampoline needs wasm GC. The fused module needs
   only WASI preview1 and the host's `loader`/`net` operations, but was run only here.
 * The loader: no `RTLD_LOCAL` scopes (every library's exports are global).
-* `ffi_call_js`: integers and pointers only; `ffi_prep_closure_loc_js` (callbacks into Python) is a stub.
+* A ctypes call or callback goes through the host (a Python function per call): slower than a call in wasm, as exact in types as JavaScript's.
 * Sockets: IPv4 lookups, blocking host sockets (timeouts kept by `poll`), no `bind`/`listen`/`accept`, no UDP
   tested, no `select` on mixed descriptors.
 * `getdents64` with a buffer that splits entries across calls was not tested alone; no `fsync`, no modes.

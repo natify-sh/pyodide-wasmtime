@@ -42,13 +42,10 @@
  {
   "name": "__assert_fail",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Message is 'Assertion failed: <cond> <file>'; the line number and function are dropped, and ', at:' is missing (JS prints 'Aborted(Assertion failed: x == 1, at: file.c,42,func)').",
-   "In the dynamic flavor dlsym cannot find it (ctypes.CDLL(None).__assert_fail -> AttributeError), and a side module that imports it would be bound lazily and fail when called; fused finds it."
-  ],
-  "evidence": "adapter.c:1467-1491; probe: ctypes __assert_fail(b'x == 1',b'file.c',42,b'func') with restype=None -> ours 'Assertion failed: x == 1 file.c' + trap rc 134; real 'Aborted(Assertion failed: x == 1, at: file.c,42,func)' + fatal error",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_assert_fail: 'Aborted(Assertion failed: <cond>, at: <file>,<line>,<func>)' on stderr ('unknown filename'/'unknown function' for NULL, a signed line), then a trap (rc 134). Probe ctypes __assert_fail(b'x == 1', b'file.c', 42, b'func') and (None, None, -7, None): both messages identical to Pyodide. Found by dlsym in the dynamic packaging too (the adapter's exports are added to the main module's)",
+  "tested": "tests/test_runtime.py::test_a_failed_assert_says_what_javascript_says_and_aborts; tests/test_runtime.py::test_an_assert_without_names; tests/test_runtime.py::test_the_adapters_functions_are_found_by_dlsym"
  },
  {
   "name": "JsvError_Throw",
@@ -1269,60 +1266,50 @@
  {
   "name": "emscripten_runtime_keepalive_push",
   "class": "hook",
-  "verdict": "stub",
+  "verdict": "n/a",
   "gaps": [],
-  "evidence": "stub (harmless): there is no event loop or runtime to keep alive; no JS source",
+  "evidence": "not answered by the adapter (a no-op in the shim/stub): keeps a JavaScript runtime from exiting while an async operation (a dlopen, a promise) is pending; the host calls are synchronous and the guest has no event loop to keep alive. Nothing in Python reaches it with an effect that could differ",
   "tested": "no"
  },
  {
   "name": "emscripten_runtime_keepalive_pop",
   "class": "hook",
-  "verdict": "stub",
+  "verdict": "n/a",
   "gaps": [],
-  "evidence": "stub (harmless), as push",
+  "evidence": "not answered by the adapter (a no-op in the shim/stub): the counterpart of keepalive_push: there is no JavaScript event loop, so no counter that decides whether the runtime exits. Nothing in Python reaches it with an effect that could differ",
   "tested": "no"
  },
  {
   "name": "exit",
   "class": "runtime",
   "verdict": "full",
-  "gaps": [
-   "Not dlsym-visible in the dynamic flavor (ctypes.CDLL(None).exit -> AttributeError); fused and real find it.",
-   "Not verified: C atexit handlers and stdio flush (w_proc_exit directly)."
-  ],
-  "evidence": "adapter.c:1005; probe: ctypes exit(3) with restype=None -> ours ExitTrap 3 / CLI rc 3, Python atexit not run; real 'Program terminated with exit(3)' (status 3), Python atexit not run. os._exit uses WASI proc_exit, not this import",
-  "tested": "no"
+  "gaps": [],
+  "evidence": "adapter.c sc_exit -> WASI proc_exit. Pyodide's exitJS does not run C atexit handlers or flush stdio either (Pyodide keeps the runtime alive); probe: ctypes atexit(callback) + printf without newline + exit(3) -> status 3, the handler did not run, nothing flushed, in both. Found by dlsym in the dynamic packaging too",
+  "tested": "tests/test_runtime.py::test_c_exit_ends_the_process_without_atexit_handlers_or_a_flush"
  },
  {
   "name": "_Py_emscripten_runtime",
   "class": "hook",
-  "verdict": "stub",
-  "gaps": [
-   "sys._emscripten_info.runtime is None (real 'node v22.23.4 (v8 ...)'; JS gives 'UNKNOWN' when it has neither process nor navigator)."
-  ],
-  "evidence": "stub (harmless: None is honest); probe sys._emscripten_info -> ours runtime=None, real runtime='node v22.23.4 (v8 12.4.254.21-node.57)'",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c runtime_name -> loader.runtime -> _host.py _runtime_name: a malloc'd 'wasmtime-py 50.0.1 (pyodide-wasmtime <version>)' (Pyodide on Node: 'node v22.23.4 (v8 ...)'); sys._emscripten_info.runtime shows it",
+  "tested": "tests/test_signals.py::test_the_runtime_is_named"
  },
  {
   "name": "_Py_CheckEmscriptenSignals_Helper",
   "class": "hook",
-  "verdict": "stub",
-  "gaps": [
-   "There is no way for the embedder to post a signal or KeyboardInterrupt into the buffer."
-  ],
-  "evidence": "stub returns 0 (no signal pending). Harmless: the host has no signal buffer",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c check_signals: reads and clears the word at the address the host gave (loader.sigcell); Pyodide.interrupt(signum=2) (_host.py) writes the signal number there and sets Python's Py_EMSCRIPTEN_SIGNAL_HANDLING byte (what setInterruptBuffer does). Python takes it between bytecodes (within ~50): SIGINT -> KeyboardInterrupt, another signal runs its handler. Tested from a host function (the net.pollv operation) the guest is calling; from another thread the write to the guest's memory is not safe (documented on interrupt())",
+  "tested": "tests/test_signals.py::test_interrupt_from_a_host_function"
  },
  {
   "name": "_PyEM_TrampolineCall_JS",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Only (i32 x0..4)->i32 and ->void targets are handled. A target with more than 4 params, or with i64/f32/f64 params or results, hits `unreachable`; JS wasmTable.get(f)(a,b,c) coerces those (not reachable from correct C extensions).",
-   "A null slot traps (JS throws a TypeError); both are fatal."
-  ],
-  "evidence": "_wasm.py:94-121 (TRAMP_WAT, also used by tools/fuse.py:126); probe: property getter, len, operator.add, sorted(key=), max(key=None) -> ours 'tramp 5 2 3 [1, 3] 2', real identical",
-  "tested": "tests/test_basic.py::test_hello (every call of a C method)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "_wasm.py TRAMP_WAT: the ten types it tests are called in wasm; any other type goes to loader.call_any (_host.py _call_any/_js_call: the callee's own type, arguments as Numbers, ToInt32 of the result). A null table slot is a TypeError = a trap, as JS throws. Probe via the export: sqrt(16), abs(-5), free, ldexp(3,2) -> 4 5 0 12 in both Pyodide and ours",
+  "tested": "tests/test_ffi.py::test_the_trampoline_calls_a_type_it_does_not_know; tests/test_basic.py::test_hello (every call of a C method)"
  },
  {
   "name": "__syscall_getuid32_js",
@@ -1402,9 +1389,9 @@
  {
   "name": "emscripten_debugger",
   "class": "hook",
-  "verdict": "stub",
+  "verdict": "n/a",
   "gaps": [],
-  "evidence": "stub (harmless): JS runs `debugger`",
+  "evidence": "not answered by the adapter (a no-op in the shim/stub): runs the JavaScript `debugger` statement; there is no JavaScript debugger to stop in. Nothing in Python reaches it with an effect that could differ",
   "tested": "no"
  },
  {
@@ -1420,48 +1407,34 @@
  {
   "name": "ffi_call_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "call_indirect needs the exact wasm signature, while JS wasmTable.get(fn)(...) tolerates mismatches. Default restype c_int on a void function (libc.free(p), exit, abort, __assert_fail, qsort), an extra argument (PyLong_FromLong(5,6)) and variadic calls (libc.printf(b'hi')) all trap with 'indirect call type mismatch' and kill the interpreter; real Pyodide returns normally.",
-   "Struct by value traps (__builtin_trap), as argument (inet_ntoa(in_addr)) and as result (div -> div_t); JS supports both.",
-   "long double traps: sqrtl with c_longdouble (JS passes two i64).",
-   "More than 4 arguments when any is float or 64-bit traps: PyOS_double_to_string(double, char, int, int, ptr) (JS ok).",
-   "More than 8 integer arguments traps (JS any count).",
-   "nfixedargs (variadic calls) and abi are ignored."
-  ],
-  "evidence": "adapter.c:1017-1131; probe: div/PyOS_double_to_string/sqrtl/inet_ntoa/free()/printf/PyLong_FromLong(5,6) -> ours trap rc 134 every time; real 'div 3 1', b'1.5', 4.0, b'127.0.0.1', 0, 15, 5. memset/labs/llabs/fabs/fmaf/ldexp agree",
-  "tested": "tests/test_basic.py::test_ctypes_calls_with_floats_and_64_bit_values; tests/test_checks.py::test_openssl_through_ctypes"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c ffi_call_js -> loader.ffi_call -> _host.py _ffi_call/_js_call (libffi's JS rules: unbox_small_structs, struct copies on the stack, the variadic block, nfixedargs; the callee's own wasm type; extra arguments dropped, missing ones undefined; a BigInt/Number mismatch is a TypeError = a trap, as JS throws); probes (both packagings, equal to Pyodide on Node): div, PyOS_double_to_string, sqrtl, inet_ntoa, free(p) with the default restype, srand, snprintf (plain and variadic, long double), PyLong_FromLong(5,6) and (), >8 arguments, labs/llabs/fabs/fabsf/ldexp/memset. FFI_STATIC=1 keeps the old generated dispatch for a build without a host",
+  "tested": "tests/test_ffi.py::test_ctypes_calls_take_any_signature; tests/test_basic.py::test_ctypes_calls_with_floats_and_64_bit_values; tests/test_checks.py::test_openssl_through_ctypes"
  },
  {
   "name": "ffi_closure_alloc_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Every closure takes a new table slot (table_grow), and freed slots are never reused: after 1000 created and freed callbacks the next slot is 9039+1001. JS reuses freed slots (14665 -> 14666).",
-   "The result of malloc and of table_grow (-1 when it fails) is not checked."
-  ],
-  "evidence": "adapter.c:909-915; probe: CFUNCTYPE address, then 1000 alloc/free, then 3 more -> ours 9039 then [10040,10041,10042]; real 14665 then [14666,14667,14668]",
-  "tested": "suite test_ctypes.test_callbacks (fails on ours)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c ffi_closure_alloc_js: malloc(size) + loader.ffi_slot (_host.py _ffi_slot: the slot freed last, else table.grow by one, as getEmptyTableSlot); a failed malloc gives 0. Probe (both packagings, equal to Pyodide): slot offsets 1 2 / reuse 0 / [2, 1, 3] / [4, 5, 6] after 1000 created and freed",
+  "tested": "tests/test_ffi.py::test_freed_closures_give_their_table_slots_back"
  },
  {
   "name": "ffi_closure_free_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Frees the closure memory but does not give the table slot back (JS freeTableIndexes.push), so slots leak."
-  ],
-  "evidence": "adapter.c:917; same probe as ffi_closure_alloc_js",
-  "tested": "suite test_ctypes.test_callbacks (fails)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c ffi_closure_free_js -> loader.ffi_free (_host.py _ffi_free: the table slot is nulled and goes on the free list), then free(closure); same probe as ffi_closure_alloc_js",
+  "tested": "tests/test_ffi.py::test_freed_closures_give_their_table_slots_back"
  },
  {
   "name": "ffi_prep_closure_loc_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A lie: it returns 0 (FFI_OK), but the table slot stays null and user_data is never written. Calling a ctypes CFUNCTYPE callback traps; cffi's callback() raises SystemError 'ffi_prep_closure(): bad user_data'; libc.qsort with a comparator traps."
-  ],
-  "evidence": "stub; probe: CFUNCTYPE(c_double,c_double)(lambda x:x*2)(1.25) -> ours trap rc 134, real 2.5; _cffi_backend.callback (wheel-less dlopen of cffi's .so) -> ours SystemError, real 'created'",
-  "tested": "suite test_ctypes.test_callbacks and test_ctypes.test_libc: both FAIL on fused (run here)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c ffi_prep_closure_loc_js -> loader.ffi_prep -> _host.py _ffi_prep/_ffi_closure: a host function of the closure's wasm signature (derived from the cif as the JS does) is put in the table slot codeloc; on a call it writes the arguments to the guest stack as avalue (struct copies, the variadic pointer), calls fun(cif, ret, args, user_data) and returns ret per the signature. Probes (both packagings, equal to Pyodide): CFUNCTYPE int/double/float/int64/uint64/pointer/no-arg/void/char/short/ubyte/struct-by-value argument/long double/10 arguments, qsort and bsearch comparators called by libc, a callback that raises, a callback inside a callback; cffi callback() from the wheel. Suite: test_ctypes.test_callbacks and test_ctypes.test_libc pass on fused and dynamic",
+  "tested": "tests/test_ffi.py::test_ctypes_callbacks_of_every_kind; tests/test_ffi.py::test_cffi_callbacks; suite test_ctypes.test_callbacks, test_ctypes.test_libc"
  },
  {
   "name": "__hiwire_deduplicate_new",
@@ -1526,21 +1499,18 @@
  {
   "name": "_tzset_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Always UTC: the host's time zone is ignored. With TZ=Europe/Kyiv real gives tzname ('UTC+0200','UTC+0300'), timezone -7200, daylight 1; ours gives ('UTC','UTC'), 0, 0.",
-   "Under a UTC host the names differ: ours 'UTC', JS 'UTC-0000' (time.tzname and strftime('%Z'))."
-  ],
-  "evidence": "adapter.c:1399-1403; probe: time.tzname/timezone/daylight with and without TZ=Europe/Kyiv -> see gaps",
-  "tested": "suite test_time (fails on ours because of process_time, which is not this import), test_strftime passes"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c tzset_js -> loader.tzset -> _host.py _t_tzset: timezone, daylight and the names 'UTC+0200'/'UTC-0000' from the Jan 1/Jul 1 offsets of the current year, exactly as the JS (std/dst by the smaller west offset). Probe: time.tzname/timezone/daylight/altzone and strftime %Z in 5 zones equal Pyodide (e.g. Kyiv ('UTC+0200','UTC+0300') -7200 1 -10800; UTC ('UTC-0000','UTC-0000') 0 0)",
+  "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {
   "name": "_abort_js",
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1492-1497; probe os.abort() -> ours 'abort()' on stderr + trap, rc 134; real 'Aborted()' + fatal RuntimeError unreachable. Both are fatal; the wording differs",
-  "tested": "tests/test_basic.py::test_exit_codes"
+  "evidence": "adapter.c sc_abort_js: 'Aborted()' on stderr as the JS prints, then a trap (rc 134, tests/test_basic.py::test_exit_codes). Probe os.abort(): 'Aborted()' in both",
+  "tested": "tests/test_runtime.py::test_abort_says_aborted; tests/test_basic.py::test_exit_codes"
  },
  {
   "name": "__syscall_faccessat",
@@ -1717,8 +1687,8 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:562-567; probe time.time() -> ours 1794292298.95, real 1794292301.04 (seconds apart, matching host `date +%s`); ours has sub-millisecond digits, which does not matter",
-  "tested": "suite test_time"
+  "evidence": "adapter.c date_now: WASI realtime clock in whole milliseconds, as Date.now(); probe: integer, within 5 s of the host's time.time()",
+  "tested": "tests/test_runtime.py::test_date_now_is_whole_milliseconds"
  },
  {
   "name": "__syscall_epoll_create1",
@@ -1899,7 +1869,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:562-568; probe monotonic/perf_counter are non-decreasing in both; ours starts at the host's monotonic origin (3.24), real at process start (2.02), which does not matter",
+  "evidence": "adapter.c get_now: WASI monotonic clock in ms with sub-ms digits (performance.now() is relative to process start; ours to the host's monotonic origin, which nothing depends on); time.monotonic/perf_counter are non-decreasing in both",
   "tested": "suite test_time"
  },
  {
@@ -1949,50 +1919,34 @@
  {
   "name": "_timegm_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Never fails: a year beyond JS Date's range returns a value where JS returns -1 (tm_year=300000 -> ours 9464876611200, real -1).",
-   "It normalizes all fields of the struct (as glibc does), while JS writes only wday and yday. Ours is better POSIX; the result is the same.",
-   "Years 0-99 are correct in ours; JS maps them to 1900-1999 (a JS bug, ours is better)."
-  ],
-  "evidence": "adapter.c:1347-1392; probe ctypes timegm: normal value equal; unnormalized: same t=1614909730 but fields differ; year50 -> ours -60589296000, real -631152000",
-  "tested": "tests/test_checks.py::test_the_guests_own_tls (network, OpenSSL certificate dates)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c timegm_js: Date.UTC's rules (a year 0..99 is 19xx, V8's limits of year +-1e6 and month +-1e7, |t| > 8.64e12 s gives -1) and, as the JS, only tm_wday and tm_yday are written. Probe: 14 tuples, tests/checks/time_gm.py equals Pyodide",
+  "tested": "tests/test_time.py::test_gmtime_and_timegm_at_the_edges_of_date; tests/test_checks.py::test_the_guests_own_tls (network)"
  },
  {
   "name": "_mktime_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Always UTC, ignoring the host time zone and DST. With TZ=Europe/Kyiv, mktime((2020,7,1,12,0,0,0,0,-1)) -> ours 1593604800, real 1593594000.",
-   "tm_isdst is forced to 0 (JS keeps the caller's 1 under UTC).",
-   "No range error: year 275761 -> ours 8640009504000, real OverflowError."
-  ],
-  "evidence": "adapter.c:1384-1397; probe: 11 time.mktime tuples plus the TZ run; equal under UTC within range",
-  "tested": "suite test_time (fails on an unrelated process_time error)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c mktime_js -> loader.mktime -> _host.py _t_mktime: Date(y, m, d, h, mi, s) with V8's limits and the 19xx rule, a time that does not exist or happens twice as ECMAScript's UTC(), the JS tm_isdst logic (dst < 0 guessed, a wrong flag shifts the time by the offsets' difference), -1 beyond the range. Probe: 23 tuples in 5 zones equal Pyodide",
+  "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {
   "name": "_localtime_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Always UTC: the host TZ, DST, tm_gmtoff and tm_isdst are ignored. With TZ=Europe/Kyiv, localtime(1593561600) -> ours hour 0, isdst 0, gmtoff 0; real hour 3, isdst 1, gmtoff 10800.",
-   "Years beyond int range are truncated without an error: localtime(1e17) gives year -1126091476, where real raises OSError EINVAL for |t|>8.64e12.",
-   "|t| between 8.64e12 and about 6.7e16 returns a date where JS returns an error (OSError).",
-   "t=-2^63 overflows in fill_tm (-t)."
-  ],
-  "evidence": "adapter.c:1356-1382; probe: 14 edge values: identical within ±8.64e12 except year 1-99 yday (JS bug: -693959); outside that range ours computes and real raises OSError 28",
-  "tested": "suite test_time / test_datetime (test_datetime passes)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c localtime_js -> loader.localtime -> _host.py _t_localtime: the offset of the host's zone (time.localtime), tm_gmtoff and tm_isdst as the JS computes them (offsets in whole minutes, DST = the larger of the Jan 1/Jul 1 offsets), fields from the exact offset, error beyond +-8.64e12 s. The zone is the host process's (TZ, zoneinfo), as Date is Node's. Probe: tests/checks/time_local.py in UTC, Europe/Kyiv, America/New_York, Australia/Lord_Howe, Asia/Kolkata equals Pyodide",
+  "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {
   "name": "_gmtime_js",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "No range error, and the year is truncated to i32: time.gmtime(1e17) -> year -1126091476, gmtime(-2**63) -> year -219246529 (signed overflow in fill_tm). Real raises OSError EINVAL beyond 8.64e12.",
-   "Years 1-99 have the correct yday in ours; JS gives yday -693959 (a JS bug)."
-  ],
-  "evidence": "adapter.c:1356-1376; probe: gmtime at 0, -1, -86401, 1e9, ±2^31, 9999/10000, 8.64e12, 1e13, 1e15, 1e17, ±2^63, year 1/0 -> equal within range, differences as listed",
-  "tested": "tests/test_checks.py::test_the_guests_own_tls (network); suite test_time"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c gmtime_js/fill_tm: integer arithmetic with Date's range (|t| > 8.64e12 s: error 1 -> OSError EINVAL) and the JS yday bug for the years 0..99 (counted from Jan 1 of 19xx) and for -271821 (NaN | 0 = 0). Probe: 27 values from 0 to +-2^63, tests/checks/time_gm.py equals the output of Pyodide on Node",
+  "tested": "tests/test_time.py::test_gmtime_and_timegm_at_the_edges_of_date"
  },
  {
   "name": "__syscall_poll",
@@ -2051,31 +2005,26 @@
  {
   "name": "_emscripten_get_progname",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "The name is 'python' (JS thisProgram: the script path).",
-   "If len < 7 nothing is written, not even a NUL terminator (JS truncates and terminates)."
-  ],
-  "evidence": "adapter.c:557-560; probe __progname / program_invocation_name -> ours b'python'/b'python', real b'pyo_audit_16908.mjs'/b'/tmp/pyo_audit_16908.mjs'",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c get_progname: 'python' cut to len-1 and always ended with a NUL (stringToUTF8); len <= 0 writes nothing. The name is not Node's script path: there is no script; 'python' is the honest program name here",
+  "tested": "tests/test_runtime.py::test_progname_is_cut_and_ended"
  },
  {
   "name": "_emscripten_runtime_keepalive_clear",
   "class": "hook",
-  "verdict": "stub",
+  "verdict": "n/a",
   "gaps": [],
-  "evidence": "stub (harmless): resets JS keepalive counters, and there is no runtime loop here",
+  "evidence": "not answered by the adapter (a no-op in the shim/stub): resets the JavaScript keepalive counters (noExitRuntime = false); there are none here: exit() always ends the process. Nothing in Python reaches it with an effect that could differ",
   "tested": "no"
  },
  {
   "name": "__call_sighandler",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A lie: raise() reports success but never calls the C handler. Python handlers for signal.raise_signal(SIGUSR1) and os.kill(os.getpid(), SIGUSR2) never run, and raise_signal(SIGINT) does not raise KeyboardInterrupt."
-  ],
-  "evidence": "stub; caller is raise (func $14342); probe raise_signal SIGUSR1 -> ours [], real [10]; os.kill self -> ours silent, real 'handler 12'",
-  "tested": "suite test_signal: RaiseSignalTest.test_handler and test_sigint FAIL on fused (run here)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c call_sighandler: call_indirect void(i32) on the table entry. Probe (both packagings, equal to Pyodide): raise_signal(SIGUSR1) -> [('usr1', 10)], os.kill(getpid(), SIGUSR2) -> handler 12, raise_signal(SIGINT) and os.kill(SIGINT) -> KeyboardInterrupt; test_signal.RaiseSignalTest.test_handler and test_sigint ok (the module as a whole still fails on os.pipe: WakeupFD tests, not this import)",
+  "tested": "tests/test_signals.py::test_raise_and_kill_call_the_handlers; unittest test.test_signal.RaiseSignalTest"
  },
  {
   "name": "__syscall_readlinkat",
@@ -2114,12 +2063,10 @@
  {
   "name": "_setitimer_js",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "A lie: the timer never fires. JS fires only from its event loop after the synchronous run, so the effect is the same inside one run. Python's signal module has no setitimer or alarm in this build (AttributeError in both), so only ctypes reaches it."
-  ],
-  "evidence": "stub; callers setitimer (func $14439) and _emscripten_timeout; probe signal.setitimer -> AttributeError in both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c setitimer_js: keeps a deadline per timer (ITIMER_REAL/VIRTUAL/PROF, the monotonic clock) and turns Python's signal checking on; check_signals fires an expired one by calling libc's _emscripten_timeout (which raises SIGALRM and re-arms an interval). Python has no setitimer/alarm in this build; ctypes setitimer and alarm reach it. JS fires the timer from its event loop, after the synchronous run (a busy loop never sees it); here a busy loop does",
+  "tested": "tests/test_signals.py::test_itimer_delivers_sigalrm_when_python_looks_for_signals"
  },
  {
   "name": "__syscall_statfs64",
@@ -2154,24 +2101,18 @@
  {
   "name": "emscripten_get_heap_max",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "Reports 0x7FFF0000 (2 GiB - 64 KiB) while the memory actually grows to about 4 GiB (4000 MB allocated in both); JS reports 4294901760.",
-   "Not dlsym-visible in the dynamic flavor."
-  ],
-  "evidence": "adapter.c:569; probe ctypes emscripten_get_heap_max -> ours 2147418112, real 4294901760; 40 x 100 MB bytearrays -> 4000 MB in both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c heap_max: 4294901760 (getHeapMax(): 4 GiB less a page), the engine grows the memory to that (emscripten_resize_heap(0xFFFF0000) succeeds, above it fails); probe equal to Pyodide. Found by dlsym in the dynamic packaging too",
+  "tested": "tests/test_runtime.py::test_heap_max_and_resize_follow_getheapmax"
  },
  {
   "name": "_emscripten_system",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "It returns -1 instead of a -errno, so libc's __syscall_ret sets errno=1 (E2BIG). JS outside Node returns -52 (errno ENOSYS).",
-   "Real Pyodide on Node runs the command through a shell (os.system('echo hi') prints 'hi', returns 0) and system(NULL) gives 1. Ours returns -1 and 0, consistent with 'no processes'."
-  ],
-  "evidence": "adapter.c:1463; probe: os.system('echo hi'), system(NULL), system(b'true') with use_errno -> ours -1/0/(-1, errno 1); real 0 + 'hi'/1/(0,0)",
-  "tested": "no"
+  "verdict": "enosys",
+  "gaps": [],
+  "evidence": "adapter.c sc_system: system(NULL) is 0 (no shell), a command returns -52 (ENOSYS: errno 52, system() -1) as the JS glue outside Node. Pyodide on Node runs the command with child_process (os.system('echo hi') prints hi, returns 0): a shell of the host from inside the guest is a way out of the sandbox, so it is deliberately not done",
+  "tested": "tests/test_runtime.py::test_system_is_enosys"
  },
  {
   "name": "__syscall_truncate64",
@@ -2195,11 +2136,9 @@
   "name": "emscripten_resize_heap",
   "class": "runtime",
   "verdict": "full",
-  "gaps": [
-   "Not a functional gap: no over-allocation (JS grows by up to 20% extra), so more memory.grow calls."
-  ],
-  "evidence": "adapter.c:571-576; probe 40 x 100 MB bytearrays -> 4000 MB in both; bytearray(1.5 GiB) ok",
-  "tested": "tests/test_basic.py::test_big_list_grows_the_memory"
+  "gaps": [],
+  "evidence": "adapter.c resize_heap: memory.grow to the requested size, 0 above getHeapMax() (0xFFFF0000); no over-allocation (JS grows by up to 20% extra: only fewer grow calls here). JS also fails a request below the current size once the memory is at its maximum (a negative page count throws): nothing asks for that; here it is 1",
+  "tested": "tests/test_runtime.py::test_heap_max_and_resize_follow_getheapmax; tests/test_basic.py::test_big_list_grows_the_memory"
  },
  {
   "name": "__syscall_accept4",

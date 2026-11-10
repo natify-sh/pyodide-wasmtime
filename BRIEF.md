@@ -6,7 +6,7 @@ The briefing for anyone (person or agent) who starts work on this repository. Ev
 
 **pyodide-wasmtime runs Pyodide's CPython, and its wheels, on wasmtime with no JavaScript.** Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**
 (`wasm/adapter.c`, built with wasi-sdk 34's clang, after the shape of Wasmtime's preview1 adapter: no data section, no stack of its own): system calls over WASI, the dynamic loader (`dlopen` of a wheel), libffi calls, sockets,
-time, the trampoline. The Python host (`src/pyodide_wasmtime/_host.py`, class `Pyodide`) gives what a wasm module cannot do: wasmtime's WASI, four loader operations and the host's sockets. Pyodide is **not rebuilt**: its wasm is the npm
+time, the trampoline. The Python host (`src/pyodide_wasmtime/_host.py`, class `Pyodide`) gives what a wasm module cannot do: wasmtime's WASI, the loader operations, libffi's calls and callbacks, the host's time zone and the host's sockets. Pyodide is **not rebuilt**: its wasm is the npm
 package's, with the legacy wasm exceptions converted once to `exnref`. The package is an **alpha** and meant to be a ready solution for anything Pyodide runs without the browser's JavaScript, not for numpy only.
 
 ## What it is NOT
@@ -47,7 +47,7 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 
 ## Official suite, host mode (2026-11-10, both packagings give the same)
 
-819 modules of Pyodide's CPython suite: first run 500 passed, 103 failed, 185 skipped, 31 xfail (module level: one failing test fails a module). Found since: 29 `__syscall_*` imports of `pyodide.asm.wasm` were answered with 0 ("success") and did nothing; they return ENOSYS now, and `symlinkat`, `linkat`, `truncate64`, `fallocate`, `fdatasync`, `fcntl`, a real `chdir`/`getcwd` and `exit` are real. Of the 103 failing modules, 14 pass after that; the rest group into: `ffi_call_js` limited to integer and pointer signatures (wasm trap in `ctypes`, 18), more unimplemented calls (`pipe2`, `dup`, `chdir` family...), `dlsym` on the main module not finding symbols that are exported (8), "files modified" by tests (6), `clock_gettime` for the process time (3). Not compared with Pyodide on Node.
+819 modules of Pyodide's CPython suite: first run 500 passed, 103 failed, 185 skipped, 31 xfail (module level: one failing test fails a module). Found since: 29 `__syscall_*` imports of `pyodide.asm.wasm` were answered with 0 ("success") and did nothing; they return ENOSYS now, and `symlinkat`, `linkat`, `truncate64`, `fallocate`, `fdatasync`, `fcntl`, a real `chdir`/`getcwd` and `exit` are real. Of the 103 failing modules, 14 pass after that; the rest group into: `ffi_call_js` limited to integer and pointer signatures (wasm trap in `ctypes`, 18), more unimplemented calls (`pipe2`, `dup`, `chdir` family...), `dlsym` on the main module not finding symbols that are exported (8), "files modified" by tests (6), `clock_gettime` for the process time (3). Not compared with Pyodide on Node. Since then `ffi_call_js` takes any signature and callbacks work (host operations; `test_ctypes.test_callbacks` and `test_libc` pass on both), and `raise()`/`os.kill` call the handlers (`test_signal`'s raise cases).
 
 ## Hard rules (short form; the full list is in CLAUDE.md)
 

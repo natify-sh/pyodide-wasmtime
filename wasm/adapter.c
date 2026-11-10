@@ -65,6 +65,18 @@ LOADER("sym") u32 dl_sym(i32 id, const char *name, i32 n, u32 *out);
 LOADER("call") i32 dl_call(i32 id, const char *name, i32 n);
 // the main module's table, grown by n null entries -> the old size (the trampoline module's table.grow)
 __attribute__((import_module("aux"), import_name("table_grow"))) u32 table_grow(u32 n);
+// libffi's emscripten port (calls and closures), the local time zone, signals and the runtime's name: host operations
+// (_host.py). ffi_call performs the call with the callee's real wasm type, as the JavaScript glue's
+// `wasmTable.get(fn)(...args)` does; ffi_prep puts a host function into the closure's table slot.
+LOADER("ffi_call") void host_ffi_call(const void *cif, u32 fn, void *rvalue, void **avalue);
+LOADER("ffi_prep") i32 host_ffi_prep(void *closure, const void *cif, u32 fun, u32 user_data, u32 codeloc);
+LOADER("ffi_slot") u32 host_ffi_slot(void);
+LOADER("ffi_free") void host_ffi_free(u32 index);
+LOADER("localtime") i32 host_localtime(i64 t, i32 *tm);  // tm_isdst and tm_gmtoff of the host's zone; 1 beyond Date's range
+LOADER("mktime") i64 host_mktime(i32 *tm);
+LOADER("tzset") void host_tzset(i32 *timezone, i32 *daylight, char *std_name, char *dst_name);
+LOADER("sigcell") u32 *host_sigcell(void);  // the word where the host posts a signal for Python
+LOADER("runtime") u32 host_runtime(void);   // a malloc'd string naming the runtime
 
 #define AT_FDCWD (-100)
 #define PREOPEN 3
@@ -562,9 +574,12 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
     }
 }
 
-EXPORT("_emscripten_get_progname") void get_progname(char *buf, i32 len) {
-    if (len < 7) return;
-    buf[0] = 'p', buf[1] = 'y', buf[2] = 't', buf[3] = 'h', buf[4] = 'o', buf[5] = 'n', buf[6] = 0;
+EXPORT("_emscripten_get_progname") void get_progname(char *buf, i32 len) {  // stringToUTF8: cut to len-1, always ended
+    const char name[7] = {'p', 'y', 't', 'h', 'o', 'n', 0};
+    if (len <= 0) return;
+    i32 i = 0;
+    for (; i < len - 1 && name[i]; i++) buf[i] = name[i];
+    buf[i] = 0;
 }
 
 static double now_ms(i32 clock) {
@@ -572,11 +587,16 @@ static double now_ms(i32 clock) {
     w_clock_time_get(clock, 1000, &t);
     return (double)t / 1e6;
 }
-EXPORT("emscripten_date_now") double date_now(void) { return now_ms(0); }
+EXPORT("emscripten_date_now") double date_now(void) {  // Date.now(): whole milliseconds
+    u64 t = 0;
+    w_clock_time_get(0, 1000, &t);
+    return (double)(t / 1000000ull);
+}
 EXPORT("emscripten_get_now") double get_now(void) { return now_ms(1); }
-EXPORT("emscripten_get_heap_max") i32 heap_max(void) { return 0x7FFF0000; }
+EXPORT("emscripten_get_heap_max") u32 heap_max(void) { return 0xFFFF0000u; }  // getHeapMax(): 4 GiB less a page
 
 EXPORT("emscripten_resize_heap") i32 resize_heap(u32 n) {
+    if (n > 0xFFFF0000u) return 0;  // beyond getHeapMax()
     u32 have = (u32)__builtin_wasm_memory_size(0);
     u32 want = (u32)(((u64)n + 65535) / 65536);
     if (want <= have) return 1;
@@ -914,15 +934,27 @@ EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
     return 0;
 }
 
+// A closure is a block from malloc whose first word is its table slot; the host reuses freed slots (getEmptyTableSlot)
 EXPORT("ffi_closure_alloc_js") u32 ffi_closure_alloc_js(u32 size, u32 *code) {
     u32 *closure = (u32 *)malloc(size);
-    u32 slot = table_grow(1);  // an empty slot, as getEmptyTableSlot() of the glue
+    if (!closure) {
+        *code = 0;
+        return 0;
+    }
+    u32 slot = host_ffi_slot();
     *code = slot;
     *closure = slot;
     return (u32)closure;
 }
 
-EXPORT("ffi_closure_free_js") void ffi_closure_free_js(void *closure) { free(closure); }
+EXPORT("ffi_closure_free_js") void ffi_closure_free_js(u32 *closure) {
+    host_ffi_free(*closure);
+    free(closure);
+}
+
+EXPORT("ffi_prep_closure_loc_js") i32 ffi_prep_closure_loc_js(void *closure, const void *cif, u32 fun, u32 user_data, u32 codeloc) {
+    return host_ffi_prep(closure, cif, fun, user_data, codeloc);
+}
 
 // ================================================================== writing files (what installing a wheel needs)
 
@@ -1018,10 +1050,15 @@ EXPORT("__syscall_chmod") i32 sc_chmod(i32 a, i32 b) { (void)a, (void)b; return 
 EXPORT("__syscall_fchmod") i32 sc_fchmod(i32 a, i32 b) { (void)a, (void)b; return 0; }
 EXPORT("__syscall_fchmodat2") i32 sc_fchmodat2(i32 a, i32 b, i32 c, i32 d) { (void)a, (void)b, (void)c, (void)d; return 0; }
 
-// ================================================================== ffi_call_js: ctypes calls, for integer/pointer signatures
-// libffi's emscripten port calls through JavaScript (`wasmTable.get(fn)(...args)`); here a call_indirect with
-// the type that the cif describes, for up to 8 arguments that are integers or pointers and an integer,
-// pointer or void result. Anything else (floats, 64-bit, structs) traps rather than calling wrongly.
+// ================================================================== ffi_call_js: ctypes calls
+// libffi's emscripten port calls through JavaScript (`wasmTable.get(fn)(...args)`), which takes any callee type. The host
+// does the same (loader.ffi_call: any arity, 64-bit, floats, structs, variadic calls). FFI_STATIC (tools/gen_ffi.py) is
+// the variant for a build without such a host: a call_indirect with the type the cif describes, for up to 8 integer or
+// pointer arguments and, with floats or 64-bit values, up to 4; it traps for anything else, and for a callee of
+// another type than the cif's.
+#ifndef FFI_STATIC
+EXPORT("ffi_call_js") void ffi_call_js(const void *cif, u32 fn, void *rvalue, void **avalue) { host_ffi_call(cif, fn, rvalue, avalue); }
+#else
 typedef struct {
     u32 size;
     u16 alignment, type;
@@ -1138,6 +1175,7 @@ EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, voi
     }
     *(u32 *)rvalue = r;
 }
+#endif
 
 // ================================================================== sockets: Emscripten's socket calls over the host's
 // WASI preview1 cannot create or connect a socket, so the host gives a few operations; a socket is a guest
@@ -1399,9 +1437,13 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
     return 0;
 }
 
-// ================================================================== time: Emscripten's JavaScript date helpers, in UTC
-// (OpenSSL checks certificate dates through gmtime/timegm; with the stubs every date was a format error).
+// ================================================================== time: Emscripten's JavaScript date helpers
+// gmtime and timegm are integer arithmetic with what JavaScript's Date does to them: nothing beyond +-8.64e12 s (an error),
+// V8's limits for the year and the month, and a year 0..99 read as 19xx by Date.UTC (so the day of the year, which JavaScript
+// counts from Jan 1 of that 19xx, is wrong for the years 1..99: the same wrong number). localtime, mktime and tzset ask
+// the host, which knows the time zone (_host.py, `_t_localtime`).
 // struct tm: sec, min, hour, mday, mon, year, wday, yday, isdst (i32 each), gmtoff (long), zone.
+#define DATE_LIMIT 8640000000000LL
 static i64 days_from_civil(i64 y, i64 m, i64 d) {  // proleptic Gregorian, H. Hinnant's algorithm
     y -= m <= 2;
     i64 era = (y >= 0 ? y : y - 399) / 400;
@@ -1411,7 +1453,7 @@ static i64 days_from_civil(i64 y, i64 m, i64 d) {  // proleptic Gregorian, H. Hi
     return era * 146097 + doe - 719468;
 }
 
-static void fill_tm(i64 t, i32 *tm) {
+static void fill_tm(i64 t, i32 *tm, i32 js_yday) {
     i64 days = t >= 0 ? t / 86400 : -((-t + 86399) / 86400);
     i64 secs = t - days * 86400;
     tm[0] = (i32)(secs % 60), tm[1] = (i32)(secs / 60 % 60), tm[2] = (i32)(secs / 3600);
@@ -1425,39 +1467,46 @@ static void fill_tm(i64 t, i32 *tm) {
     tm[3] = (i32)d, tm[4] = (i32)(m - 1), tm[5] = (i32)(y - 1900);
     i64 w = (days + 4) % 7;  // 1970-01-01 was a Thursday
     tm[6] = (i32)(w < 0 ? w + 7 : w);
-    tm[7] = (i32)(days - days_from_civil(y, 1, 1));
+    if (js_yday && y == -271821)  // Date.UTC(y, 0, 1) is NaN, and NaN | 0 is 0
+        tm[7] = 0;
+    else if (js_yday && y >= 0 && y <= 99)  // (date - Date.UTC(1900 + y, 0, 1)) / 864e5 | 0
+        tm[7] = (i32)((t - days_from_civil(1900 + y, 1, 1) * 86400) / 86400);
+    else
+        tm[7] = (i32)(days - days_from_civil(y, 1, 1));
 }
 
 EXPORT("_gmtime_js") i32 gmtime_js(i64 t, i32 *tm) {
-    fill_tm(t, tm);
+    if (t > DATE_LIMIT || t < -DATE_LIMIT) return 1;
+    fill_tm(t, tm, 1);
     return 0;
 }
 
 EXPORT("_localtime_js") i32 localtime_js(i64 t, i32 *tm) {
-    fill_tm(t, tm);
-    tm[8] = 0, tm[9] = 0;  // no DST, UTC
+    i32 off = host_localtime(t, tm);  // tm_isdst and tm_gmtoff; the exact offset east for the fields, INT_MIN: out of Date's range
+    if (off == (i32)0x80000000) return 1;
+    fill_tm(t + off, tm, 0);
     return 0;
 }
 
-static i64 tm_to_time(i32 *tm) {
+// Date.UTC(...): -1 for NaN; only tm_wday and tm_yday are written
+EXPORT("_timegm_js") i64 timegm_js(i32 *tm) {
     i64 y = (i64)tm[5] + 1900, mon = tm[4];
+    if (y >= 0 && y <= 99) y += 1900;
+    if (y < -1000000 || y > 1000000 || mon < -10000000 || mon > 10000000) return -1;
     y += mon >= 0 ? mon / 12 : -((11 - mon) / 12);
     mon = ((mon % 12) + 12) % 12;
-    i64 t = days_from_civil(y, mon + 1, 1) * 86400 + ((i64)tm[3] - 1) * 86400 + (i64)tm[2] * 3600 + (i64)tm[1] * 60 + tm[0];
-    fill_tm(t, tm);
-    return t;
-}
-EXPORT("_timegm_js") i64 timegm_js(i32 *tm) { return tm_to_time(tm); }
-EXPORT("_mktime_js") i64 mktime_js(i32 *tm) {
-    i64 t = tm_to_time(tm);
-    tm[8] = 0;
+    i64 t = (days_from_civil(y, mon + 1, 1) + tm[3] - 1) * 86400 + (i64)tm[2] * 3600 + (i64)tm[1] * 60 + tm[0];
+    if (t > DATE_LIMIT || t < -DATE_LIMIT) return -1;
+    i32 f[10];
+    fill_tm(t, f, 1);
+    tm[6] = f[6], tm[7] = f[7];
     return t;
 }
 
+EXPORT("_mktime_js") i64 mktime_js(i32 *tm) { return host_mktime(tm); }
+
 EXPORT("_tzset_js") void tzset_js(i32 *timezone, i32 *daylight, char *std_name, char *dst_name) {
-    *timezone = 0, *daylight = 0;
-    std_name[0] = 'U', std_name[1] = 'T', std_name[2] = 'C', std_name[3] = 0;
-    dst_name[0] = 'U', dst_name[1] = 'T', dst_name[2] = 'C', dst_name[3] = 0;
+    host_tzset(timezone, daylight, std_name, dst_name);
 }
 
 // ================================================================== owners, nodes, messages, failures
@@ -1521,39 +1570,98 @@ EXPORT("__syscall_recvmsg") i32 sc_recvmsg(i32 fd, u32 *msg, i32 flags, i32 a, i
     return 0;
 }
 
-// system(): there are no processes (and system(NULL) says there is no shell)
-EXPORT("_emscripten_system") i32 sc_system(const char *cmd) { return cmd ? -1 : 0; }
+// system(): there are no processes. Outside Node the JavaScript glue answers system(NULL) 0 (no shell) and ENOSYS to a
+// command; Pyodide on Node runs the command with a shell, which here would be a way out of the guest.
+EXPORT("_emscripten_system") i32 sc_system(const char *cmd) { return cmd ? -52 : 0; }
 
-// abort() and a failed assert() end the program: they were stubs that returned, so the program went on. The
-// messages are built from integer constants (no data section).
-static void err_write(const char *s) {
+// abort() and a failed assert() end the program with the message of the JavaScript glue (Aborted(...)) on stderr and a
+// trap. The text is built from integer constants (no data section).
+static void err_n(const void *s, i32 n) {
     u32 iov[2];
-    iov[0] = (u32)s, iov[1] = (u32)slen(s);
-    i32 n;
-    w_fd_write(2, iov, 1, &n);
+    iov[0] = (u32)s, iov[1] = (u32)n;
+    i32 w;
+    w_fd_write(2, iov, 1, &w);
+}
+static void err_lit(i32 n, u64 a, u64 b, u64 c, u64 d) {  // the first n bytes of a, b, c, d (little-endian)
+    u64 m[4];
+    m[0] = a, m[1] = b, m[2] = c, m[3] = d;
+    err_n(m, n);
 }
 EXPORT("__assert_fail") void sc_assert_fail(const char *cond, const char *file, i32 line, const char *func) {
-    (void)line, (void)func;
-    u64 m[3];
-    m[0] = 0x6f69747265737341ull, m[1] = 0x64656c696166206eull, m[2] = 0x000000000000203aull;  // "Assertion failed: " (the last chunk ends with the NUL of the string)
-    u8 head[24];
-    for (i32 k = 0; k < 3; k++)
-        for (i32 j = 0; j < 8; j++) head[k * 8 + j] = (u8)(m[k] >> (8 * j));
-    head[18] = 0;
-    err_write((const char *)head);
-    err_write(cond ? cond : (const char *)head + 18);
-    u8 sp[2];
-    sp[0] = ' ', sp[1] = 0;
-    err_write((const char *)sp);
-    err_write(file ? file : (const char *)sp + 1);
-    u8 nl[2];
-    nl[0] = '\n', nl[1] = 0;
-    err_write((const char *)nl);
+    err_lit(26, 0x28646574726f6241ull, 0x6f69747265737341ull, 0x64656c696166206eull, 0x203aull);  // "Aborted(Assertion failed: "
+    if (cond) err_n(cond, slen(cond));
+    err_lit(6, 0x203a7461202cull, 0, 0, 0);  // ", at: "
+    if (file) err_n(file, slen(file));
+    else err_lit(16, 0x206e776f6e6b6e75ull, 0x656d616e656c6966ull, 0, 0);  // "unknown filename"
+    err_lit(1, 0x2cull, 0, 0, 0);  // ","
+    char num[12];
+    i32 k = 12;
+    u32 v = line < 0 ? (u32)-line : (u32)line;
+    do num[--k] = (char)('0' + v % 10), v /= 10;
+    while (v);
+    if (line < 0) num[--k] = '-';
+    err_n(num + k, 12 - k);
+    err_lit(1, 0x2cull, 0, 0, 0);
+    if (func) err_n(func, slen(func));
+    else err_lit(16, 0x206e776f6e6b6e75ull, 0x6e6f6974636e7566ull, 0, 0);  // "unknown function"
+    err_lit(2, 0xa29ull, 0, 0, 0);                                         // ")\n"
     __builtin_trap();
 }
 EXPORT("_abort_js") void sc_abort_js(void) {
-    u64 m[2];
-    m[0] = 0x0a292874726f6261ull, m[1] = 0;  // "abort()\n"
-    err_write((const char *)m);
+    err_lit(10, 0x28646574726f6241ull, 0xa29ull, 0, 0);  // "Aborted()\n"
     __builtin_trap();
 }
+
+// ================================================================== signals and timers
+// raise() and kill(getpid()) call the handler the program set (Python's, which notes the signal); the host can post one
+// for Python too (Pyodide.interrupt: JavaScript's Py_EmscriptenSignalBuffer), and a timer the program armed
+// (setitimer, alarm) is checked when Python looks for signals, since there is no event loop here to fire it.
+EXPORT("__call_sighandler") void call_sighandler(u32 fp, i32 sig) { ((void (*)(i32))fp)(sig); }
+
+typedef struct {
+    u32 *cell;          // where the host posts a signal number
+    double deadline[3];  // ITIMER_REAL, VIRTUAL, PROF: when it fires (get_now's clock), 0: not armed
+} Sig;
+__asm__(".globaltype sig_state, i32\nsig_state:\n");
+static Sig *sigst(void) {
+    Sig *r;
+    __asm__ volatile("global.get sig_state\n\tlocal.set %0" : "=r"(r));
+    if (!r) {
+        r = (Sig *)calloc(1, sizeof(Sig));
+        r->cell = host_sigcell();
+        __asm__ volatile("local.get %0\n\tglobal.set sig_state" : : "r"(r));
+    }
+    return r;
+}
+
+EXPORT("_setitimer_js") i32 setitimer_js(i32 which, double timeout_ms) {
+    if ((u32)which > 2) return 0;
+    sigst()->deadline[which] = timeout_ms != 0 ? now_ms(1) + timeout_ms : 0;
+    if (timeout_ms != 0) {  // Python looks for signals only when the main module's byte says so (what setInterruptBuffer sets)
+        u64 nm[4];
+        nm[0] = 0x5243534d455f7950ull, nm[1] = 0x49535f4e45545049ull, nm[2] = 0x4e41485f4c414e47ull, nm[3] = 0x474e494c44ull;  // "Py_EMSCRIPTEN_SIGNAL_HANDLING"
+        u32 out[2], addr = dl_sym(0, (const char *)nm, 29, out);
+        if (out[0] == 1) *(u8 *)addr = 1;
+    }
+    return 0;
+}
+
+EXPORT("_Py_CheckEmscriptenSignals_Helper") i32 check_signals(void) {
+    Sig *s = sigst();
+    for (i32 which = 0; which < 3; which++) {
+        if (s->deadline[which] == 0) continue;
+        double now = now_ms(1);
+        if (now < s->deadline[which]) continue;
+        s->deadline[which] = 0;
+        u64 nm[3];
+        nm[0] = 0x70697263736d655full, nm[1] = 0x656d69745f6e6574ull, nm[2] = 0x74756full;  // "_emscripten_timeout" (libc's, re-arms an interval)
+        u32 out[2], slot = dl_sym(0, (const char *)nm, 19, out);
+        if (out[0] == 2) ((void (*)(i32, double))slot)(which, now);
+    }
+    i32 v = (i32)*s->cell;
+    *s->cell = 0;
+    return v;
+}
+
+// sys._emscripten_info.runtime
+EXPORT("_Py_emscripten_runtime") u32 runtime_name(void) { return host_runtime(); }

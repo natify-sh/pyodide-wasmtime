@@ -1,0 +1,18 @@
+struct result (3, 1)
+5 args with a double b'1.5'
+long double 4.0
+struct argument b'127.0.0.1'
+void function, default restype 0
+srand (void), default restype 0
+labs 5
+llabs 1099511627776
+fabs 2.5
+fabsf 2.5
+ldexp 24.0
+snprintf, no argtypes (16, b'0|(null)|0.000|0')
+snprintf, variadic (11, b'7|x|2.500|0')
+snprintf, variadic with a long double and a char (10, b'A|1.500000')
+an extra argument 5
+a missing argument 0
+more than 8 arguments (10, b'0123456789')
+memset (True, b'AAA\x00')

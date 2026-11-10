@@ -1,0 +1,21 @@
+int 7
+double 6.0
+float 1.5
+int64 25769803776
+uint64 18446744073709551615
+ptr 1234
+noargs 42
+void [9]
+char b'z'
+short -5
+ubyte 0
+structret EXC TypeError
+bigstruct arg 6.5
+bigstruct ret EXC TypeError
+longdouble 3.0
+many 7.5
+raises True
+raises-stderr True
+nested 12
+qsort [0, 1, 3, 4, 5, 9]
+bsearch 3

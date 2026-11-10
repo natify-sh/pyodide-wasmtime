@@ -2,7 +2,8 @@
 
 `func_imports` gives the function types of a module's imports (from wasmtime's `Module.imports`). `shim_wat` is the module that answers every `env` import of `pyodide.asm.wasm` for the
 dynamic build (what the adapter answers calls through a table; the rest are zero/null stubs, the JavaScript bridge),
-`TRAMP_WAT` is `_PyEM_TrampolineCall_JS` (what JavaScript's `wasmTable.get(f)(a, b, c)` does).
+`TRAMP_WAT` is `_PyEM_TrampolineCall_JS` (what JavaScript's `wasmTable.get(f)(a, b, c)` does: the ten types it knows are
+called in wasm, any other through the host's `loader.call_any`).
 """
 
 from __future__ import annotations
@@ -103,6 +104,8 @@ TRAMP_WAT = """(module
   (type $v3 (func (param i32 i32 i32)))
   (type $v4 (func (param i32 i32 i32 i32)))
   (import "env" "__indirect_function_table" (table $t 0 funcref))
+  ;; a table entry of any other type: the host calls it with its real type, as JavaScript does (loader.call_any)
+  (import "loader" "call_any" (func $any (param i32 i32 i32 i32) (result i32)))
   ;; wasmTable.get(f)(a, b, c) of JavaScript: extra arguments dropped, missing ones 0
   (func (export "_PyEM_TrampolineCall_JS") (param $f i32) (param $a i32) (param $b i32) (param $c i32) (result i32)
     (local $r funcref)
@@ -117,7 +120,7 @@ TRAMP_WAT = """(module
     (if (ref.test (ref $v1) (local.get $r)) (then (call_ref $v1 (local.get $a) (ref.cast (ref $v1) (local.get $r))) (return (i32.const 0))))
     (if (ref.test (ref $v4) (local.get $r)) (then (call_ref $v4 (local.get $a) (local.get $b) (local.get $c) (i32.const 0) (ref.cast (ref $v4) (local.get $r))) (return (i32.const 0))))
     (if (ref.test (ref $v0) (local.get $r)) (then (call_ref $v0 (ref.cast (ref $v0) (local.get $r))) (return (i32.const 0))))
-    unreachable)
+    (call $any (local.get $f) (local.get $a) (local.get $b) (local.get $c)))
   (func (export "table_grow") (param i32) (result i32) (table.grow $t (ref.null func) (local.get 0))))
 """
 

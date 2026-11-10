@@ -14,6 +14,7 @@ Two builds of the same sources, one `Pyodide` class:
 from __future__ import annotations
 
 import errno
+import importlib.metadata
 import json
 import logging
 import os
@@ -77,6 +78,85 @@ _s.stdout.flush(); _s.stderr.flush()
 open({rc!r}, "w").write(str(_rc))
 del _s, _m, _t, _rc
 """
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# JavaScript's numbers, for the calls that Emscripten's glue makes as `wasmTable.get(fn)(...args)` (ffi_call_js, the
+# trampoline): an i32 parameter takes a Number (a fraction is cut, a missing value is 0), an i64 only a BigInt, a float
+# a Number (a missing value is NaN); anything else is a TypeError, as in JavaScript.
+class _Big(int):
+    """A BigInt (what libffi's JavaScript reads for 64-bit values), as against a Number."""
+
+
+def _to_wasm(v: Any, t: str) -> Any:
+    if t == "i32":
+        if isinstance(v, _Big):
+            raise TypeError("Cannot mix BigInt and other types")
+        if isinstance(v, float):
+            v = int(v) if v == v and abs(v) != float("inf") else 0
+        v = (v or 0) & 0xFFFFFFFF
+        return v - (1 << 32) if v >> 31 else v
+    if t == "i64":
+        if not isinstance(v, _Big):
+            raise TypeError(f"Cannot convert {v} to a BigInt")
+        v &= 0xFFFFFFFFFFFFFFFF
+        return v - (1 << 64) if v >> 63 else v
+    if t in ("f32", "f64"):
+        if isinstance(v, _Big):
+            raise TypeError("Cannot mix BigInt and other types")
+        return float("nan") if v is None else float(v)
+    raise TypeError(f"a function parameter of type {t} cannot be called from a C signature")
+
+
+def _from_wasm(res: Any, results: list[str]) -> Any:
+    """A wasm result as the JavaScript value: None (undefined) for no result, a BigInt for an i64."""
+    if not results:
+        return None
+    if len(results) > 1:
+        return float("nan")
+    return _Big(res) if results[0] == "i64" else res
+
+
+def _num(v: Any, bits: int) -> int:
+    """A Number (or undefined) stored into an unsigned typed array of `bits`: cut, wrapped; a BigInt is a TypeError."""
+    if isinstance(v, _Big):
+        raise TypeError("Cannot mix BigInt and other types")
+    if isinstance(v, float):
+        v = int(v) if v == v and abs(v) != float("inf") else 0
+    return (v or 0) & ((1 << bits) - 1)
+
+
+def _days_from_civil(y: int, m: int, d: int) -> int:  # proleptic Gregorian (H. Hinnant)
+    y -= m <= 2
+    era = y // 400
+    yoe = y - era * 400
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    return era * 146097 + doe - 719468
+
+
+def _civil_from_days(z: int) -> tuple[int, int, int]:
+    z += 719468
+    era = z // 146097
+    doe = z - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    m = mp + (3 if mp < 10 else -9)
+    return yoe + era * 400 + (m <= 2), m, doy - (153 * mp + 2) // 5 + 1
+
+
+_DATE_LIMIT = 8_640_000_000_000  # JavaScript's Date holds +-8.64e15 ms
+
+
+def _js_make(year: int, mon: int, mday: int, h: int, mi: int, s: int) -> int | None:
+    """MakeDate(MakeDay(year, mon, mday), MakeTime(h, mi, s, 0)) of V8, in seconds; None is NaN. A year 0..99 is 19xx
+    (the Date constructor and Date.UTC do that), a year or month beyond V8's limits is NaN."""
+    if 0 <= year <= 99:
+        year += 1900
+    if not (-1_000_000 <= year <= 1_000_000 and -10_000_000 <= mon <= 10_000_000):
+        return None
+    year += mon // 12
+    return (_days_from_civil(year, mon % 12 + 1, 1) + mday - 1) * 86400 + h * 3600 + mi * 60 + s
 
 
 def data_dir(path: str | os.PathLike[str] | None = None) -> Path:
@@ -172,6 +252,12 @@ class Pyodide:
         self._exited: int | None = None
         self.ex: Any = None
         self.table: Any = None
+        # table slots of freed closures (ffi_closure_free_js), reused last in, first out
+        self.free_slots: list[int] = []
+        # table index -> (Func, parameter types, result types) of the functions called by ffi_call_js and the trampoline
+        self.functions: dict[int, tuple] = {}
+        self._cell = 0  # the word with a pending signal (_Py_CheckEmscriptenSignals_Helper), in the guest's memory
+        self._pending = 0  # a signal posted before the guest asked for the word
         self.memory: Any = None
         self.store: Any = None
 
@@ -446,6 +532,412 @@ class Pyodide:
         self._wr(ap, socket.inet_aton(ip))
         return 0
 
+    # ------------------------------------------------------------------ libffi's emscripten port: calls and closures
+    # What pyodide.asm.mjs does in ffi_call_js / ffi_prep_closure_loc_js, with the type of the function from the wasm
+    # table (a JavaScript call tolerates any signature: extra arguments are dropped, missing ones are undefined).
+    def _u32(self, a: int) -> int:
+        return struct.unpack("<I", self._rd(a, 4))[0]
+
+    def _unbox(self, t: int) -> tuple[int, int]:
+        """A struct of one member is that member (libffi's JS `unbox_small_structs`): (type pointer, type id)."""
+        while True:
+            tid = struct.unpack("<H", self._rd(t + 6, 2))[0]
+            if tid != 13:
+                return t, tid
+            first, second = struct.unpack("<II", self._rd(self._u32(t + 8), 8))
+            if first == 0:
+                return t, 0
+            if second != 0:
+                return t, 13
+            t = first
+
+    def _table_func(self, idx: int) -> Any:
+        f = self.table.get(self.cur[-1], idx)
+        if not isinstance(f, self._wt.Func):
+            raise TypeError(f"table entry {idx} is null")
+        return f
+
+    def _js_call(self, idx: int, args: list) -> Any:
+        """`wasmTable.get(idx)(...args)`: args are Numbers (int, float) or BigInts (_Big); the JavaScript result. What a
+        table entry is does not change (only a closure's slot does: `_ffi_prep`, `_ffi_free`), so its type is kept."""
+        ctx = self.cur[-1]
+        known = self.functions.get(idx)
+        if known is None:
+            f = self._table_func(idx)
+            ty = f.type(ctx)
+            known = self.functions[idx] = (f, [str(t) for t in ty.params], [str(t) for t in ty.results])
+        f, types, results = known
+        vals = [_to_wasm(args[k] if k < len(args) else None, t) for k, t in enumerate(types)]
+        return _from_wasm(f(ctx, *vals), results)
+
+    def _call_any(self, fn: int, a: int, b: int, c: int) -> int:
+        """`_PyEM_TrampolineCall_JS` for a table entry whose type the WAT trampoline does not know."""
+        return _to_wasm(self._js_call(fn, [a, b, c]), "i32")
+
+    def _ffi_call(self, cif: int, fn: int, rvalue: int, avalue: int) -> None:
+        ctx = self.cur[-1]
+        _abi, nargs, atp, rtp, _bytes, _flags, nfixed = struct.unpack("<7I", self._rd(cif, 28))
+        _rp, rid = self._unbox(rtp)
+        if rid == 15:
+            raise RuntimeError("complex ret marshalling nyi")
+        if rid > 15:
+            raise RuntimeError(f"Unexpected rtype {rid}")
+        sp = self.ex["__stack_pointer"]
+        orig = cur = sp.value(ctx)
+        args: list = []
+        ret_by_arg = rid in (4, 13)
+        if ret_by_arg:
+            args.append(rvalue)
+        aptrs = struct.unpack(f"<{nargs}I", self._rd(avalue, 4 * nargs)) if nargs else ()
+        atypes = struct.unpack(f"<{nargs}I", self._rd(atp, 4 * nargs)) if nargs else ()
+        for i in range(nfixed):
+            ap = aptrs[i]
+            tp, tid = self._unbox(atypes[i])
+            if tid in (1, 9, 10, 14):
+                args.append(self._u32(ap))
+            elif tid == 2:
+                args.append(struct.unpack("<f", self._rd(ap, 4))[0])
+            elif tid == 3:
+                args.append(struct.unpack("<d", self._rd(ap, 8))[0])
+            elif tid in (5, 6):
+                args.append(struct.unpack("<B" if tid == 5 else "<b", self._rd(ap, 1))[0])
+            elif tid in (7, 8):
+                args.append(struct.unpack("<H" if tid == 7 else "<h", self._rd(ap, 2))[0])
+            elif tid in (11, 12):
+                args.append(_Big(struct.unpack("<Q", self._rd(ap, 8))[0]))
+            elif tid == 4:
+                args.extend(_Big(x) for x in struct.unpack("<QQ", self._rd(ap, 16)))
+            elif tid == 13:
+                size, align = struct.unpack("<IH", self._rd(tp, 6))
+                cur = (cur - size) & ~(align - 1)
+                self._wr(cur, self._rd(ap, size))
+                args.append(cur)
+            else:
+                raise RuntimeError("complex marshalling nyi" if tid == 15 else f"Unexpected type {tid}")
+        if nfixed != nargs:  # the variadic part: a block on the stack, its address the last argument
+            structs = []
+            for i in range(nargs - 1, nfixed - 1, -1):
+                ap = aptrs[i]
+                tp, tid = self._unbox(atypes[i])
+                if tid in (5, 6):
+                    cur -= 1
+                    self._wr(cur, self._rd(ap, 1))
+                elif tid in (7, 8):
+                    cur = (cur - 2) & ~1
+                    self._wr(cur, self._rd(ap, 2))
+                elif tid in (1, 9, 10, 14, 2):
+                    cur = (cur - 4) & ~3
+                    self._wr(cur, self._rd(ap, 4))
+                elif tid in (3, 11, 12):
+                    cur = (cur - 8) & ~7
+                    self._wr(cur, self._rd(ap, 8))
+                elif tid == 4:
+                    cur = (cur - 16) & ~7
+                    self._wr(cur, self._rd(ap, 16))
+                elif tid == 13:
+                    cur = (cur - 4) & ~3
+                    structs.append((cur, ap, *struct.unpack("<IH", self._rd(tp, 6))))
+                else:
+                    raise RuntimeError("complex arg marshalling nyi" if tid == 15 else f"Unexpected argtype {tid}")
+            args.append(cur)
+            for target, ap, size, align in structs:
+                cur = (cur - size) & ~(align - 1)
+                self._wr(cur, self._rd(ap, size))
+                self._wr(target, struct.pack("<I", cur))
+        if cur == orig:  # nothing on the stack: stackRestore(cur) is a no-op
+            res = self._js_call(fn, args)
+        else:
+            sp.set_value(ctx, cur)
+            try:
+                res = self._js_call(fn, args)
+            finally:
+                sp.set_value(ctx, orig)
+        if ret_by_arg:
+            return
+        if rid in (1, 9, 10, 14):
+            self._wr(rvalue, struct.pack("<I", _num(res, 32)))
+        elif rid in (5, 6):
+            self._wr(rvalue, struct.pack("<B", _num(res, 8)))
+        elif rid in (7, 8):
+            self._wr(rvalue, struct.pack("<H", _num(res, 16)))
+        elif rid in (2, 3):
+            if isinstance(res, _Big):
+                raise TypeError("Cannot mix BigInt and other types")
+            x = float("nan") if res is None else float(res)
+            try:
+                self._wr(rvalue, struct.pack("<f" if rid == 2 else "<d", x))
+            except OverflowError:  # a float32 too large for it is an infinity
+                self._wr(rvalue, struct.pack("<f", float("inf") if x > 0 else float("-inf")))
+        elif rid in (11, 12):
+            if not isinstance(res, _Big):
+                raise TypeError(f"Cannot convert {res} to a BigInt")
+            self._wr(rvalue, struct.pack("<Q", res & 0xFFFFFFFFFFFFFFFF))
+
+    def _ffi_slot(self) -> int:
+        """getEmptyTableSlot(): a freed slot (the last freed first), else the table grown by one."""
+        if self.free_slots:
+            return self.free_slots.pop()
+        return self.table.grow(self.cur[-1], 1, self._wt.Val.funcref(None))
+
+    def _ffi_free(self, index: int) -> None:
+        self.functions.pop(index, None)
+        self.table.set(self.cur[-1], index, self._wt.Val.funcref(None))
+        self.free_slots.append(index)
+
+    def _ffi_prep(self, closure: int, cif: int, fun: int, user_data: int, codeloc: int) -> int:
+        """Puts a host function of the closure's signature into table slot `codeloc`; when the guest calls it, the
+        arguments are written to the stack as libffi's `avalue` and `fun(cif, ret, args, user_data)` is called."""
+        wt = self._wt
+        _abi, nargs, atp, rtp, _bytes, _flags, nfixed = struct.unpack("<7I", self._rd(cif, 28))
+        _rp, rid = self._unbox(rtp)
+        i32, i64, f32, f64 = (getattr(wt.ValType, n)() for n in ("i32", "i64", "f32", "f64"))
+        if rid == 15:
+            raise RuntimeError("complex ret marshalling nyi")
+        ret_by_arg = rid in (4, 13)
+        if ret_by_arg:
+            params, results, rk = [i32], [], "v"
+        elif rid == 0:
+            params, results, rk = [], [], "v"
+        elif rid in (1, 5, 6, 7, 8, 9, 10, 14):
+            params, results, rk = [], [i32], "i"
+        elif rid == 2:
+            params, results, rk = [], [f32], "f"
+        elif rid == 3:
+            params, results, rk = [], [f64], "d"
+        elif rid in (11, 12):
+            params, results, rk = [], [i64], "j"
+        else:
+            raise RuntimeError(f"Unexpected rtype {rid}")
+        atypes = struct.unpack(f"<{nargs}I", self._rd(atp, 4 * nargs)) if nargs else ()
+        info = []  # (type id, size, alignment) of each argument
+        for t in atypes:
+            tp, tid = self._unbox(t)
+            size, align = struct.unpack("<IH", self._rd(tp, 6))
+            info.append((tid, size, align))
+        for tid, _s, _a in info[:nfixed]:
+            if tid in (1, 5, 6, 7, 8, 9, 10, 14, 13):
+                params.append(i32)
+            elif tid == 2:
+                params.append(f32)
+            elif tid == 3:
+                params.append(f64)
+            elif tid == 4:
+                params += [i64, i64]
+            elif tid in (11, 12):
+                params.append(i64)
+            else:
+                raise RuntimeError("complex marshalling nyi" if tid == 15 else f"Unexpected argtype {tid}")
+        if nfixed < nargs:
+            params.append(i32)
+
+        def trampoline(caller: Any, *a: Any) -> Any:
+            self.cur.append(caller)
+            try:
+                return self._ffi_closure(closure, nargs, nfixed, info, ret_by_arg, rk, a)
+            finally:
+                self.cur.pop()
+
+        try:
+            func = wt.Func(self.store, wt.FuncType(params, results), trampoline, access_caller=True)
+        except Exception:  # JavaScript: convertJsFunctionToWasm failed
+            return 1
+        self.functions.pop(codeloc, None)
+        self.table.set(self.cur[-1], codeloc, func)
+        self._wr(closure + 4, struct.pack("<III", cif, fun, user_data))
+        return 0
+
+    def _ffi_closure(
+        self, closure: int, nargs: int, nfixed: int, info: list, ret_by_arg: bool, rk: str, a: tuple
+    ) -> Any:
+        ctx = self.cur[-1]
+        sp = self.ex["__stack_pointer"]
+        orig = cur = sp.value(ctx)
+        _index, cif, fun, user_data = struct.unpack("<IIII", self._rd(closure, 16))
+        j = 0
+        if ret_by_arg:
+            ret_ptr = a[0] & 0xFFFFFFFF
+            j = 1
+        else:
+            cur = (cur - 8) & ~7
+            ret_ptr = cur
+        cur -= 4 * nargs
+        args_ptr = cur
+        slots: dict[int, int] = {}
+
+        def put(c: int, size: int, align: int, data: bytes) -> None:
+            nonlocal cur
+            cur = (cur - size) & ~(align - 1)
+            slots[c] = cur
+            self._wr(cur, data)
+
+        for c in range(nfixed):
+            v = a[j]
+            j += 1
+            tid, size, align = info[c]
+            if tid in (5, 6):
+                put(c, 1, 4, struct.pack("<B", v & 0xFF))
+            elif tid in (7, 8):
+                put(c, 2, 4, struct.pack("<H", v & 0xFFFF))
+            elif tid in (1, 9, 10, 14):
+                put(c, 4, 4, struct.pack("<I", v & 0xFFFFFFFF))
+            elif tid == 13:
+                put(c, size, align, self._rd(v & 0xFFFFFFFF, size))
+            elif tid == 2:
+                put(c, 4, 4, struct.pack("<f", v))
+            elif tid == 3:
+                put(c, 8, 8, struct.pack("<d", v))
+            elif tid in (11, 12):
+                put(c, 8, 8, struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF))
+            elif tid == 4:
+                put(c, 16, 8, struct.pack("<QQ", v & 0xFFFFFFFFFFFFFFFF, a[j] & 0xFFFFFFFFFFFFFFFF))
+                j += 1
+        varargs = a[-1] & 0xFFFFFFFF if nfixed < nargs else 0
+        for c in range(nfixed, nargs):
+            tid, size, align = info[c]
+            if tid == 13:
+                put(c, size, align, self._rd(self._u32(varargs), size))
+            else:
+                slots[c] = varargs
+            varargs += 4
+        if nargs:
+            self._wr(args_ptr, struct.pack(f"<{nargs}I", *(slots[c] for c in range(nargs))))
+        sp.set_value(ctx, cur)
+        try:
+            self._table_func(fun)(ctx, *(_to_wasm(x, "i32") for x in (cif, ret_ptr, args_ptr, user_data)))
+        finally:
+            sp.set_value(ctx, orig)
+        if rk == "v":
+            return None
+        raw = self._rd(ret_ptr, 8)
+        if rk == "i":
+            return _to_wasm(struct.unpack("<I", raw[:4])[0], "i32")
+        if rk == "j":
+            return _to_wasm(_Big(struct.unpack("<Q", raw)[0]), "i64")
+        if rk == "d":
+            return struct.unpack("<d", raw)[0]
+        if rk == "f":
+            return struct.unpack("<f", raw[:4])[0]
+        return None
+
+    # ------------------------------------------------------------------ local time: Emscripten's JS date helpers
+    # `_localtime_js`, `_mktime_js` and `_tzset_js` read the time zone of the process through `Date` (the host's: its
+    # TZ and zoneinfo). Here the host's C library answers the offset at an instant (`time.localtime`), and the rest is
+    # what the JavaScript does with it: its rules for a local time that does not exist or happens twice, its errors
+    # beyond +-8.64e12 s, its habit of reading a year 0..99 as 19xx in `new Date(year, ...)`, and offsets in whole
+    # minutes (getTimezoneOffset cuts a seconds part of an old local mean time; the fields of the date keep it).
+    @staticmethod
+    def _gmtoff(t: int) -> int:
+        """Seconds east of UTC at the instant t."""
+        try:
+            return time.localtime(t).tm_gmtoff or 0
+        except (OverflowError, OSError, ValueError):  # a C library with a narrow time_t (Windows): the nearest it has
+            return time.localtime(min(max(t, 0), 32535215999)).tm_gmtoff or 0
+
+    def _minutes(self, t: int) -> int:
+        """-Date.getTimezoneOffset() at the instant t: minutes east, cut towards zero."""
+        return int(self._gmtoff(t) / 60)
+
+    def _utc_from_local(self, lt: int) -> int:
+        """The instant of a wall-clock time (seconds): of two (it happens twice) the earlier, of none (it is skipped)
+        the one with the offset from before the change; as ECMAScript's UTC(t)."""
+        before, after = self._gmtoff(lt - 86400), self._gmtoff(lt + 86400)
+        found = [u for u in {lt - before, lt - after} if self._gmtoff(u) == lt - u]
+        return min(found) if found else lt - before
+
+    def _year_minutes(self, year: int) -> tuple[int, int]:
+        """The offsets (minutes east) of `new Date(year, 0, 1)` and `new Date(year, 6, 1)`."""
+        out = []
+        for mon in (0, 6):
+            lt = _js_make(year, mon, 1, 0, 0, 0)
+            out.append(0 if lt is None else self._minutes(self._utc_from_local(lt)))
+        return out[0], out[1]
+
+    def _t_localtime(self, t: int, tm: int) -> int:
+        """tm_isdst and tm_gmtoff into the struct; the exact offset (s east) for the fields, or INT_MIN: an error."""
+        if abs(t) > _DATE_LIMIT:
+            return -(1 << 31)
+        off = self._gmtoff(t)
+        winter, summer = self._year_minutes(_civil_from_days((t + off) // 86400)[0])
+        minutes = int(off / 60)
+        # the offset of the summer (the larger one) is DST when the year has two
+        self._wr(tm + 32, struct.pack("<ii", int(summer != winter and minutes == max(winter, summer)), minutes * 60))
+        return off
+
+    def _t_mktime(self, tm: int) -> int:
+        sec, mi, hour, mday, mon, year, _wday, _yday, dst = struct.unpack("<9i", self._rd(tm, 36))
+        lt = _js_make(year + 1900, mon, mday, hour, mi, sec)
+        if lt is None:
+            return -1
+        u = self._utc_from_local(lt)
+        if abs(u) > _DATE_LIMIT:
+            return -1
+        guessed = self._minutes(u)
+        winter, summer = self._year_minutes(_civil_from_days((u + self._gmtoff(u)) // 86400)[0])
+        dst_off, std_off = max(winter, summer), min(winter, summer)
+        if dst < 0:
+            dst = int(summer != winter and dst_off == guessed)
+        elif (dst > 0) != (dst_off == guessed):
+            u += (guessed - (dst_off if dst > 0 else std_off)) * 60
+            if abs(u) > _DATE_LIMIT:
+                return -1
+        days, secs = divmod(u + self._gmtoff(u), 86400)
+        y, m, d = _civil_from_days(days)
+        yday = days - _days_from_civil(y, 1, 1)
+        fields = (secs % 60, secs // 60 % 60, secs // 3600, d, m - 1, y - 1900, (days + 4) % 7, yday)
+        self._wr(tm, struct.pack("<8i", *fields) + struct.pack("<i", dst))
+        return u
+
+    def _t_tzset(self, timezone: int, daylight: int, std_name: int, dst_name: int) -> None:
+        winter, summer = self._year_minutes(time.localtime().tm_year)
+
+        def zone(east: int) -> bytes:  # UTC-0200 for two hours east: the sign is of the offset as Date gives it (west)
+            return f"UTC{'-' if east <= 0 else '+'}{abs(east) // 60:02d}{abs(east) % 60:02d}".encode()[:16] + b"\0"
+
+        self._wr(timezone, struct.pack("<I", (-min(winter, summer) * 60) & 0xFFFFFFFF))
+        self._wr(daylight, struct.pack("<i", int(winter != summer)))
+        std, dst = (winter, summer) if summer > winter else (summer, winter)  # JS: summerOffset < winterOffset (west)
+        self._wr(std_name, zone(std))
+        self._wr(dst_name, zone(dst))
+
+    # ------------------------------------------------------------------ signals and the runtime's name
+    def _sigcell(self) -> int:
+        """The word that `_Py_CheckEmscriptenSignals_Helper` reads (JavaScript's Py_EmscriptenSignalBuffer)."""
+        if not self._cell:
+            self._cell = self.ex["malloc"](self.cur[-1], 4)
+            self._wr(self._cell, struct.pack("<I", self._pending))
+            self._pending = 0
+        return self._cell
+
+    def interrupt(self, signum: int = 2) -> None:
+        """Post signal `signum` (SIGINT: KeyboardInterrupt) to the guest's Python, as JavaScript's
+        ``Py_EmscriptenSignalBuffer[0] = 2`` does. Python takes it when it checks for signals: between bytecodes of the
+        running code, within a few dozen of them, not while it waits in a system call. Call it from a host function
+        that the guest is calling (a host callback, an ``fd_read`` hook, a socket operation) or between ``run()``
+        calls; the guest's memory is written, which is not safe from another thread while the guest runs."""
+        if not self._started:
+            raise RuntimeError("the guest is not running")
+        flag = self.instances[0]["exports"][
+            "Py_EMSCRIPTEN_SIGNAL_HANDLING"
+        ]  # a byte: Python looks for signals if it is 1
+        self._wr(flag.value(self.cur[-1]), b"\x01")
+        if self._cell:
+            self._wr(self._cell, struct.pack("<I", signum))
+        else:
+            self._pending = signum
+
+    def _runtime_name(self) -> int:
+        """`sys._emscripten_info.runtime`: a string from the guest's malloc, as stringToNewUTF8 gives."""
+        try:
+            wv = importlib.metadata.version("wasmtime")
+        except importlib.metadata.PackageNotFoundError:
+            wv = "unknown"
+        from . import __version__
+
+        b = f"wasmtime-py {wv} (pyodide-wasmtime {__version__})".encode() + b"\0"
+        p = self.ex["malloc"](self.cur[-1], len(b))
+        self._wr(p, b)
+        return p
+
     def _wrap(self, fn, nres: int):
         def f(caller, *args):
             self.cur.append(caller)
@@ -469,6 +961,16 @@ class Pyodide:
             "got_set": (self._dl_got_set, ft(3, 0)),
             "sym": (self._dl_sym, ft(4)),
             "call": (self._dl_call, ft(3)),
+            "ffi_call": (self._ffi_call, ft(4, 0)),
+            "ffi_prep": (self._ffi_prep, ft(5)),
+            "ffi_slot": (self._ffi_slot, ft(0)),
+            "ffi_free": (self._ffi_free, ft(1, 0)),
+            "call_any": (self._call_any, ft(4)),
+            "localtime": (self._t_localtime, wt.FuncType([wt.ValType.i64(), i32], [i32])),
+            "mktime": (self._t_mktime, wt.FuncType([i32], [wt.ValType.i64()])),
+            "tzset": (self._t_tzset, ft(4, 0)),
+            "sigcell": (self._sigcell, ft(0)),
+            "runtime": (self._runtime_name, ft(0)),
         }
         net = {
             "socket": (self._n_socket, ft(3)),
@@ -577,6 +1079,7 @@ class Pyodide:
 
             tl = wt.Linker(engine)
             tl.define(store, "env", "__indirect_function_table", self.table)
+            define_ops(tl)  # the trampoline's fallback for a type it does not know is a host operation
             tramp = tl.instantiate(store, wt.Module(engine, wt.wat2wasm(_wasm.TRAMP_WAT))).exports(store)
 
             al = wt.Linker(engine)
@@ -591,6 +1094,12 @@ class Pyodide:
             al.define(store, "aux", "table_grow", tramp["table_grow"])
             define_ops(al)
             adapter = al.instantiate(store, adapter_mod).exports(store)
+            for n, e in {
+                **adapter,
+                _wasm.TRAMP: tramp[_wasm.TRAMP],
+            }.items():  # dlsym finds them too, as in the fused module
+                if isinstance(e, wt.Func) and not n.startswith("__wasm") and n not in self.instances[0]["exports"]:
+                    self.instances[0]["exports"][n] = e
             table = shim["table"]  # fixup
             for n, k in fwd.items():
                 table.set(store, k, wt.Val.funcref(tramp[n] if n == _wasm.TRAMP else adapter[n]))
@@ -660,6 +1169,9 @@ class Pyodide:
         if self.root is not None:
             shutil.rmtree(self.root, ignore_errors=True)
             self.root = None
+        self.free_slots.clear()
+        self.functions.clear()
+        self._cell = self._pending = 0
         self._started = False
 
     def __enter__(self) -> Pyodide:
