@@ -1242,10 +1242,10 @@
  {
   "name": "_try_fcntl64",
   "class": "hook",
-  "verdict": "stub",
+  "verdict": "n/a",
   "gaps": [],
-  "evidence": "stub (harmless): __wrap___syscall_fcntl64 (main WAT func $264) falls through to __syscall_fcntl64 when this returns 0, which is what JS does when there are no sock_ops. probe: socket F_GETFL after setblocking(False) -> ours 2, real 2050 (that difference comes from adapter.c:520-555 __syscall_fcntl64, which ignores O_NONBLOCK on sockets, not from this import)",
-  "tested": "no"
+  "evidence": "A JavaScript hook of Emscripten's SOCKFS: `function _try_fcntl64(fd,cmd,arg,result){var sock=Module.SOCKFS.getSocket(fd);if(!sock?.sock_ops?.fcntl64)return false;...}`. Our sockets have no sock_ops, so the JS returns false too; the stub returns 0 and the libc wrapper falls through to __syscall_fcntl64, which handles sockets (F_GETFL/F_SETFL O_NONBLOCK, tested by test_the_flag_is_visible_through_fcntl_and_the_constructor).",
+  "tested": "tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor"
  },
  {
   "name": "_maybe_poll_async",
@@ -1258,10 +1258,10 @@
  {
   "name": "_try_shutdown",
   "class": "hook",
-  "verdict": "stub",
+  "verdict": "n/a",
   "gaps": [],
-  "evidence": "stub (harmless): __wrap___syscall_shutdown (func $266) falls through to __syscall_shutdown when this returns 0. probe: s.shutdown(SHUT_RDWR) on an unconnected socket -> ours OSError 53, real OSError 52; both come from the fallback syscall",
-  "tested": "no"
+  "evidence": "A JavaScript hook of Emscripten's SOCKFS: `function _try_shutdown(fd,how,result){var sock=Module.SOCKFS.getSocket(fd);if(!sock?.sock_ops?.shutdown)return false;...}`. Our sockets have no sock_ops; the stub returns 0 and the libc wrapper falls through to __syscall_shutdown, which shuts the host socket down (see that entry).",
+  "tested": "tests/test_sockets.py::test_poll_reports_a_hang_up"
  },
  {
   "name": "emscripten_runtime_keepalive_push",
@@ -1298,17 +1298,21 @@
  {
   "name": "_Py_CheckEmscriptenSignals_Helper",
   "class": "hook",
-  "verdict": "full",
-  "gaps": [],
-  "evidence": "adapter.c check_signals: reads and clears the word at the address the host gave (loader.sigcell); Pyodide.interrupt(signum=2) (_host.py) writes the signal number there and sets Python's Py_EMSCRIPTEN_SIGNAL_HANDLING byte (what setInterruptBuffer does). Python takes it between bytecodes (within ~50): SIGINT -> KeyboardInterrupt, another signal runs its handler. Tested from a host function (the net.pollv operation) the guest is calling; from another thread the write to the guest's memory is not safe (documented on interrupt())",
+  "verdict": "partial",
+  "gaps": [
+   "Pyodide.interrupt() writes the guest's memory through the Store, which is not thread-safe: it works from a host function the guest is calling (a poll, a callback) and between run() calls, not from another thread against a running busy loop (JS writes a SharedArrayBuffer from any thread)."
+  ],
+  "evidence": "adapter.c check_signals: reads and clears the word at the address the host gave (loader.sigcell); Pyodide.interrupt(signum=2) (_host.py) writes the signal number there and sets Python's Py_EMSCRIPTEN_SIGNAL_HANDLING byte (what setInterruptBuffer does). Python takes it between bytecodes (within ~50): SIGINT -> KeyboardInterrupt, another signal runs its handler. Tested from a host function (the net.pollv operation) the guest is calling; not from another thread (see gaps)",
   "tested": "tests/test_signals.py::test_interrupt_from_a_host_function"
  },
  {
   "name": "_PyEM_TrampolineCall_JS",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
-  "evidence": "_wasm.py TRAMP_WAT: the ten types it tests are called in wasm; any other type goes to loader.call_any (_host.py _call_any/_js_call: the callee's own type, arguments as Numbers, ToInt32 of the result). A null table slot is a TypeError = a trap, as JS throws. Probe via the export: sqrt(16), abs(-5), free, ldexp(3,2) -> 4 5 0 12 in both Pyodide and ours",
+  "verdict": "partial",
+  "gaps": [
+   "For a type outside its ten (loader.call_any) a wasm exception can not cross the Python host frame: the guest traps (the ten types are called in wasm and pass exceptions)."
+  ],
+  "evidence": "_wasm.py TRAMP_WAT: the ten types it tests are called in wasm; any other type goes to loader.call_any (_host.py _call_any/_js_call: the callee's own type, arguments as Numbers, ToInt32 of the result). A null table slot is an error, as JS throws. A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-wasmtime: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case). Probe via the export: sqrt(16), abs(-5), free, ldexp(3,2) -> 4 5 0 12 in both Pyodide and ours",
   "tested": "tests/test_ffi.py::test_the_trampoline_calls_a_type_it_does_not_know; tests/test_basic.py::test_hello (every call of a C method)"
  },
  {
@@ -1322,61 +1326,42 @@
  {
   "name": "__syscall_umask_js",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The mask is never stored: every call returns 022, so os.umask(0o77); os.umask(0o22) returns 0o22 where Pyodide returns 0o77.",
-   "The umask is never applied to created files (modes are ignored anyway)."
-  ],
-  "evidence": "adapter.c:1002; probe os.umask twice: ours ('0o22','0o22'), Pyodide ('0o22','0o77')",
-  "tested": "no (suite test_os notes 'os.umask is not supported')"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_umask: the mask is stored (MetaT.umask, & 0777) and the previous one returned; open_at/mkdirat/mknodat apply it to the recorded mode. os.umask(0o77), os.umask(0o22), os.umask(0o22) -> (0o22, 0o77, 0o22) in Pyodide and in ours. Note: Pyodide on Node forwards the mask to the host process (process.umask) and does not apply it to its in-memory files; ours applies it (Linux), by decision. The mask lives for the interpreter's lifetime.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files"
  },
  {
   "name": "__syscall_ioctl",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "FIONBIO is real now; FIONREAD on a socket gives ENOTTY (Emscripten answers it).",
-   "A bad descriptor gives ENOTTY instead of EBADF; any other request gives ENOTTY where Pyodide gives EINVAL (and handles TCGETS/TCSETS on ttys: none here)."
-  ],
-  "evidence": "adapter.c sc_ioctl: va points at the variable arguments, the flag is **va",
-  "tested": "tests/test_sockets.py::test_a_non_blocking_socket_does_not_block"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_ioctl, as Pyodide's JavaScript: a descriptor that is not open is EBADF; FIONBIO and FIONREAD on a socket (FIONREAD: the host's byte count, the next datagram's size for UDP), ENOTTY on a file (no ioctl op); the terminal requests (TCGETS... TIOCSWINSZ) ENOTTY: Pyodide answers them only for its emulated stdio ttys, and a WASI descriptor can not be asked about a terminal; every other request EINVAL. Probe on real Pyodide and ours: FIONREAD socket b'\\0\\0\\0\\0' both, file/TCGETS ENOTTY both, bad fd EBADF both, 0x5555 EINVAL both, isatty(0) False both.",
+  "tested": "tests/test_sockets.py::test_ioctl_answers_as_pyodide, tests/test_sockets.py::test_a_non_blocking_socket_does_not_block"
  },
  {
   "name": "getprotobyname",
   "class": "runtime",
-  "verdict": "stub",
-  "gaps": [
-   "Returns NULL for every name: socket.getprotobyname('tcp') raises OSError 'protocol not found' (JS returns 6; 'udp' 17). Honest failure, not a lie, but wrong."
-  ],
-  "evidence": "stub; probe getprotobyname('tcp'/'udp') -> ours OSError protocol not found; real 6 / 17",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c getprotobyname_ -> _host.py _n_protobyname: a struct protoent {name, aliases [NULL], proto} from the host's protocols table (tcp 6, udp 17, icmp 1...; tcp and udp even where the host has no table), built once per name and kept as Pyodide keeps its two; NULL for an unknown name. Pyodide: tcp/udp only. getprotobynumber is not an import (libc internal).",
+  "tested": "tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups"
  },
  {
   "name": "getaddrinfo",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "IPv4 only: getaddrinfo('::1',80) -> gaierror -2 (real AF_INET6); family AF_INET6 -> EAI_FAMILY (-6) instead of the JS answer.",
-   "ai_protocol is the hint's protocol (0), where JS defaults it to 6 for stream and 17 for dgram: getaddrinfo('127.0.0.1',80) -> proto 0 vs 6.",
-   "getaddrinfo(None, None) succeeds with 127.0.0.1:0 (JS EAI_NONAME).",
-   "Flags are not validated and AI_NUMERICHOST is ignored: ('localhost', flags=AI_NUMERICHOST) resolves (JS EAI_NONAME).",
-   "Socket type is not validated: SOCK_RAW is accepted (JS EAI_SOCKTYPE -7).",
-   "The service must be all digits: '80abc' -> EAI_SERVICE (JS parseInt gives 80).",
-   "At most one address is returned, and ai_canonname is never set.",
-   "Not a JS shortcoming but different: names go to real host DNS (localhost -> 127.0.0.1), where JS returns fake 172.29.x.x."
-  ],
-  "evidence": "adapter.c:1261-1285; probe: 16 getaddrinfo cases, diffs as listed (ours/real outputs saved in /tmp/x/ours1.txt and /tmp/x/real1.txt)",
-  "tested": "tests/test_checks.py::test_the_guests_own_tls (network, socket.create_connection)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c getaddrinfo_ -> _host.py _n_getaddrinfo: Pyodide's input checks in its order (EAI_NONAME for no node and no service, EAI_BADFLAGS, EAI_SOCKTYPE, EAI_FAMILY, parseInt of the service, EAI_SERVICE) and defaults (ai_socktype 1, ai_protocol 6 / 17); the answers come from the host's getaddrinfo, ALL addresses (IPv4 and IPv6), ai_canonname with AI_CANONNAME, AI_PASSIVE/NUMERICHOST/NUMERICSERV/ADDRCONFIG by the host, services by name from the host's table (and the same small table that is the guest's /etc/services). The list is one malloc'd block plus the first sockaddr, which is all freeaddrinfo frees (it does not follow ai_next). Differences from Pyodide on purpose: real addresses where its JS invents 172.29.x.x; IPv6 results (Pyodide's CPython has no IPv6, socket.has_ipv6 is False, so Python shows them as (10, raw bytes)); with socktype 0 one STREAM entry, as the JS (not glibc's three).",
+  "tested": "tests/test_sockets.py::test_getaddrinfo_lists_the_hosts_addresses, tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups, tests/test_sockets.py::test_ipv6_structures_are_written_and_read_right"
  },
  {
   "name": "getnameinfo",
   "class": "runtime",
-  "verdict": "enosys",
-  "gaps": [
-   "Always EAI_FAIL (-4): even numeric getnameinfo(('127.0.0.1',80), NI_NUMERICHOST|NI_NUMERICSERV) fails (JS ('127.0.0.1','80')), and socket.gethostbyaddr('127.0.0.1') raises herror."
-  ],
-  "evidence": "adapter.c:1287-1290; probe -> ours gaierror -4 x3, herror 3; real ('127.0.0.1','80'), NAMEREQD -> -2, gethostbyaddr ok",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c getnameinfo_ -> _host.py _n_getnameinfo: the host's getnameinfo on the sockaddr_in/in6 (scope id), NI_NUMERICHOST/NUMERICSERV/NAMEREQD/DGRAM by name, EAI_NONAME, EAI_FAMILY for a bad family or length, EAI_OVERFLOW when the buffer is too small. Pyodide: numeric only ('127.0.0.1', '80'); socket.gethostbyaddr('127.0.0.1') works through it in both.",
+  "tested": "tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups, tests/test_sockets.py::test_ipv6_structures_are_written_and_read_right"
  },
  {
   "name": "emscripten_set_up_async_input_device_js",
@@ -1407,9 +1392,11 @@
  {
   "name": "ffi_call_js",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
-  "evidence": "adapter.c ffi_call_js -> loader.ffi_call -> _host.py _ffi_call/_js_call (libffi's JS rules: unbox_small_structs, struct copies on the stack, the variadic block, nfixedargs; the callee's own wasm type; extra arguments dropped, missing ones undefined; a BigInt/Number mismatch is a TypeError = a trap, as JS throws); probes (both packagings, equal to Pyodide on Node): div, PyOS_double_to_string, sqrtl, inet_ntoa, free(p) with the default restype, srand, snprintf (plain and variadic, long double), PyLong_FromLong(5,6) and (), >8 arguments, labs/llabs/fabs/fabsf/ldexp/memset. FFI_STATIC=1 keeps the old generated dispatch for a build without a host",
+  "verdict": "partial",
+  "gaps": [
+   "A wasm exception (a C++ throw, a wasm setjmp/longjmp) can not cross the Python host frame of this operation: the guest traps (JS lets it pass through its frames)."
+  ],
+  "evidence": "adapter.c ffi_call_js -> loader.ffi_call -> _host.py _ffi_call/_js_call (libffi's JS rules: unbox_small_structs, struct copies on the stack, the variadic block, nfixedargs; the callee's own wasm type; extra arguments dropped, missing ones undefined; a BigInt/Number mismatch is an error, as JS throws); probes (both packagings, equal to Pyodide on Node): div, PyOS_double_to_string, sqrtl, inet_ntoa, free(p) with the default restype, srand, snprintf (plain and variadic, long double), PyLong_FromLong(5,6) and (), >8 arguments, labs/llabs/fabs/fabsf/ldexp/memset; A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-wasmtime: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case).",
   "tested": "tests/test_ffi.py::test_ctypes_calls_take_any_signature; tests/test_basic.py::test_ctypes_calls_with_floats_and_64_bit_values; tests/test_checks.py::test_openssl_through_ctypes"
  },
  {
@@ -1431,9 +1418,11 @@
  {
   "name": "ffi_prep_closure_loc_js",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
-  "evidence": "adapter.c ffi_prep_closure_loc_js -> loader.ffi_prep -> _host.py _ffi_prep/_ffi_closure: a host function of the closure's wasm signature (derived from the cif as the JS does) is put in the table slot codeloc; on a call it writes the arguments to the guest stack as avalue (struct copies, the variadic pointer), calls fun(cif, ret, args, user_data) and returns ret per the signature. Probes (both packagings, equal to Pyodide): CFUNCTYPE int/double/float/int64/uint64/pointer/no-arg/void/char/short/ubyte/struct-by-value argument/long double/10 arguments, qsort and bsearch comparators called by libc, a callback that raises, a callback inside a callback; cffi callback() from the wheel. Suite: test_ctypes.test_callbacks and test_ctypes.test_libc pass on fused and dynamic",
+  "verdict": "partial",
+  "gaps": [
+   "A wasm exception (a C++ throw, a wasm setjmp/longjmp) can not cross the Python host frame of this operation: the guest traps (JS lets it pass through its frames)."
+  ],
+  "evidence": "adapter.c ffi_prep_closure_loc_js -> loader.ffi_prep -> _host.py _ffi_prep/_ffi_closure: a host function of the closure's wasm signature (derived from the cif as the JS does) is put in the table slot codeloc; on a call it writes the arguments to the guest stack as avalue (struct copies, the variadic pointer), calls fun(cif, ret, args, user_data) and returns ret per the signature. Probes (both packagings, equal to Pyodide): CFUNCTYPE int/double/float/int64/uint64/pointer/no-arg/void/char/short/ubyte/struct-by-value argument/long double/10 arguments, qsort and bsearch comparators called by libc, a callback that raises, a callback inside a callback; cffi callback() from the wheel. Suite: test_ctypes.test_callbacks and test_ctypes.test_libc pass on fused and dynamic; A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-wasmtime: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case).; the wasmtime Funcs of closures are pooled per signature and reused (a Func is never freed before its store): 20000 create/free cycles keep the memory flat",
   "tested": "tests/test_ffi.py::test_ctypes_callbacks_of_every_kind; tests/test_ffi.py::test_cffi_callbacks; suite test_ctypes.test_callbacks, test_ctypes.test_libc"
  },
  {
@@ -1473,28 +1462,18 @@
   "class": "os",
   "verdict": "partial",
   "gaps": [
-   "F_DUPFD ignores its minimum number (fcntl(fd, F_DUPFD, 50) returns the lowest free).",
-   "F_GETLK/F_SETLK/F_SETLKW of this ABI are 12/13/14 but the code handles 6/7 (dead code): fcntl.lockf fails with EINVAL.",
-   "F_GETFD/F_SETFD return 0 for an invalid descriptor (Pyodide: EBADF).",
-   "F_DUPFD on a standard stream, a socket or a pipe is ENOSYS (no path to reopen).",
-   "F_GETFL/F_SETFL on a socket keep O_NONBLOCK now (fixed)."
+   "F_DUPFD/F_DUPFD_CLOEXEC are left to dup (minimum number not honoured; streams, sockets and pipes ENOSYS): the descriptor layer's work, not this step's."
   ],
-  "evidence": "adapter.c sc_fcntl64: va points at the variable arguments; F_GETFL over fd_fdstat_get, F_SETFL over fd_fdstat_set_flags",
-  "tested": "tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor"
+  "evidence": "adapter.c sc_fcntl64: EBADF for a closed descriptor for every command (Pyodide's getStreamFromFD); F_GETLK (12) reports F_UNLCK, F_SETLK/F_SETLKW (13, 14) are granted (one process): fcntl.lockf and flock work; F_GETFD/F_SETFD 0; F_GETFL/F_SETFL for files and sockets; other commands EINVAL. F_DUPFD is dup's (the descriptor layer).",
+  "tested": "tests/test_files.py::test_fcntl_locks_and_invalid_descriptors, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor"
  },
  {
   "name": "__syscall_openat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The mode is ignored: os.open(p, O_CREAT, 0o600) then stat gives 0o100644 (Pyodide 0o100600).",
-   "'..' above the guest root fails: os.stat('/..') and os.stat('..') at cwd '/' give EPERM (WASI sandbox escape); Linux and Pyodide treat it as '/'.",
-   "If cwd + relative path exceeds 1024 bytes, resolve() (211-235) silently keeps the relative path and resolves it against '/', not the cwd: a wrong file, not ENAMETOOLONG (code read, not probed).",
-   "O_SYNC/O_DSYNC/O_RSYNC, O_NOATIME and O_TMPFILE are dropped silently.",
-   "The path record that dup() uses is skipped silently for paths over 1024 bytes, so dup of such an fd gives ENOSYS."
-  ],
-  "evidence": "adapter.c:364-395 (resolve 211-269); probe: O_NOFOLLOW link ELOOP, dirfd-relative, O_DIRECTORY file ENOTDIR, dir O_WRONLY EISDIR, O_EXCL EEXIST all match; mode 0600 → ours 0o100644 / Pyodide 0o100600; stat('/..') → EPERM / 0o40777",
-  "tested": "tests/test_basic.py::test_files_in_the_guest, ::test_dup_scandir_fwalk_and_rmtree"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c open_at: the mode of O_CREAT (the variable argument) minus the umask is recorded for a file made now (checked with a stat before the open); an existing file with a recorded mode is opened only if that mode allows the access (EACCES, as Pyodide's mayOpen); a file made now needs the directory to allow write and search (dir_denies); the path record of dup() is malloc'd and has no length limit. The ABI's '..' above the root is clamped in resolve()/fixpath (stat('/..') is the root); cwd + relative paths are composed in growing buffers (no 1024-byte limit, no silent resolution against '/'). O_SYNC/O_DSYNC/O_RSYNC/O_NOATIME are no-ops in Pyodide as well. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: open mode, umask, chmod 0 + open -> EACCES, long paths match. '..' after a name is resolved physically (phys(): a path like /l/../../top with l -> a/b gives /top, as Linux; a leading chain of '..' from the cwd or the root is clamped lexically); a dirfd-relative path is left to WASI, and only a '..' out of the descriptor (which cap-std refuses) is walked from the descriptor's recorded path, if that path still names the same directory. dup() reopens the file without any permission check (open_at nocheck), as Linux. Out of memory is ENOMEM where a syscall can say it.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_long_paths_have_no_wrong_answer, tests/test_files.py::test_dotdot_after_a_symlink_is_physical, tests/test_files.py::test_dup_does_not_check_permissions"
  },
  {
   "name": "_tzset_js",
@@ -1515,45 +1494,34 @@
  {
   "name": "__syscall_faccessat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "amode is ignored: on a chmod 0 file, os.access(W_OK) and os.access(X_OK) are True (Pyodide False, False).",
-   "An invalid amode (0o10) is not EINVAL: it returns True (Pyodide False)."
-  ],
-  "evidence": "adapter.c:461-469; probe: access nope → False/False; W,X on 000 → (True,True)/(False,False); access mode 0o10 → True/False",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_faccessat: amode & ~7 is EINVAL; the recorded (or default) mode bits give EACCES as Pyodide's nodePermissions (any of the user/group/other bits, whoever asks); a missing path or an empty one is ENOENT. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chmod 0 file -> (R, W, X, F) = (False, False, False, True), amode 8 -> EINVAL.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_chdir",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Lexical, not physical: after chdir('/tmp/y/ln2') (ln2 → real/sub), getcwd() gives '/tmp/y/ln2' (Pyodide/Linux '/tmp/y/real/sub'), and chdir('..') goes to '/tmp/y' instead of '/tmp/y/real'.",
-   "Too long returns -36, which is EMULTIHOP in WASI numbering (ENAMETOOLONG is 37): os.chdir('/'+'a/'*600) raises EMULTIHOP."
-  ],
-  "evidence": "adapter.c:314-357; probe: chdir file ENOTDIR / nope ENOENT match; symlink getcwd ours '/tmp/y/ln2' vs '/tmp/y/real/sub'; long → EMULTIHOP vs ENOENT",
-  "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c phys() + sc_chdir: physical, an iterative readlink walk of the components (loop limit 40 -> ELOOP, '..' is the real parent), the target must be a directory (ENOTDIR) it may search (EACCES for a recorded mode without x); the path is not limited in length. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chdir through a link, chdir('..') after it, chdir('/'+'a/'*600) -> ENOENT, empty -> ENOENT match. Uses the same physical walk for '..' as the other path calls.",
+  "tested": "tests/test_files.py::test_chdir_is_physical, tests/test_files.py::test_long_paths_have_no_wrong_answer"
  },
  {
   "name": "__syscall_chmod",
   "class": "os",
-  "verdict": "stub",
-  "gaps": [
-   "Exported, returns 0 and does nothing. This is a lie: os.chmod(f, 0o751) then stat gives 0o100644 (Pyodide 0o100751), and os.chmod on a missing path succeeds (Pyodide ENOENT)."
-  ],
-  "evidence": "adapter.c:1009; probe: chmod → 0o100644 / 0o100751; chmod nope → None / ENOENT",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_chmod -> set_mode: the permission bits (& 07777) are recorded for the file the path names (links followed), for the interpreter's lifetime; a missing path is ENOENT. stat, access and open honour them. Not written to the host file (WASI has no chmod). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chmod 0o751, missing path, high bits match.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_fchownat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Any uid/gid other than 0/-1 gives EPERM; Pyodide (and Linux as root, the uid we report) succeed: os.chown(f, 1000, 1000).",
-   "Ownership is never recorded (Pyodide doesn't record it either)."
-  ],
-  "evidence": "adapter.c:1408-1417; probe: chown 1000 → EPERM / None; chown 0 and chown missing (ENOENT) match",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchownat -> set_owner: any uid/gid is accepted and recorded in the metadata table (-1 leaves one as it is) for the interpreter's lifetime, not written to the host file; a missing path is ENOENT; AT_SYMLINK_NOFOLLOW honoured. stat/fstat report the recorded uid/gid. (Pyodide accepts the call and records nothing; recording is the Linux behaviour and the decision.)",
+  "tested": "tests/test_files.py::test_chown_is_recorded_and_stat_shows_it"
  },
  {
   "name": "__syscall_dup",
@@ -1695,7 +1663,7 @@
   "class": "os",
   "verdict": "enosys",
   "gaps": [],
-  "evidence": "not exported; _wasm.py:51-56 returns -52, the same as Pyodide's JS (-52); select.epoll is absent in both builds (probe)",
+  "evidence": "not exported; _wasm.py stub_results returns -52 (ENOSYS) for an unanswered __syscall_*; Pyodide's JS is the same line: `var ___syscall_epoll_create1=flags=>-52` / `function ___syscall_epoll_ctl(epfd,op,fd,ev){...return-52}` / `function ___syscall_epoll_pwait(...){...return-52}`. select.epoll does not exist in either CPython (probe: AttributeError in both), selectors.DefaultSelector is PollSelector.",
   "tested": "no"
  },
  {
@@ -1703,7 +1671,7 @@
   "class": "os",
   "verdict": "enosys",
   "gaps": [],
-  "evidence": "not exported; -52, same as JS",
+  "evidence": "not exported; _wasm.py stub_results returns -52 (ENOSYS) for an unanswered __syscall_*; Pyodide's JS is the same line: `var ___syscall_epoll_create1=flags=>-52` / `function ___syscall_epoll_ctl(epfd,op,fd,ev){...return-52}` / `function ___syscall_epoll_pwait(...){...return-52}`. select.epoll does not exist in either CPython (probe: AttributeError in both), selectors.DefaultSelector is PollSelector.",
   "tested": "no"
  },
  {
@@ -1711,106 +1679,80 @@
   "class": "os",
   "verdict": "enosys",
   "gaps": [],
-  "evidence": "not exported; -52, same as JS",
+  "evidence": "not exported; _wasm.py stub_results returns -52 (ENOSYS) for an unanswered __syscall_*; Pyodide's JS is the same line: `var ___syscall_epoll_create1=flags=>-52` / `function ___syscall_epoll_ctl(epfd,op,fd,ev){...return-52}` / `function ___syscall_epoll_pwait(...){...return-52}`. select.epoll does not exist in either CPython (probe: AttributeError in both), selectors.DefaultSelector is PollSelector.",
   "tested": "no"
  },
  {
   "name": "__syscall_fchdir",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Only fds opened by openat and preopens work; fchdir(1) ends in ENOENT (musl's /proc fallback), not ENOTDIR as in Pyodide.",
-   "It uses the path recorded at open time, so a directory renamed since then gives a stale cwd.",
-   "Inherits chdir's lexical normalisation."
-  ],
-  "evidence": "adapter.c:359-362; probe: fchdir(dirfd) → /tmp/y/real both; fchdir(file) ENOTDIR both; fchdir(1) → ENOENT/ENOTDIR",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchdir: the path the descriptor was opened with (Pyodide: stream.path as well) through the same physical chdir; a stream or a socket is ENOTDIR, a closed descriptor EBADF, a file ENOTDIR. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match (fchdir(1) ENOTDIR, fchdir(5000) EBADF).",
+  "tested": "tests/test_files.py::test_chdir_is_physical"
  },
  {
   "name": "__syscall_fchmod",
   "class": "os",
-  "verdict": "stub",
-  "gaps": [
-   "Returns 0 and does nothing (a lie); os.fchmod(999, 0o600) succeeds (Pyodide EBADF)."
-  ],
-  "evidence": "adapter.c:1010; probe: fchmod bad → None / EBADF",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchmod: as chmod for a descriptor; EBADF for a closed one. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_fchmodat2",
   "class": "os",
-  "verdict": "stub",
-  "gaps": [
-   "Returns 0 and does nothing (a lie), even for a missing path."
-  ],
-  "evidence": "adapter.c:1011; not probed directly (os.chmod went through chmod; same code shape)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchmodat2: as chmod; AT_SYMLINK_NOFOLLOW (256) changes the link's own record, as Pyodide's JS does; a missing or empty path is ENOENT.",
+  "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
   "name": "__syscall_fchown32",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "uid/gid other than 0/-1 give EPERM where Pyodide succeeds."
-  ],
-  "evidence": "adapter.c:1419-1423; probe: fchown(999) → EBADF both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fchown32 -> set_owner: as fchownat for a descriptor; EBADF for a closed one. fstat reports the recorded owners.",
+  "tested": "tests/test_files.py::test_chown_is_recorded_and_stat_shows_it"
  },
  {
   "name": "__syscall_fdatasync",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "os.fdatasync(1) gives EBADF; Pyodide returns 0 for any valid stream."
-  ],
-  "evidence": "adapter.c:970-973; probe: read-only fd → None both; stdout → EBADF/None; 999 → EBADF both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fdatasync: EBADF for a closed descriptor; a standard stream or a socket succeeds (Pyodide); other descriptors go to WASI's fd_datasync (EINVAL/ENOTSUP and the EBADF of a read-only descriptor's missing right are success). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: fdatasync(1) -> None, (5000) -> EBADF, file, directory.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "__syscall_fstat64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Permission bits are made up: files 0644, dirs 0755, links 0777, whatever the real or chmod'ed mode.",
-   "stdout reports S_IFREG 0o100644; Pyodide 0o20666 (a character device). Python then treats stdout as a regular file.",
-   "An unknown WASI filetype becomes S_IFREG; st_rdev, st_uid and st_gid are always 0; st_dev is truncated to 32 bits."
-  ],
-  "evidence": "adapter.c:434-446, put_stat 272-292; probe: fstat(1) → 0o100644/0o20666; fstat(fd) after chmod 751 → 0o100644/0o100751; nlink/uid/blksize/ino match; socket → 0o140777",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree (indirect)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c put_stat/sc_fstat64: the S_IF* type from the WASI filetype (char, block, socket, symlink, directory, regular), the permission bits, uid and gid from the metadata table (defaults 0644/0755/0777), st_dev/st_ino from WASI (st_dev is 32 bits in this ABI: the two halves are folded, st_ino is the full 64 bits), a symlink's size is the length of the target it holds; fd 0-2 are 0o20666 character devices as Pyodide's fstat(1). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings. The guest's root directory has the default mode 0o40777, as Pyodide's.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_the_guest_root_is_0777"
  },
  {
   "name": "__syscall_stat64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "os.stat('') returns the stat of the root directory instead of ENOENT: resolve() turns an empty path into '.'.",
-   "Same made-up modes as fstat64.",
-   "'/..' gives EPERM."
-  ],
-  "evidence": "adapter.c:431, 294-303; probe: stat('') → stat_result(dir) / ENOENT; stat('/..') → EPERM / 0o40777",
-  "tested": "tests/test_basic.py::test_files_in_the_guest"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c stat_path/fx_lookup/put_stat: an empty path is ENOENT; '..' above the root is the root; modes, owners and types as fstat64. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings. The guest's root is 0o40777.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths"
  },
  {
   "name": "__syscall_newfstatat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "An empty path is treated as AT_EMPTY_PATH even without flag 0x1000, so fstatat(AT_FDCWD, \"\", 0) does fstat(-100) and gives EBADF instead of ENOENT.",
-   "Same made-up modes and '..'-escape EPERM as stat64."
-  ],
-  "evidence": "adapter.c:448-451; covered by the stat('') / scandir probes above; which of stat64/newfstatat os.stat('') reached was not traced",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree (fwalk)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_newfstatat: an empty path is ENOENT unless AT_EMPTY_PATH (0x1000), which stats the descriptor (or the cwd for AT_FDCWD); a relative path with '..' to a directory descriptor is made absolute (WASI refuses a '..' out of a descriptor); the rest as stat64/lstat64.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths"
  },
  {
   "name": "__syscall_lstat64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "os.lstat('') returns the root directory instead of ENOENT.",
-   "Made-up modes."
-  ],
-  "evidence": "adapter.c:432; probe: lstat('') → dir / ENOENT; lstat(link) → 0o120777 both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_lstat64 -> stat_path(follow 0): an empty path is ENOENT, link types and sizes as stored. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {
   "name": "__syscall_ftruncate64",
@@ -1831,14 +1773,10 @@
  {
   "name": "__syscall_getdents64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "lseek on a directory fd does not reset the per-fd WASI cookie, so rewinddir() then readdir() returns nothing; seekdir/telldir are ignored too.",
-   "The cookie table has 1024 entries: a directory fd ≥ 1024 gives EBADF.",
-   "After dup3 the target fd keeps a stale cookie (code read)."
-  ],
-  "evidence": "adapter.c:473-507; probe ctypes opendir/readdir/rewinddir/readdir: ours second listing [] / Pyodide ['.','..','e0','e1','e2']; listdir(fd) twice and scandir types match",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_getdents64 + x_fd_seek (fd_seek is routed through the adapter, WASI_ROUTED): lseek on a directory descriptor sets/reads the readdir cookie (rewinddir = SEEK_SET 0, seekdir/telldir use d_off); the cookie table grows with the descriptor number (no 1024 limit); dup3 resets the target's cookie. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: rewinddir/seekdir/telldir by musl's own code -> (7, 7, 4, 4) entries in both.",
+  "tested": "tests/test_files.py::test_directory_descriptors_seek_and_list_past_1024, tests/test_files.py::test_dup2_onto_a_directory_resets_its_listing"
  },
  {
   "name": "__syscall_getegid32",
@@ -1875,46 +1813,36 @@
  {
   "name": "__syscall_linkat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "AT_SYMLINK_FOLLOW (0x400) gives EINVAL from wasmtime; Linux follows the link.",
-   "Not reachable through os.link (absent in Pyodide's os); only ctypes. Pyodide's JS gives EMLINK for every link, so ours does more than the baseline."
-  ],
-  "evidence": "adapter.c:989-995; probe ctypes link: ours 0, nlink 2 / Pyodide EMLINK; link exists EEXIST / EMLINK; linkat FOLLOW EINVAL / EMLINK",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_linkat: AT_SYMLINK_FOLLOW is done here (phys() resolves the link, then the file is linked: wasmtime's own flag is EINVAL); other flags EINVAL. The directory of the new name must allow write and search (EACCES). A hard link to a directory is the host's EPERM. Ours really links where Pyodide's JS says EMLINK for every call (more than the baseline).",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "_emscripten_lookup_name",
   "class": "runtime",
-  "verdict": "partial",
-  "gaps": [
-   "On a resolve failure it returns 0, so C gethostbyname('nonexistent.invalid') succeeds with 0.0.0.0 instead of NULL. JS returns a fake 172.29.x.x, also a lie.",
-   "IPv4 only: '::1' -> 0.0.0.0, the same as JS."
-  ],
-  "evidence": "adapter.c:1255-1259; probe ctypes gethostbyname: localhost/invalid/10.1.2.3/::1 -> ours 127.0.0.1/0.0.0.0/10.1.2.3/0.0.0.0, real 172.29.1.0/172.29.2.0/10.1.2.3/0.0.0.0",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c lookup_name: the host resolves the IPv4 address (net.resolve). The libc caller (gethostbyname2_r, wasm func $17452 area) has NO failure path through this import: it stores the returned 4 bytes and reports success. Pyodide's JS never fails either (it makes up 172.29.x.x); ours returns INADDR_NONE (255.255.255.255) for a name the host can not resolve, which nothing connects to. socket.gethostbyname uses getaddrinfo and raises properly.",
+  "tested": "tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups"
  },
  {
   "name": "__syscall_mkdirat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The mode is ignored: os.mkdir(d, 0o700) then stat gives 0o40755 (Pyodide 0o40700)."
-  ],
-  "evidence": "adapter.c:921-928; probe: mkdir mode → 0o40755/0o40700; exists EEXIST and missing parent ENOENT match",
-  "tested": "tests/test_basic.py::test_files_in_the_guest"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_mkdirat: the mode minus the umask (& 01777) is recorded for the new directory; the parent must allow write and search (dir_denies, EACCES as Pyodide). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: mkdir(d, 0o700) -> 0o40700.",
+  "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files"
  },
  {
   "name": "__syscall_mknodat",
   "class": "os",
   "verdict": "partial",
   "gaps": [
-   "S_IFIFO/S_IFCHR/S_IFBLK/S_IFSOCK give ENOSYS (mkfifo fails); Pyodide's JS makes them (mknod chr succeeded).",
-   "Type 0 makes a regular file (as Linux), where Pyodide's JS gives EINVAL.",
-   "The mode is ignored."
+   "S_IFIFO/S_IFCHR/S_IFBLK/S_IFSOCK give ENOSYS (os.mkfifo fails); Pyodide's in-memory file system makes them. WASI preview1 has no mknod/mkfifo and wasmtime cannot make a node on the host."
   ],
-  "evidence": "adapter.c:1426-1434; probe ctypes: mknod reg ok both; mknod 0 → created / EINVAL; mknod chr → ENOSYS / 0; mkfifo → ENOSYS / -1",
-  "tested": "no"
+  "evidence": "adapter.c sc_mknodat: a regular file is made like open(O_CREAT|O_EXCL) with the mode and the umask recorded; a mode with no type is EINVAL (Pyodide's JS); FIFOs, character and block devices and sockets are ENOSYS: WASI preview1 and wasmtime have no call that makes them.",
+  "tested": "tests/test_files.py::test_mknod_makes_regular_files_only"
  },
  {
   "name": "_timegm_js",
@@ -1927,16 +1855,20 @@
  {
   "name": "_mktime_js",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
+  "verdict": "partial",
+  "gaps": [
+   "On a Windows host (a C library with a narrow time_t) an instant outside 0..32535215999 is answered with the zone offset of the nearest instant inside it; not tested there."
+  ],
   "evidence": "adapter.c mktime_js -> loader.mktime -> _host.py _t_mktime: Date(y, m, d, h, mi, s) with V8's limits and the 19xx rule, a time that does not exist or happens twice as ECMAScript's UTC(), the JS tm_isdst logic (dst < 0 guessed, a wrong flag shifts the time by the offsets' difference), -1 beyond the range. Probe: 23 tuples in 5 zones equal Pyodide",
   "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {
   "name": "_localtime_js",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
+  "verdict": "partial",
+  "gaps": [
+   "On a Windows host (a C library with a narrow time_t) an instant outside 0..32535215999 is answered with the zone offset of the nearest instant inside it; not tested there."
+  ],
   "evidence": "adapter.c localtime_js -> loader.localtime -> _host.py _t_localtime: the offset of the host's zone (time.localtime), tm_gmtoff and tm_isdst as the JS computes them (offsets in whole minutes, DST = the larger of the Jan 1/Jul 1 offsets), fields from the exact offset, error beyond +-8.64e12 s. The zone is the host process's (TZ, zoneinfo), as Date is Node's. Probe: tests/checks/time_local.py in UTC, Europe/Kyiv, America/New_York, Australia/Lord_Howe, Asia/Kolkata equals Pyodide",
   "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
@@ -1951,14 +1883,10 @@
  {
   "name": "__syscall_poll",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "POLLHUP, POLLERR and POLLPRI are never reported (a closed peer is POLLIN, then recv gives 0).",
-   "A file is always ready for what was asked (as before; so is stdin).",
-   "nfds is not bounded (a malloc of 12 bytes per entry)."
-  ],
-  "evidence": "adapter.c do_poll: one net.pollv call for all sockets with the timeout, POLLNVAL for an invalid descriptor, a ready file makes the sockets answer at once",
-  "tested": "tests/test_sockets.py::test_poll_waits_for_the_socket_that_gets_data, ::test_poll_times_out_on_idle_sockets, ::test_a_ready_file_does_not_wait_for_an_idle_socket, ::test_poll_reports_an_invalid_descriptor"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c do_poll -> _host.py _poll: one select.poll() call (select() where there is no poll) for all sockets with the timeout, revents POLLIN/PRI/OUT/ERR/HUP/NVAL as the host reports them (POLLOUT after a connect, POLLHUP after shutdown, POLLERR after a refused connect); nfds above MAXFD is EINVAL; a file is ready for what it is asked (Pyodide's pollOne: 5 for a stream without poll op) and an unopened descriptor is POLLNVAL.",
+  "tested": "tests/test_sockets.py::test_poll_waits_for_the_socket_that_gets_data, tests/test_sockets.py::test_poll_times_out_on_idle_sockets, tests/test_sockets.py::test_a_ready_file_does_not_wait_for_an_idle_socket, tests/test_sockets.py::test_poll_reports_an_invalid_descriptor, tests/test_sockets.py::test_poll_reports_a_hang_up, tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes"
  },
  {
   "name": "__syscall_pipe2",
@@ -1973,41 +1901,33 @@
  {
   "name": "__syscall_poll_nonblocking",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "As __syscall_poll with timeout 0."
-  ],
-  "evidence": "adapter.c sc_poll_nb = do_poll(..., 0)",
-  "tested": "tests/test_sockets.py (through select.poll(0) and select.select)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_poll_nb = do_poll(..., 0), see __syscall_poll.",
+  "tested": "tests/test_sockets.py::test_select_works_and_descriptors_are_small, tests/test_asyncio.py::test_a_selectors_echo_server_and_client_without_asyncio"
  },
  {
   "name": "__syscall_fadvise64",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Returns 0 for anything: os.posix_fadvise(999, …) succeeds (Pyodide EBADF); no ESPIPE for non-seekable fds."
-  ],
-  "evidence": "adapter.c:976-979; probe: fadvise bad → None / EBADF; valid fd → None both",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fadvise64: EBADF for a closed descriptor, ESPIPE for a standard stream, socket or character device (Pyodide's stream.seekable), else 0. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "__syscall_fallocate",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "mode is ignored: FALLOC_FL_KEEP_SIZE/PUNCH_HOLE are treated as a plain allocate (Pyodide gives EOPNOTSUPP for mode≠0).",
-   "No EINVAL for negative offset/len before WASI.",
-   "posix_fallocate(fd,0,100) through ctypes left the size at 0 (Pyodide 100); wasmtime's fd_allocate probably fails, but the return value could not be read (see the ffi_call_js bug)."
-  ],
-  "evidence": "adapter.c:964-968; probe ctypes posix_fallocate: ours size 0, ret garbage / Pyodide ret 0, size 100 (os.posix_fallocate absent in both)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fallocate, as Pyodide's JS: |offset|,|len| > 2^53 -> EFBIG, mode != 0 -> EOPNOTSUPP, negative -> EINVAL, closed fd EBADF, non-seekable ESPIPE, otherwise the size grows to offset+len if it is smaller (fd_filestat_set_size; EACCES if the recorded mode forbids writing, as Pyodide's ftruncate). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings (posix_fallocate through ctypes: mode is not reachable from Python).",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
   "name": "_emscripten_get_progname",
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c get_progname: 'python' cut to len-1 and always ended with a NUL (stringToUTF8); len <= 0 writes nothing. The name is not Node's script path: there is no script; 'python' is the honest program name here",
+  "evidence": "adapter.c get_progname: './this.program' (Pyodide's thisProgram when it is not run from a script file) cut to len-1 and always ended with a NUL (stringToUTF8); len <= 0 writes nothing",
   "tested": "tests/test_runtime.py::test_progname_is_cut_and_ended"
  },
  {
@@ -2031,18 +1951,16 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:453-459; probe: relative-link read, not-a-link EINVAL, missing ENOENT, bufsize 0 all match (absolute links cannot be made: symlinkat gap)",
-  "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
+  "evidence": "adapter.c sc_readlinkat: WASI's path_readlink; for a link made with an absolute target (symlinkat) the original string from the metadata table. Relative links, not-a-link EINVAL, missing ENOENT match Pyodide.",
+  "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored, tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
   "name": "__syscall_unlinkat",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Flags other than 0/AT_REMOVEDIR are not rejected: unlinkat(AT_FDCWD, f, 0x1) deletes the file (Pyodide EINVAL, file kept)."
-  ],
-  "evidence": "adapter.c:930-936; probe: unlink dir EISDIR and rmdir(dir_fd) match; bad flag → 0, file gone / EINVAL, file kept",
-  "tested": "tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_unlinkat: flags other than 0 and AT_REMOVEDIR (0x200) are EINVAL before anything is removed; the record of the last name of a file (or of a removed directory) is dropped, so a new file with the same inode gets its own; the parent directory must allow write and search (dir_denies, EACCES as Pyodide's mayDelete). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: unlinkat(f, 1) -> EINVAL, file kept. The record of an unlinked file stays while a descriptor opened by the adapter still holds the inode (fstat keeps the mode) and is dropped at the last close; a new file never inherits it.",
+  "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat, tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_an_unlinked_open_file_keeps_its_mode_until_the_last_close"
  },
  {
   "name": "__syscall_rmdir",
@@ -2057,46 +1975,44 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:940-946; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match",
-  "tested": "no"
+  "evidence": "adapter.c sc_renameat; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match; the record of a replaced file is dropped, and a link made with an absolute target is made again for its new directory. Renaming a directory makes every symlink with a stored absolute target under it again (relink_tree).",
+  "tested": "tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored, tests/test_files.py::test_a_renamed_directory_keeps_its_absolute_symlinks_pointing_at_the_same_file"
  },
  {
   "name": "_setitimer_js",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
+  "verdict": "partial",
+  "gaps": [
+   "A timer fires inside a busy Python loop (when Python looks for signals); JavaScript fires it from its event loop after the synchronous run, so never inside one run. Deliberate: otherwise the timer could not fire at all."
+  ],
   "evidence": "adapter.c setitimer_js: keeps a deadline per timer (ITIMER_REAL/VIRTUAL/PROF, the monotonic clock) and turns Python's signal checking on; check_signals fires an expired one by calling libc's _emscripten_timeout (which raises SIGALRM and re-arms an interval). Python has no setitimer/alarm in this build; ctypes setitimer and alarm reach it. JS fires the timer from its event loop, after the synchronous run (a busy loop never sees it); here a busy loop does",
   "tested": "tests/test_signals.py::test_itimer_delivers_sigalrm_when_python_looks_for_signals"
  },
  {
   "name": "__syscall_statfs64",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "os.statvfs('/') and shutil.disk_usage give ENOSYS; Pyodide returns made-up values (f_bsize 4096)."
-  ],
-  "evidence": "not exported; probe: statvfs → ENOSYS / 4096",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_statfs64 + _host.py _fs_statvfs (host operation fs.statvfs): the guest path is first proved through WASI (fx_lookup: sandboxed, so ENOENT/EACCES/EPERM come out exactly as for os.stat, and a link out of the sandbox is EPERM, never host data); only then does the adapter ask the host for the numbers of the PREOPEN that the path belongs to (the longest-prefix mount, as resolve() chooses it), naming it by its WASI descriptor: the host never receives a path of the guest. The host answers with os.statvfs of that preopen's folder; where os.statvfs does not exist (Windows) it uses shutil.disk_usage (f_bsize 4096, f_files and f_ffree are 0 there). Any host error is an errno, never a trap. Pyodide answers made-up numbers.",
+  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host, tests/test_files.py::test_statvfs_never_gives_the_host_a_path_from_the_guest, tests/test_files.py::test_the_preopen_of_a_path_picks_the_host_folder, tests/test_files.py::test_the_host_operation_has_no_trap_without_statvfs_or_on_any_error"
  },
  {
   "name": "__syscall_fstatfs64",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "os.fstatvfs gives ENOSYS; Pyodide gives values."
-  ],
-  "evidence": "not exported; probe: fstatvfs → ENOSYS / 4096",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_fstatfs64 + fs.statvfs: EBADF for a closed descriptor (fd_fdstat_get), else the numbers of the preopen that the path the descriptor was opened with belongs to (a stream, a socket or no known path: the guest's root); the host is given the preopen, never a path. Windows and errors as statfs64.",
+  "tested": "tests/test_files.py::test_statvfs_and_fstatvfs_come_from_the_host, tests/test_files.py::test_the_preopen_of_a_path_picks_the_host_folder"
  },
  {
   "name": "__syscall_symlinkat",
   "class": "os",
   "verdict": "partial",
   "gaps": [
-   "An absolute target is refused by wasmtime: os.symlink('/tmp/y/real/sub', link) gives EPERM (Pyodide succeeds). Relative targets work."
+   "A link in one preopen to an absolute target in another (a --mount) gives EXDEV, where Linux symlink(2) never fails that way. The reason is the platform's: wasmtime/cap-std refuses an ABSOLUTE target (EPERM) and cannot follow ANY link, even a relative one, from one preopen directory into another, so no target string stored in the host file can make the link work; making the link without a working target would be a dangling fake. (Links within one preopen, absolute or relative, work.)"
   ],
-  "evidence": "adapter.c:981-987; probe: absolute → EPERM / None; relative and EEXIST match",
-  "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys (relative only)"
+  "evidence": "adapter.c sc_symlinkat/rel_target: wasmtime refuses an absolute target (EPERM), so the link is made with the target relative to the link's real directory (phys()) and the original string is kept in the metadata table: readlink returns exactly what the program stored, lstat's size is its length, opening through the link reaches the same file; rename makes the link again for its new directory (relink), copytree(symlinks=True) round-trips. The directory of the new link must allow write and search (EACCES). A link and a target under different preopens (a --mount) cannot be expressed: EXDEV. Relative targets are stored as they are. Targets are stored relative to the link's real directory; a directory renamed later has the stored absolute links inside it made again (relink_tree, skipped when no such link exists).",
+  "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {
   "name": "emscripten_get_heap_max",
@@ -2125,12 +2041,12 @@
  {
   "name": "__syscall_utimensat",
   "class": "os",
-  "verdict": "stub",
+  "verdict": "partial",
   "gaps": [
-   "Returns 0 and does nothing (a lie): after os.utime(f, (1e9, 1e9)) mtime is unchanged (Pyodide 1000000000.0); os.utime on a missing path succeeds (Pyodide ENOENT). WASI has path_filestat_set_times. The suite skips test_utime*, so nothing catches it."
+   "WASI timestamps are unsigned nanoseconds since 1970 (u64): a time before 1970 or after the year 2554 is EINVAL, where Pyodide's JavaScript Date accepts it (os.utime(f, (-5, 10)) and (2**40, 10))."
   ],
-  "evidence": "adapter.c:1008; probe: utime → 1794291630.37 / 1e9; utime nope → None / ENOENT; utime ns → unchanged / 1234567000000",
-  "tested": "no"
+  "evidence": "adapter.c sc_utimensat: path_filestat_set_times / fd_filestat_set_times (a null or empty path is the descriptor, futimens), UTIME_NOW and UTIME_OMIT per time, AT_SYMLINK_NOFOLLOW, ENOENT for a missing path, EINVAL for a bad nanosecond. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match for ordinary times. (CPython's os.utime here goes through utimes(), so a time set from Python has microsecond precision.)",
+  "tested": "tests/test_files.py::test_utimensat_sets_the_times"
  },
  {
   "name": "emscripten_resize_heap",
@@ -2143,139 +2059,113 @@
  {
   "name": "__syscall_accept4",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "No server sockets. Pyodide's JS needs `ws` on Node."
-  ],
-  "evidence": "not exported; probe of bind/listen ENOSYS (accept is unreachable without listen)",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_accept4, _host.py _n_accept: the peer address is written to the sockaddr and its length; SOCK_NONBLOCK is kept, SOCK_CLOEXEC accepted, other flags EINVAL; a non-blocking listener without a pending connection is EAGAIN; the new descriptor is taken before accepting, so EMFILE leaves the connection queued. Pyodide: needs `ws` on Node. A non-blocking accept never waits on the host.",
+  "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_asyncio.py::test_an_asyncio_server_and_its_clients_in_one_guest, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
   "name": "__syscall_bind",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "socket().bind(...) gives ENOSYS, so socket.socketpair() (its fallback uses bind/listen/accept) gives ENOSYS, and asyncio.run()/SelectorEventLoop() fail with OSError 52."
-  ],
-  "evidence": "not exported; probe: bind → ENOSYS; socketpair → ENOSYS; asyncio.run → OSError(52); Pyodide: socketpair is fatal 'Cannot find module ws'",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_bind, _host.py _n_bind: sockaddr_in and sockaddr_in6 (scope id) read from the guest, errno of the host (EADDRINUSE...), a family that is not the socket's is EAFNOSUPPORT. SO_REUSEADDR is whatever the program set with setsockopt (real now, see __syscall_setsockopt_host). Pyodide: needs `ws` on Node. Probe: socket().bind(('127.0.0.1', 0)) in both packagings; real Pyodide: fatal 'Cannot find module ws' at listen.",
+  "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts"
  },
  {
   "name": "__syscall_connect",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "A non-blocking connect completes at once on the host (it can block there) and returns 0, never EINPROGRESS.",
-   "addrlen is ignored and the family is not checked against the socket."
-  ],
-  "evidence": "adapter.c sc_connect, _host.py _n_connect",
-  "tested": "tests/test_checks.py::test_the_guests_own_tls (network); tests/test_sockets.py"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_connect, _host.py _n_connect: sockaddr_in/in6 with the length checked; a non-blocking socket starts the connection and gets EINPROGRESS (completion: poll POLLOUT, then SO_ERROR), a blocking one waits; settimeout works through CPython's poll + SO_ERROR (ECONNREFUSED/ETIMEDOUT as the kernel says). Pyodide's connect needs `ws`.",
+  "tested": "tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes, tests/test_asyncio.py::test_asyncio_run_sleeps_and_talks_to_a_server_on_the_host"
  },
  {
   "name": "__syscall_getpeername",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Always an AF_INET sockaddr. For an AF_INET6 socket the host's socket.inet_aton(ip) is outside the try (_host.py:412) and would raise in the host function, i.e. a trap (not verified: the host here has no IPv6).",
-   "*lenp is read without a NULL check."
-  ],
-  "evidence": "adapter.c:1204-1222; probe: unconnected → ENOTCONN; connected → ('127.0.0.1', 47811)",
-  "tested": "tests/test_checks.py::test_the_guests_own_tls (network, via ssl)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_getpeername -> _host.py _n_name, as getsockname; an unconnected socket is ENOTCONN (the host's answer).",
+  "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_udp_has_addresses_in_both_directions"
  },
  {
   "name": "__syscall_getsockname",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Always AF_INET; IPv6 has the same suspected host trap as getpeername (not verified)."
-  ],
-  "evidence": "adapter.c:1223-1226; probe: unconnected ('0.0.0.0',0), connected 127.0.0.1",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_getsockname -> _host.py _n_name: the host writes a sockaddr_in or sockaddr_in6 (28 bytes, scope id) cut to the caller's length, *lenp = the real size; NULL pointers EFAULT. Probe: bound, connected, unbound, UDP.",
+  "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_sockaddr_translation_round_trips"
  },
  {
   "name": "__syscall_getsockopt",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Every option returns 0 with success (a lie): SO_RCVBUF 0; TCP_NODELAY 0 right after setting it to 1. Pyodide's JS gives ENOPROTOOPT for everything but SO_ERROR.",
-   "SO_TYPE is always SOCK_STREAM, even for UDP sockets.",
-   "If *optlen < 4 it returns 0 and writes nothing."
-  ],
-  "evidence": "adapter.c:1228-1234; probe: SO_TYPE tcp 1, udp 1; SO_RCVBUF 0; TCP_NODELAY (None, 0); SO_ERROR 0",
-  "tested": "tests/test_checks.py::test_the_guests_own_tls (network)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_getsockopt -> _host.py _n_getopt: the host's real value, found by NAME in a table of musl's option numbers (SOL_SOCKET, IP, TCP, IPV6 levels); SO_TYPE/SO_DOMAIN/SO_PROTOCOL in musl's numbers; SO_ERROR as the guest's errno; an option or level the table lacks is ENOPROTOOPT (Pyodide: ENOPROTOOPT for everything but SO_ERROR). What a program set with setsockopt is read back (TCP_NODELAY 1 after setting 1).",
+  "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes, tests/test_sockets.py::test_setsockopt_is_real"
  },
  {
   "name": "__syscall_listen",
   "class": "os",
-  "verdict": "enosys",
-  "gaps": [
-   "No server sockets (Pyodide on Node: fatal without `ws`)."
-  ],
-  "evidence": "not exported; probe: listen → ENOSYS",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_listen, _host.py _n_listen (a negative backlog is SOMAXCONN). Pyodide: fatal without `ws`.",
+  "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_errors_are_emscriptens_numbers"
  },
  {
   "name": "__syscall_recvfrom",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The source address is never written: on UDP, recvfrom gives no sender.",
-   "Only MSG_PEEK and MSG_DONTWAIT are honoured (MSG_WAITALL etc. ignored)."
-  ],
-  "evidence": "adapter.c sc_recvfrom: EAGAIN for a non-blocking socket or MSG_DONTWAIT without data (net.poll with timeout 0)",
-  "tested": "tests/test_sockets.py::test_a_non_blocking_socket_does_not_block, ::test_msg_dontwait"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_recvfrom -> _host.py _n_recvfrom: the sender's address is written (sockaddr_in/in6 and its length; 0 for a connected stream), MSG_PEEK, MSG_WAITALL, MSG_DONTWAIT, MSG_TRUNC; a datagram is read whole so that a short buffer truncates it as the kernel does. A non-blocking socket or MSG_DONTWAIT never waits on the host (a dropped datagram is EAGAIN); a huge length is clamped.",
+  "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_msg_dontwait, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
   "name": "__syscall_recvmsg",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "Only the first non-empty iovec is filled (recvmsg_into with several buffers fills one).",
-   "msg_name is not written (no sender address)."
-  ],
-  "evidence": "adapter.c sc_recvmsg: msg_controllen and msg_namelen are zeroed, ENOTSOCK is 57, EAGAIN as recvfrom",
-  "tested": "tests/test_sockets.py::test_recvmsg_returns_no_control_data"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_recvmsg -> _host.py _n_recvmsg: ALL iovecs are filled in order, msg_name/msg_namelen written, msg_flags carries MSG_TRUNC, msg_controllen stays 0 (no ancillary data on the host side), as Pyodide. iovlen above 1024 is EMSGSIZE, a bad iovec EFAULT, before anything is read.",
+  "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_recvmsg_returns_no_control_data, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
   "name": "__syscall_sendmsg",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "msg_name is ignored; control data (SCM_RIGHTS) is dropped silently.",
-   "Each iovec is a separate host send."
-  ],
-  "evidence": "adapter.c sc_sendmsg: ENOTSOCK is 57, EAGAIN as sendto",
-  "tested": "no"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_sendmsg -> _host.py _n_sendmsg: msg_name honoured, all iovecs joined in one send; control data (SCM_RIGHTS...) is EOPNOTSUPP, never dropped (no host primitive carries it). A non-blocking socket or MSG_DONTWAIT never waits on the host: a partial count, or EAGAIN.",
+  "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
   "name": "__syscall_sendto",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "The destination address is ignored: sendto on an unconnected UDP socket gives EDESTADDRREQ.",
-   "flags other than MSG_DONTWAIT are ignored (MSG_OOB is sent in-band)."
-  ],
-  "evidence": "adapter.c sc_sendto: EAGAIN when a non-blocking socket cannot take data",
-  "tested": "tests/test_sockets.py (send path through the peer fixture)"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_sendto -> _host.py _n_sendto: the destination sockaddr (in and in6) is honoured, MSG_* bits are translated by name (MSG_OOB, DONTROUTE, EOR, MORE; MSG_NOSIGNAL moot, DONTWAIT by the adapter), one the host lacks is EOPNOTSUPP; a non-blocking socket that cannot take data is EAGAIN. A non-blocking socket or MSG_DONTWAIT never waits on the host: a partial count, or EAGAIN.",
+  "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps, tests/test_sockets.py::test_errors_are_emscriptens_numbers"
  },
  {
   "name": "__syscall_shutdown",
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:1198-1202; probe: shutdown(SHUT_WR) then recv → b'Eq', b'' (Linux semantics; Pyodide's JS returns ENOSYS, so ours does more); non-socket → ENOTSOCK",
-  "tested": "no"
+  "evidence": "adapter.c sc_shutdown -> net.shutdown (the host's shutdown(2)); a non-socket is ENOTSOCK, an unopened descriptor EBADF; shutdown(SHUT_WR) then recv gives the rest and b'' (Linux semantics; Pyodide's JS has no shutdown).",
+  "tested": "tests/test_sockets.py::test_poll_reports_a_hang_up"
  },
  {
   "name": "__syscall_socket",
   "class": "os",
-  "verdict": "partial",
-  "gaps": [
-   "protocol is ignored; SOCK_RAW gives EAFNOSUPPORT instead of EPROTONOSUPPORT/EPERM.",
-   "At most MAXFD (1024) descriptors in all: a socket needs a free one (EMFILE).",
-   "AF_INET6 depends on the host and then meets the IPv4-only getsockname/getpeername."
-  ],
-  "evidence": "adapter.c sc_socket (a placeholder WASI descriptor, SOCK_NONBLOCK kept); the audit's earlier gaps (fd >= 4096, SOCK_NONBLOCK dropped) are fixed",
-  "tested": "tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, ::test_select_works_and_descriptors_are_small, ::test_many_sockets_can_be_opened_and_closed"
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "adapter.c sc_socket (a placeholder WASI descriptor, SOCK_NONBLOCK kept), _host.py _n_socket: AF_INET and AF_INET6 (the host's own answer if it has no IPv6: EAFNOSUPPORT), SOCK_STREAM/SOCK_DGRAM (other types ESOCKTNOSUPPORT, Pyodide: EINVAL), a protocol that does not fit the type EPROTONOSUPPORT (as Pyodide). Probe: fused and dynamic. Every host error is translated by name to Emscripten's errno (ENOTSUP/EOPNOTSUPP is 138), also the Windows WSAE* numbers (_host.py guest_errno); a net operation never raises into the wasm: EFAULT for a pointer outside the memory, EIO (logged) for the unforeseen.",
+  "tested": "tests/test_sockets.py::test_many_sockets_can_be_opened_and_closed, tests/test_sockets.py::test_select_works_and_descriptors_are_small, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_host_errors_are_translated_by_name_on_every_os, tests/test_sockets.py::test_the_net_wrapper_turns_every_exception_into_an_errno, tests/test_sockets.py::test_the_accessors_check_the_memory"
+ },
+ {
+  "name": "__syscall_setsockopt_host",
+  "class": "os",
+  "verdict": "full",
+  "gaps": [],
+  "evidence": "NOT in Pyodide's own import list: pyodide.asm.wasm has setsockopt as a libc stub with the system call inlined as 'returns 0' (func $17466; Emscripten's JavaScript has no setsockopt, so Pyodide ignores every setsockopt). The build (tools/patch_main.mjs, binaryen.js from npm, run by tools/build_data.sh before the exnref conversion) replaces that function's body with a call to this import and sets errno from a negative result. adapter.c sc_setsockopt -> _host.py _n_setopt: the option by NAME in the host's socket module, ENOPROTOOPT for one it has not; SO_REUSEADDR is not applied on a non-POSIX host (it means 'steal the port' there). Probe: TCP_NODELAY 0 -> set 1 -> reads 1, SO_KEEPALIVE and SO_REUSEADDR the same, in both packagings (before the patch: 0).",
+  "tested": "tests/test_sockets.py::test_setsockopt_is_real, tests/test_asyncio.py::test_an_asyncio_server_and_its_clients_in_one_guest"
  }
 ]

@@ -4,10 +4,15 @@ same scripts (tests/checks/ffi_*.py, cffi_callbacks.py)."""
 
 from __future__ import annotations
 
+import struct
 import zipfile
 from pathlib import Path
+from typing import Any
 
+import pytest
 from conftest import Guest, check_file, missing, work_dir
+
+from pyodide_wasmtime import Pyodide
 
 
 def lines(out: str) -> list[str]:
@@ -87,3 +92,109 @@ def test_cffi_callbacks(guest: Guest, tmp_path: Path) -> None:
     r = guest.run(check_file("cffi_callbacks.py"), None, "--site", str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert lines(r.stdout) == lines(check_file("cffi_callbacks.expected"))
+
+
+class FakeMemory:
+    """A guest memory of 4 KiB for the operations that read a cif: the host reads it as the guest left it."""
+
+    def __init__(self) -> None:
+        self.data = bytearray(4096)
+
+    def data_len(self, _store: object) -> int:
+        return len(self.data)
+
+    def read(self, _store: object, start: int, stop: int) -> bytes:
+        return bytes(self.data[start:stop])
+
+    def write(self, _store: object, data: bytes, start: int) -> None:
+        self.data[start : start + len(data)] = data
+
+
+def fake_host() -> Any:
+    from pyodide_wasmtime._host import Pyodide
+
+    py = Pyodide.__new__(Pyodide)
+    py.cur, py.memory = [None], FakeMemory()
+    py._wt = object()
+
+    class Stack:
+        def value(self, _ctx: object) -> int:
+            return 4000
+
+    py.ex = {"__stack_pointer": Stack()}
+    return py
+
+
+def test_pointers_of_the_operations_are_unsigned_and_checked() -> None:
+    """wasmtime passes an i32 as a signed number: a pointer above 2 GiB is negative. It is read as the address it is
+    (outside this memory: a GuestFault), never as an offset from the end of the memory."""
+    from pyodide_wasmtime._host import GuestFault
+
+    py = fake_host()
+    for call in (
+        lambda: py._ffi_call(-8, 0, 0, 0),
+        lambda: py._ffi_prep(0, -8, 0, 0, 0),
+        lambda: py._t_mktime(-40),
+        lambda: py._t_localtime(0, -40),
+        lambda: py._t_tzset(-4, 0, 0, 0),
+    ):
+        with pytest.raises(GuestFault):
+            call()
+
+
+def test_a_cif_from_the_guest_cannot_make_the_host_loop_or_copy_without_end() -> None:
+    from pyodide_wasmtime._host import GuestFault
+
+    py = fake_host()
+    mem = py.memory.data
+    mem[16 + 6 : 16 + 8] = (13).to_bytes(2, "little")  # an ffi_type (at 16) that is a struct ...
+    mem[16 + 8 : 16 + 12] = (32).to_bytes(4, "little")  # ... whose elements (at 32) are [itself, NULL]
+    mem[32:36] = (16).to_bytes(4, "little")
+    with pytest.raises(RuntimeError, match="too deep"):
+        py._unbox(16)
+    # a cif (abi, nargs, arg_types, rtype, bytes, flags, nfixedargs) whose argument types lie outside the memory
+    mem[64:92] = struct.pack("<7I", 0, 100, 2**31, 0, 0, 0, 100)
+    with pytest.raises(GuestFault):
+        py._ffi_call(64, 0, 0, 0)
+    mem[64:92] = struct.pack("<7I", 0, 5000, 0, 0, 0, 0, 5000)  # more arguments than a wasm function can have
+    with pytest.raises(RuntimeError, match="5000 arguments"):
+        py._ffi_call(64, 0, 0, 0)
+
+
+def test_a_failing_host_function_ends_the_interpreter_like_a_trap(flavor: str, capfd: Any) -> None:
+    """A BigInt where the callee wants a Number is a TypeError in JavaScript (fatal in Pyodide); here run() says so once
+    on stderr, returns 134 as for a trap, and the next run() starts a new interpreter."""
+    code = """
+import ctypes as c
+libc = c.CDLL(None)
+libc.llabs.argtypes = [c.c_int]
+libc.llabs.restype = c.c_longlong
+libc.llabs(-3)
+"""
+    with Pyodide(flavor) as py:
+        assert py.run(code) == 134
+        err = capfd.readouterr().err
+        assert "a host function failed, the guest is dead: TypeError: Cannot convert 4294967293 to a BigInt" in err
+        assert py.run("print('alive')") == 0
+    assert capfd.readouterr().out == "alive\n"
+
+
+def test_closures_reuse_their_wasmtime_functions(flavor: str) -> None:
+    """A wasmtime Func is never freed before its store: 20000 created and freed callbacks must not make 20000."""
+    import resource
+
+    code = """
+import ctypes as c
+CB = c.CFUNCTYPE(c.c_int, c.c_int)
+for i in range(20000):
+    f = CB(lambda x: x + 1)
+    assert f(i) == i + 1
+    del f
+"""
+    with Pyodide(flavor) as py:
+        assert py.run("pass") == 0
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        assert py.run(code) == 0
+        grown_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before
+        assert sum(len(v) for v in py.func_pool.values()) <= 2 and not py.live_funcs
+    assert grown_kb < 40_000  # it was 150 MB

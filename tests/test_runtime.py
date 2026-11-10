@@ -73,15 +73,15 @@ libc = c.CDLL(None)
 for n in (4, 1, 0, 20):
     buf = c.create_string_buffer(b"x" * 20)
     libc._emscripten_get_progname(buf, n)
-    print(n, buf.raw[:8])
+    print(n, buf.raw[:16])
 """
     r = guest.run(code)
     assert r.returncode == 0, r.stderr
     assert r.stdout.splitlines() == [
-        "4 b'pyt\\x00xxxx'",
-        "1 b'\\x00xxxxxxx'",
-        "0 b'xxxxxxxx'",
-        "20 b'python\\x00x'",
+        "4 b'./t\\x00xxxxxxxxxxxx'",
+        "1 b'\\x00xxxxxxxxxxxxxxx'",
+        "0 b'xxxxxxxxxxxxxxxx'",
+        "20 b'./this.program\\x00x'",
     ]
 
 

@@ -38,6 +38,9 @@ WASI("path_rename") i32 w_rename(i32 fd, const char *p, i32 n, i32 fd2, const ch
 WASI("fd_filestat_set_size") i32 w_fd_set_size(i32 fd, u64 size);
 WASI("path_symlink") i32 w_symlink(const char *old, i32 oldn, i32 fd, const char *new_, i32 newn);
 WASI("path_link") i32 w_link(i32 ofd, i32 oflags, const char *op, i32 on, i32 nfd, const char *np, i32 nn);
+WASI("path_filestat_set_times") i32 w_path_set_times(i32 fd, i32 lookup, const char *p, i32 n, u64 atim, u64 mtim, i32 fstflags);
+WASI("fd_filestat_set_times") i32 w_fd_set_times(i32 fd, u64 atim, u64 mtim, i32 fstflags);
+WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
 WASI("fd_allocate") i32 w_fd_allocate(i32 fd, u64 offset, u64 len);
 WASI("fd_tell") i32 w_fd_tell(i32 fd, u64 *offset);
 WASI("fd_seek") i32 w_fd_seek(i32 fd, i64 offset, i32 whence, u64 *newoffset);
@@ -85,6 +88,24 @@ LOADER("runtime") u32 host_runtime(void);   // a malloc'd string naming the runt
 #define EBADF 8
 #define ENOMEM 48
 #define MAXFD 1024
+// errno values of this ABI (WASI's numbering), for the file functions
+#define FE_ACCES 2
+#define FE_BADF 8
+#define FE_EXIST 20
+#define FE_FBIG 22
+#define FE_INVAL 28
+#define FE_LOOP 32
+#define FE_NOENT 44
+#define FE_PERM 63
+#define FE_NOSYS 52
+#define FE_NOTDIR 54
+#define FE_SPIPE 70
+#define FE_XDEV 75
+#define FE_OPNOTSUPP 138
+// the host's view of the files: statvfs of the host folder of a preopen (named by its WASI descriptor) -> 0, or -errno;
+// writes Emscripten's statfs64 (88 bytes). The host is never given a path of the guest.
+#define FS(n) __attribute__((import_module("fs"), import_name(n)))
+FS("statvfs") i32 fs_statvfs(i32 preopen_fd, u8 *buf);
 
 static i32 is_sock(i32 fd);  // a socket descriptor (the sockets section, at the end)
 static i32 sock_nb(i32 fd);
@@ -100,14 +121,29 @@ static inline u64 *state_get(void) {
 static inline void state_set(u64 *v) {
     __asm__ volatile("local.get %0\n\tglobal.set adapter_state" : : "r"(v));
 }
-static u64 *cookies(void) {  // per descriptor: the next fd_readdir cookie
-    u64 *s = state_get();
-    if (!s) {
-        s = (u64 *)malloc(MAXFD * 8);
-        for (i32 i = 0; i < MAXFD; i++) s[i] = 0;
-        state_set(s);
+// per descriptor: the next fd_readdir cookie (a table that grows with the descriptor numbers)
+typedef struct {
+    u32 cap;
+    u64 *v;
+} Ck;
+static u64 *ckp(i32 fd) {  // 0 when out of memory
+    Ck *c = (Ck *)state_get();
+    if (!c) {
+        c = (Ck *)calloc(1, sizeof(Ck));
+        if (!c) return 0;
+        state_set((u64 *)c);
     }
-    return s;
+    if ((u32)fd >= c->cap) {
+        u32 nc = c->cap ? c->cap : 256;
+        while (nc <= (u32)fd) nc *= 2;
+        u64 *nv = (u64 *)calloc(nc, 8);
+        if (!nv) return 0;
+        for (u32 i = 0; i < c->cap; i++) nv[i] = c->v[i];
+        if (c->v) free(c->v);
+        c->v = nv;
+        c->cap = nc;
+    }
+    return &c->v[fd];
 }
 
 static i32 slen(const char *p) {
@@ -150,10 +186,12 @@ static Pre *preopens(void) {
 
 // ---- the current directory (chdir): kept as an absolute path in one malloc'd block, its address in a wasm global.
 // A relative path against AT_FDCWD is joined to it into one of two buffers (rename and link resolve two at once).
-#define PATHMAX 1024
+// The cwd, the two path buffers and the path records of the open files are malloc'd and grow with the path: no length
+// limit of their own (the host's operating system has its own).
 typedef struct {
-    char cwd[PATHMAX];
-    char buf[2][PATHMAX];
+    char *cwd;
+    char *b[2];
+    u32 cap[2];
     i32 flip;
 } Cwd;
 __asm__(".globaltype cwd_state, i32\ncwd_state:\n");
@@ -162,10 +200,193 @@ static Cwd *cwdst(void) {
     __asm__ volatile("global.get cwd_state\n\tlocal.set %0" : "=r"(r));
     if (!r) {
         r = (Cwd *)calloc(1, sizeof(Cwd));
+        r->cwd = (char *)malloc(2);
         r->cwd[0] = '/';
+        r->cwd[1] = 0;
         __asm__ volatile("local.get %0\n\tglobal.set cwd_state" : : "r"(r));
     }
     return r;
+}
+static char *slot(i32 k, u32 need) {  // a path buffer of at least `need` bytes, or 0 (out of memory)
+    Cwd *C = cwdst();
+    if (C->cap[k] < need) {
+        char *nb = (char *)malloc(need);
+        if (!nb) return 0;
+        if (C->b[k]) free(C->b[k]);
+        C->b[k] = nb;
+        C->cap[k] = need;
+    }
+    return C->b[k];
+}
+static char *dupn(const char *s, u32 n) {  // a malloc'd copy of n bytes and a NUL, or 0
+    char *r = (char *)malloc(n + 1);
+    if (!r) return 0;
+    for (u32 i = 0; i < n; i++) r[i] = s[i];
+    r[n] = 0;
+    return r;
+}
+
+// ---- what WASI has no place for: permission bits, owners, the umask and the original target of a symlink are
+// session metadata kept here (like Pyodide's in-memory file system keeps them in its nodes), keyed by the file's
+// (st_dev, st_ino): a hash table in one malloc'd block, its address in a wasm global. They live for the interpreter's
+// lifetime and are not written to the host's file. A file with no record (it was there before the guest) gets the
+// defaults of Pyodide (regular 0644, directory 0755, symlink 0777, the guest's root 0777).
+// nrestrict counts the records whose mode forbids something (a file without read or write, a directory without read,
+// write or search): while it is 0 no permission check is needed and the calls do not look at the modes at all.
+typedef struct {
+    u64 dev, ino;
+    u32 mode, uid, gid;
+    u8 used;    // 0 free, 1 live, 2 deleted
+    u8 orphan;  // the file was unlinked while a descriptor of it is open: the record stays until the last close
+    u8 isdir, restr;
+    char *target;  // a symlink made with an absolute target: what the program stored (the link holds a relative one)
+} Meta;
+typedef struct {
+    u32 cap, fill, live, umask, ntarget, nrestrict, norphan;
+    u32 hasroot;
+    u64 rdev, rino;  // the guest's root directory
+    Meta *e;
+} MetaT;
+__asm__(".globaltype meta_state, i32\nmeta_state:\n");
+static MetaT *mt(void) {
+    MetaT *r;
+    __asm__ volatile("global.get meta_state\n\tlocal.set %0" : "=r"(r));
+    if (!r) {
+        r = (MetaT *)calloc(1, sizeof(MetaT));
+        r->umask = 022;
+        u64 fs[8];
+        if (!w_fd_filestat_get(PREOPEN, fs)) r->hasroot = 1, r->rdev = fs[0], r->rino = fs[1];
+        __asm__ volatile("local.get %0\n\tglobal.set meta_state" : : "r"(r));
+    }
+    return r;
+}
+static u32 mhash(u64 dev, u64 ino) {
+    u64 h = (dev * 0x9E3779B97F4A7C15ull) ^ (ino * 0xC2B2AE3D27D4EB4Full);
+    h ^= h >> 29;
+    return (u32)h;
+}
+static Meta *meta_find(u64 dev, u64 ino) {
+    MetaT *t = mt();
+    if (!t->cap) return 0;
+    u32 m = t->cap - 1;
+    for (u32 i = mhash(dev, ino) & m;; i = (i + 1) & m) {
+        Meta *e = &t->e[i];
+        if (e->used == 0) return 0;
+        if (e->used == 1 && e->dev == dev && e->ino == ino) return e;
+    }
+}
+static i32 meta_grow(MetaT *t) {  // rebuild without the deleted ones, at a size that keeps the load under a half; 0, or ENOMEM
+    u32 nc = t->cap ? t->cap : 256;
+    while (t->live * 2 >= nc) nc *= 2;
+    Meta *ne = (Meta *)calloc(nc, sizeof(Meta));
+    if (!ne) return ENOMEM;
+    for (u32 j = 0; j < t->cap; j++) {
+        Meta *o = &t->e[j];
+        if (o->used != 1) continue;
+        u32 i = mhash(o->dev, o->ino) & (nc - 1);
+        while (ne[i].used) i = (i + 1) & (nc - 1);
+        ne[i].dev = o->dev, ne[i].ino = o->ino, ne[i].mode = o->mode, ne[i].uid = o->uid, ne[i].gid = o->gid;
+        ne[i].used = 1, ne[i].orphan = o->orphan, ne[i].isdir = o->isdir, ne[i].restr = o->restr, ne[i].target = o->target;
+    }
+    if (t->e) free(t->e);
+    t->e = ne;
+    t->cap = nc;
+    t->fill = t->live;
+    return 0;
+}
+static void meta_notarget(MetaT *t, Meta *e) {
+    if (e->target) {
+        free(e->target);
+        e->target = 0;
+        t->ntarget--;
+    }
+}
+static void meta_setmode(MetaT *t, Meta *e, u32 mode) {
+    e->mode = mode;
+    u8 r = e->isdir ? (!(mode & 0444) || !(mode & 0222) || !(mode & 0111)) : (!(mode & 0444) || !(mode & 0222));
+    t->nrestrict += (u32)r - (u32)e->restr;
+    e->restr = r;
+}
+// a new or replaced record (no symlink target); 0 when out of memory
+static Meta *meta_put(u64 dev, u64 ino, u32 mode, u32 uid, u32 gid, u8 ft) {
+    MetaT *t = mt();
+    Meta *e = meta_find(dev, ino);
+    if (!e) {
+        if ((t->fill + 1) * 2 > t->cap && meta_grow(t)) return 0;
+        u32 m = t->cap - 1, i = mhash(dev, ino) & m;
+        while (t->e[i].used == 1) i = (i + 1) & m;
+        e = &t->e[i];
+        if (e->used == 0) t->fill++;
+        t->live++;
+        e->used = 1;
+        e->dev = dev;
+        e->ino = ino;
+        e->target = 0;
+        e->restr = 0;
+        e->orphan = 0;
+    }
+    if (e->orphan) e->orphan = 0, t->norphan--;
+    meta_notarget(t, e);
+    e->isdir = ft == 3;
+    e->uid = uid, e->gid = gid;
+    meta_setmode(t, e, mode);
+    return e;
+}
+static void meta_del(u64 dev, u64 ino) {
+    MetaT *t = mt();
+    Meta *e = meta_find(dev, ino);
+    if (!e) return;
+    meta_notarget(t, e);
+    if (e->orphan) t->norphan--;
+    t->nrestrict -= e->restr;
+    e->used = 2;
+    t->live--;
+}
+static u32 def_mode(u8 ft) { return ft == 3 ? 0755 : ft == 7 || ft == 5 || ft == 6 ? 0777 : ft == 2 || ft == 1 ? 0666 : 0644; }
+static u32 def_for(const u8 *fs) {  // the mode of a file with no record: Pyodide's defaults (its root directory is 0777)
+    MetaT *t = mt();
+    if (fs[16] == 3 && t->hasroot && *(const u64 *)fs == t->rdev && *(const u64 *)(fs + 8) == t->rino) return 0777;
+    return def_mode(fs[16]);
+}
+static u32 type_bits(u8 ft) {  // S_IF* of a WASI filetype
+    return ft == 3 ? 0040000 : ft == 7 ? 0120000 : ft == 2 ? 0020000 : ft == 1 ? 0060000 : ft == 5 || ft == 6 ? 0140000 : 0100000;
+}
+static Meta *meta_for(const u8 *fs) {  // the record of the file whose WASI filestat is fs, made from the defaults; 0: no memory
+    u64 dev = *(const u64 *)fs, ino = *(const u64 *)(fs + 8);
+    Meta *e = meta_find(dev, ino);
+    return e ? e : meta_put(dev, ino, def_for(fs), 0, 0, fs[16]);
+}
+// a file made now: its record is the mode asked, without the umask (if there is no memory for it the file has the defaults)
+static void meta_created(const u8 *fs, u32 mode, u32 keep) {
+    meta_put(*(const u64 *)fs, *(const u64 *)(fs + 8), mode & ~mt()->umask & keep, 0, 0, fs[16]);
+}
+// an object that is about to disappear (the last name of a file, or a directory)? -> its (dev, ino) in key
+static i32 meta_doomed(i32 fd, const char *p, i32 n, u64 *key) {
+    u64 fs[8];
+    if (!mt()->live || w_path_filestat_get(fd, 0, p, n, fs)) return 0;
+    key[0] = fs[0], key[1] = fs[1];
+    return *((u8 *)fs + 16) == 3 || fs[3] <= 1;
+}
+// May the name be made or removed in the directory that holds it? The directory's recorded mode needs write and search
+// (Pyodide's mayCreate / mayDelete, whoever asks). kind 1: a name to make (if it exists the call says EEXIST), 0: a name to
+// remove (if it is not there the call says ENOENT), 2: either (the destination of a rename). -> EACCES or 0
+static i32 dir_denies(i32 fd, const char *p, i32 n, i32 kind) {
+    if (!mt()->nrestrict) return 0;
+    u64 fs[8];
+    i32 missing = w_path_filestat_get(fd, 0, p, n, fs) != 0;
+    if (kind != 2 && missing != kind) return 0;
+    i32 e = n;
+    while (e > 1 && p[e - 1] == '/') e--;
+    i32 st = e;
+    while (st > 0 && p[st - 1] != '/') st--;  // the last name starts here
+    char dot[2];
+    dot[0] = '.', dot[1] = 0;
+    char *par = st ? dupn(p, (u32)st) : 0;
+    if (st && !par) return ENOMEM;
+    i32 err = w_path_filestat_get(fd, 1, par ? par : dot, st ? st : 1, fs);
+    if (par) free(par);
+    Meta *r = err ? 0 : meta_find(fs[0], fs[1]);
+    return r && (!(r->mode & 0222) || !(r->mode & 0111)) ? FE_ACCES : 0;
 }
 
 // ---- the open files: the absolute guest path and the open flags of each descriptor opened by openat, so that dup()
@@ -192,61 +413,183 @@ static const char *fd_base_path(i32 fd) {  // the path of a directory descriptor
         if (P->fd[k] == fd) return P->name[k];
     return 0;
 }
-// dirfd + path -> an absolute guest path in out (PATHMAX bytes); 0 if it can not be made
-static i32 abs_path(i32 dirfd, const char *path, char *out) {
-    const char *base = 0;
-    if (path[0] != '/') {
-        base = dirfd == AT_FDCWD ? cwdst()->cwd : fd_base_path(dirfd);
-        if (!base) return 0;
-    }
-    i32 k = 0;
-    if (base) {
-        for (const char *q = base; *q; q++) {
-            if (k >= PATHMAX - 2) return 0;
-            out[k++] = *q;
-        }
-        if (k == 0 || out[k - 1] != '/') out[k++] = '/';
-    }
-    for (const char *q = path; *q; q++) {
-        if (k >= PATHMAX - 1) return 0;
-        out[k++] = *q;
-    }
-    out[k] = 0;
-    return 1;
-}
+static char *absdup(i32 dirfd, const char *path);
 static void fd_forget(i32 fd) {
     if (fd >= 0 && fd < MAXFD && fds()->path[fd]) {
         free(fds()->path[fd]);
         fds()->path[fd] = 0;
     }
 }
+// is a descriptor (other than `skip`) that this adapter opened still open on the file (dev, ino)?
+static i32 fd_open_inode(u64 dev, u64 ino, i32 skip) {
+    Fds *F = fds();
+    for (i32 k = 0; k < MAXFD; k++) {
+        u64 fs[8];
+        if (k != skip && F->path[k] && !w_fd_filestat_get(k, fs) && fs[0] == dev && fs[1] == ino) return 1;
+    }
+    return 0;
+}
+// the last name of a file is gone: its record goes too, unless a descriptor still holds the file (an unlinked file keeps
+// its mode until the last close; its inode can not be reused before)
+static void meta_release(u64 dev, u64 ino) {
+    Meta *e = meta_find(dev, ino);
+    if (!e) return;
+    if (fd_open_inode(dev, ino, -1)) {
+        if (!e->orphan) e->orphan = 1, mt()->norphan++;
+    } else {
+        meta_del(dev, ino);
+    }
+}
+// a descriptor is about to be closed: if it held an unlinked file, drop the record when it was the last one
+static void meta_closing(i32 fd) {
+    u64 fs[8];
+    if (w_fd_filestat_get(fd, fs)) return;
+    Meta *e = meta_find(fs[0], fs[1]);
+    if (e && e->orphan && !fd_open_inode(fs[0], fs[1], fd)) meta_del(fs[0], fs[1]);
+}
+
+static i32 ncomp(const char *s) {  // the depth of an absolute path below the root
+    i32 n = 0;
+    for (i32 i = 0; s[i];) {
+        while (s[i] == '/') i++;
+        if (!s[i]) break;
+        i32 st = i;
+        while (s[i] && s[i] != '/') i++;
+        i32 l = i - st;
+        if (l == 2 && s[st] == '.' && s[st + 1] == '.') {
+            if (n) n--;
+        } else if (!(l == 1 && s[st] == '.')) {
+            n++;
+        }
+    }
+    return n;
+}
+static i32 has_dotdot(const char *s) {
+    for (i32 i = 0; s[i];) {
+        while (s[i] == '/') i++;
+        i32 st = i;
+        while (s[i] && s[i] != '/') i++;
+        if (i - st == 2 && s[st] == '.' && s[st + 1] == '.') return 1;
+    }
+    return 0;
+}
+// The path to resolve (the path itself when it needs nothing, else a buffer of ours):
+//  * a path relative to the cwd is made absolute (the cwd is kept here, WASI has none);
+//  * ".." is resolved by WASI physically, and that is right except where WASI refuses it: above the root (Linux: "/.." is "/")
+//    and out of a directory descriptor (WASI's sandbox is the descriptor). A chain of ".." that opens the path, from the
+//    cwd (a physical path) or the root, is a plain lexical pop and is clamped here; a ".." after a name may follow a symlink,
+//    so such a path is walked physically (phys(): readlink of every name) and the result is clamped at the real root;
+//  * a relative path with ".." to a directory descriptor is left to WASI, and walked physically from the path the
+//    descriptor was opened with only if WASI refuses it, and only if that path still names the same directory (a
+//    renamed directory is not guessed at: the refusal stands).
+static i32 phys(const char *base, const char *path, i32 follow, char **res);
+static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot);
+static i32 lead_dots_only(const char *s) {  // every ".." comes before the first name
+    i32 seen = 0;
+    for (i32 i = 0; s[i];) {
+        while (s[i] == '/') i++;
+        i32 st = i;
+        while (s[i] && s[i] != '/') i++;
+        i32 l = i - st;
+        if (l == 2 && s[st] == '.' && s[st + 1] == '.') {
+            if (seen) return 0;
+        } else if (l && !(l == 1 && s[st] == '.')) {
+            seen = 1;
+        }
+    }
+    return 1;
+}
+static const char *fixpath(i32 dirfd, const char *path) {
+    Cwd *C = cwdst();
+    i32 rel = path[0] != '/';
+    i32 dd = has_dotdot(path);
+    const char *base = 0;
+    i32 byfd = rel && dirfd != AT_FDCWD;
+    if (byfd) {
+        u64 fs[8], gs[8];
+        if (!dd || w_path_filestat_get(dirfd, 0, path, slen(path), fs) != FE_PERM) return path;
+        base = fd_base_path(dirfd);
+        char dot[2];
+        const char *bp;
+        i32 bn, bfd;
+        if (!base) return path;
+        bfd = resolve(AT_FDCWD, base, &bp, &bn, dot);
+        if (w_fd_filestat_get(dirfd, fs) || w_path_filestat_get(bfd, 1, bp, bn, gs) || fs[0] != gs[0] || fs[1] != gs[1]) return path;
+    } else if (rel) {
+        base = C->cwd;
+    }
+    i32 compose = rel && !byfd && !(C->cwd[0] == '/' && C->cwd[1] == 0);
+    if (!compose && !dd) return path;
+    if (dd && (byfd || !lead_dots_only(path))) {
+        char *r;
+        if (!phys(base, path, 0, &r)) {
+            u32 n = (u32)slen(r);
+            char *o = slot(C->flip, n + 1);
+            if (o) {
+                C->flip ^= 1;
+                for (u32 i = 0; i <= n; i++) o[i] = r[i];
+                free(r);
+                return o;
+            }
+            free(r);
+        }
+        if (byfd) return path;
+    }
+    i32 depth = base ? ncomp(base) : 0;
+    u32 bl = compose ? (u32)slen(base) : 0;
+    char *o = slot(C->flip, bl + (u32)slen(path) + 2);
+    if (!o) return path;
+    C->flip ^= 1;
+    i32 k = 0;
+    if (compose) {
+        for (u32 i = 0; i < bl; i++) o[k++] = base[i];
+        if (k == 0 || o[k - 1] != '/') o[k++] = '/';
+    }
+    for (i32 i = 0; path[i];) {
+        while (path[i] == '/') o[k++] = path[i++];
+        if (!path[i]) break;
+        i32 st = i;
+        while (path[i] && path[i] != '/') i++;
+        i32 l = i - st;
+        if (l == 2 && path[st] == '.' && path[st + 1] == '.') {
+            if (depth == 0) {  // above the root: it stays there
+                if (path[i] == '/') i++;
+                continue;
+            }
+            depth--;
+        } else if (!(l == 1 && path[st] == '.')) {
+            depth++;
+        }
+        for (i32 j = 0; j < l; j++) o[k++] = path[st + j];
+    }
+    o[k] = 0;
+    return o;
+}
+// an absolute path (malloc'd, ".." resolved as above), or 0: the directory descriptor has no known path, or no memory
+static char *absdup(i32 dirfd, const char *path) {
+    if (path[0] == '/') {
+        const char *f = fixpath(dirfd, path);
+        return dupn(f, (u32)slen(f));
+    }
+    const char *base = dirfd == AT_FDCWD ? cwdst()->cwd : fd_base_path(dirfd);
+    if (!base) return 0;
+    u32 bl = (u32)slen(base), pl = (u32)slen(path);
+    char *t = (char *)malloc(bl + pl + 2);
+    if (!t) return 0;
+    for (u32 i = 0; i < bl; i++) t[i] = base[i];
+    u32 k = bl;
+    if (k == 0 || t[k - 1] != '/') t[k++] = '/';
+    for (u32 i = 0; i <= pl; i++) t[k + i] = path[i];
+    const char *f = fixpath(AT_FDCWD, t);
+    char *r = dupn(f, (u32)slen(f));
+    free(t);
+    return r;
+}
 
 // A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
 static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot) {
     i32 fd = dirfd;
-    if (path[0] != '/' && dirfd == AT_FDCWD) {  // relative to the cwd: make it absolute
-        Cwd *C = cwdst();
-        if (!(C->cwd[0] == '/' && C->cwd[1] == 0)) {
-            char *o = C->buf[C->flip];
-            i32 k = 0, ok = 1;
-            for (const char *q = C->cwd; *q; q++) {
-                if (k >= PATHMAX - 2) { ok = 0; break; }
-                o[k++] = *q;
-            }
-            if (ok) {
-                o[k++] = '/';
-                for (const char *q = path; *q; q++) {
-                    if (k >= PATHMAX - 1) { ok = 0; break; }
-                    o[k++] = *q;
-                }
-            }
-            if (ok) {
-                o[k] = 0;
-                C->flip ^= 1;
-                path = o;
-            }
-        }
-    }
+    path = fixpath(dirfd, path);
     if (path[0] == '/' || dirfd == AT_FDCWD) {
         Pre *P = preopens();
         i32 best = -1, bl = -1;
@@ -282,35 +625,46 @@ static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char
     return fd;
 }
 
-// WASI filestat (64 bytes) -> Emscripten struct stat (96 bytes)
+// WASI filestat (64 bytes) -> Emscripten struct stat (96 bytes): the type from the WASI filetype, the permission bits
+// and owners from the record (or the defaults). st_dev is 32 bits in this ABI: the two halves are folded.
 static void put_stat(u8 *dst, const u8 *fs) {
     u64 dev = *(const u64 *)(fs + 0), ino = *(const u64 *)(fs + 8);
     u8 ft = fs[16];
     u64 nlink = *(const u64 *)(fs + 24), size = *(const u64 *)(fs + 32);
-    u64 at = *(const u64 *)(fs + 40), mt = *(const u64 *)(fs + 48), ct = *(const u64 *)(fs + 56);
-    u32 mode = ft == 3 ? 0040755 : ft == 4 ? 0100644 : ft == 7 ? 0120777 : ft == 2 ? 0020666 : ft == 1 ? 0060666 : 0100644;
+    u64 at = *(const u64 *)(fs + 40), mtm = *(const u64 *)(fs + 48), ct = *(const u64 *)(fs + 56);
+    Meta *r = meta_find(dev, ino);
+    u32 mode = type_bits(ft) | (r ? r->mode : def_for(fs));
+    if (ft == 7 && r && r->target) size = (u64)slen(r->target);  // a symlink's size is the length of its target
     for (i32 i = 0; i < 96; i++) dst[i] = 0;
-    *(u32 *)(dst + 0) = (u32)dev;
+    *(u32 *)(dst + 0) = (u32)dev ^ (u32)(dev >> 32);
     *(u32 *)(dst + 4) = mode;
     *(u32 *)(dst + 8) = (u32)nlink;
+    *(u32 *)(dst + 12) = r ? r->uid : 0;
+    *(u32 *)(dst + 16) = r ? r->gid : 0;
     *(i64 *)(dst + 24) = (i64)size;
     *(u32 *)(dst + 32) = 4096;
     *(u32 *)(dst + 36) = (u32)((size + 511) / 512);
     *(i64 *)(dst + 40) = (i64)(at / 1000000000ull);
     *(u32 *)(dst + 48) = (u32)(at % 1000000000ull);
-    *(i64 *)(dst + 56) = (i64)(mt / 1000000000ull);
-    *(u32 *)(dst + 64) = (u32)(mt % 1000000000ull);
+    *(i64 *)(dst + 56) = (i64)(mtm / 1000000000ull);
+    *(u32 *)(dst + 64) = (u32)(mtm % 1000000000ull);
     *(i64 *)(dst + 72) = (i64)(ct / 1000000000ull);
     *(u32 *)(dst + 80) = (u32)(ct % 1000000000ull);
     *(u64 *)(dst + 88) = ino;
 }
 
-static i32 stat_path(i32 dirfd, const char *path, void *buf, i32 follow) {
-    u64 fs[8];
+// the WASI filestat of dirfd + path: an empty path is ENOENT (only AT_EMPTY_PATH allows it); -> an errno or 0
+static i32 fx_lookup(i32 dirfd, const char *path, i32 follow, u64 *fs) {
+    if (!path[0]) return FE_NOENT;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
-    i32 e = w_path_filestat_get(fd, follow ? 1 : 0, p, n, fs);
+    return w_path_filestat_get(fd, follow ? 1 : 0, p, n, fs);
+}
+
+static i32 stat_path(i32 dirfd, const char *path, void *buf, i32 follow) {
+    u64 fs[8];
+    i32 e = fx_lookup(dirfd, path, follow, fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
     return 0;
@@ -324,83 +678,196 @@ EXPORT("__syscall_getcwd") i32 sc_getcwd(char *buf, i32 size) {
     return n + 1;
 }
 
-// chdir: the absolute path, lexically normalized ('.' and '..'), must name a directory
-EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
-    Cwd *C = cwdst();
-    char full[PATHMAX], out[PATHMAX];
-    i32 k = 0;
-    if (path[0] != '/') {
-        for (const char *q = C->cwd; *q; q++) {
-            if (k >= PATHMAX - 2) return -36;  // ENAMETOOLONG
-            full[k++] = *q;
-        }
-        full[k++] = '/';
+// The physical path of `path` (against `base` when relative): the names are walked one by one and every symlink is read
+// and followed (the last name only if `follow`), ".." goes to the real parent, a loop of more than 40 links is ELOOP.
+// -> 0 and the absolute path in *res (malloc'd), or an errno (positive).
+static i32 phys(const char *base, const char *path, i32 follow, char **res) {
+    char sl[2];
+    sl[0] = '/', sl[1] = 0;
+    char *cur = path[0] == '/' ? dupn(sl, 1) : dupn(base, (u32)slen(base));
+    char *rest = dupn(path, (u32)slen(path));
+    i32 links = 0, err = 0;
+    if (!cur || !rest) {
+        if (cur) free(cur);
+        if (rest) free(rest);
+        return ENOMEM;
     }
-    for (const char *q = path; *q; q++) {
-        if (k >= PATHMAX - 1) return -36;
-        full[k++] = *q;
-    }
-    full[k] = 0;
-    i32 len = 1;
-    out[0] = '/';
-    for (i32 i = 0; full[i];) {
-        while (full[i] == '/') i++;
+    for (i32 i = 0;;) {
+        while (rest[i] == '/') i++;
+        if (!rest[i]) break;
         i32 st = i;
-        while (full[i] && full[i] != '/') i++;
-        i32 cl = i - st;
-        if (cl == 0 || (cl == 1 && full[st] == '.')) continue;
-        if (cl == 2 && full[st] == '.' && full[st + 1] == '.') {
-            while (len > 1 && out[len - 1] != '/') len--;
-            if (len > 1) len--;  // drop the '/' before it
+        while (rest[i] && rest[i] != '/') i++;
+        i32 l = i - st;
+        if (l == 1 && rest[st] == '.') continue;
+        if (l == 2 && rest[st] == '.' && rest[st + 1] == '.') {  // the parent; the root has none
+            i32 j = slen(cur) - 1;
+            while (j > 0 && cur[j] != '/') j--;
+            if (j == 0) cur[1] = 0;
+            else cur[j] = 0;
             continue;
         }
-        if (len + cl + 1 >= PATHMAX) return -36;
-        if (len > 1) out[len++] = '/';
-        for (i32 j = 0; j < cl; j++) out[len++] = full[st + j];
+        i32 last = 1;
+        for (i32 j = i; rest[j]; j++)
+            if (rest[j] != '/') {
+                last = 0;
+                break;
+            }
+        i32 cl = slen(cur);
+        char *cand = (char *)malloc((u32)(cl + l + 2));
+        if (!cand) {
+            err = ENOMEM;
+            break;
+        }
+        for (i32 j = 0; j < cl; j++) cand[j] = cur[j];
+        if (cl == 0 || cand[cl - 1] != '/') cand[cl++] = '/';
+        for (i32 j = 0; j < l; j++) cand[cl + j] = rest[st + j];
+        cand[cl + l] = 0;
+        if (last && !follow) {
+            free(cur);
+            cur = cand;
+            continue;
+        }
+        u32 cap = 256;
+        char *tb;
+        i32 used = 0, e;
+        for (;;) {
+            char dot[2];
+            const char *p;
+            i32 n, fd = resolve(AT_FDCWD, cand, &p, &n, dot);
+            tb = (char *)malloc(cap);
+            if (!tb) {
+                e = ENOMEM;
+                break;
+            }
+            e = w_path_readlink(fd, p, n, tb, (i32)cap, &used);
+            if (e || used < (i32)cap) break;
+            free(tb);
+            cap *= 2;
+        }
+        if (e == ENOMEM) {
+            free(cand);
+            err = e;
+            break;
+        }
+        if (e == FE_INVAL) {  // not a link
+            free(tb);
+            free(cur);
+            cur = cand;
+            continue;
+        }
+        free(cand);
+        if (e || ++links > 40) {
+            free(tb);
+            err = e ? e : FE_LOOP;
+            break;
+        }
+        tb[used] = 0;
+        u32 rl = (u32)slen(rest + i);
+        char *nr = (char *)malloc((u32)used + 1 + rl + 1);
+        if (!nr) {
+            free(tb);
+            err = ENOMEM;
+            break;
+        }
+        for (i32 j = 0; j < used; j++) nr[j] = tb[j];
+        nr[used] = '/';
+        for (u32 j = 0; j <= rl; j++) nr[used + 1 + (i32)j] = rest[i + (i32)j];
+        if (tb[0] == '/') {
+            free(cur);
+            cur = dupn(sl, 1);
+            if (!cur) {
+                free(tb);
+                free(nr);
+                free(rest);
+                return ENOMEM;
+            }
+        }
+        free(tb);
+        free(rest);
+        rest = nr;
+        i = 0;
     }
-    out[len] = 0;
+    free(rest);
+    if (err) {
+        free(cur);
+        return err;
+    }
+    *res = cur;
+    return 0;
+}
+
+// chdir is physical: getcwd after chdir through a link shows the real directory, and ".." is its real parent
+EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
+    if (!path[0]) return -FE_NOENT;
+    Cwd *C = cwdst();
+    char *res;
+    i32 e = phys(C->cwd, path, 1, &res);
+    if (e) return -e;
     u64 fs[8];
     char dot[2];
     const char *p;
-    i32 n, fd = resolve(AT_FDCWD, out, &p, &n, dot);
-    i32 e = w_path_filestat_get(fd, 1, p, n, fs);
-    if (e) return -e;
-    if (*((u8 *)fs + 16) != 3) return -54;  // ENOTDIR: the filetype is not "directory"
-    for (i32 j = 0; j <= len; j++) C->cwd[j] = out[j];
+    i32 n, fd = resolve(AT_FDCWD, res, &p, &n, dot);
+    e = w_path_filestat_get(fd, 1, p, n, fs);
+    Meta *r = e ? 0 : meta_find(fs[0], fs[1]);
+    if (e || *((u8 *)fs + 16) != 3 || (r && !(r->mode & 0111))) {  // the search permission, as Pyodide's nodePermissions
+        free(res);
+        return e ? -e : *((u8 *)fs + 16) != 3 ? -FE_NOTDIR : -FE_ACCES;
+    }
+    free(C->cwd);
+    C->cwd = res;
     return 0;
 }
 
 EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
     const char *p = fd_base_path(fd);  // a directory opened by openat, or a preopen
-    return p ? sc_chdir(p) : -EBADF;
+    if (p) return sc_chdir(p);
+    u8 st[24] __attribute__((aligned(8)));
+    return (is_sock(fd) || !w_fd_fdstat_get(fd, st)) ? -FE_NOTDIR : -FE_BADF;  // a stream: not a directory
 }
 
-EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
-    (void)va;
+// nocheck: dup() opens the same file again, which no permission can forbid
+static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck) {
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
-    i32 acc = flags & 3, oflags = 0, fdflags = 0;
+    i32 acc = flags & 3, oflags = 0, fdflags = 0, created = 0;
     if (flags & 0100) oflags |= 1;       // O_CREAT
     if (flags & 0200000) oflags |= 2;    // O_DIRECTORY
     if (flags & 0200) oflags |= 4;       // O_EXCL
     if (flags & 01000) oflags |= 8;      // O_TRUNC
     if (flags & 02000) fdflags |= 1;     // O_APPEND
     if (flags & 04000) fdflags |= 4;     // O_NONBLOCK
+    if (!nocheck && ((flags & 0100) || mt()->nrestrict)) {  // is it made now? if it exists, may it be opened (its recorded mode)?
+        u64 fs[8];
+        if (w_path_filestat_get(fd, (flags & 0400000) ? 0 : 1, p, n, fs)) {
+            created = (flags & 0100) != 0;
+        } else if (!((flags & 0100) && (flags & 0200))) {
+            Meta *r = meta_find(fs[0], fs[1]);
+            i32 need = acc == 0 ? 4 : acc == 1 ? 2 : 6;
+            if (flags & 01000) need |= 2;
+            if (r && (((need & 4) && !(r->mode & 0444)) || ((need & 2) && !(r->mode & 0222)))) return -FE_ACCES;
+        }
+    }
+    if (created) {
+        i32 de = dir_denies(fd, p, n, 1);
+        if (de) return -de;
+    }
     u64 all = (1ull << 30) - 1, writes = (1ull << 6) | (1ull << 0) | (1ull << 8) | (1ull << 22);
     u64 reads = (1ull << 1) | (1ull << 14);
     u64 rights = acc == 0 ? all & ~writes : acc == 1 ? all & ~reads : all;
     i32 out = -1;
     i32 e = w_path_open(fd, (flags & 0400000) ? 0 : 1, p, n, oflags, rights, all, fdflags, &out);
     if (e) return -e;
+    if (created) {
+        u64 fs[8];
+        if (!w_fd_filestat_get(out, fs)) meta_created((const u8 *)fs, mode, 07777);
+    }
     if (out >= 0 && out < MAXFD) {
-        cookies()[out] = 0;  // a new descriptor lists its directory from the start
-        char ap[PATHMAX];
+        u64 *ck = ckp(out);
+        if (ck) *ck = 0;  // a new descriptor lists its directory from the start
         fd_forget(out);
-        if (abs_path(dirfd, path, ap)) {
-            i32 n2 = slen(ap) + 1;
-            char *copy = (char *)malloc(n2);
-            for (i32 j = 0; j < n2; j++) copy[j] = ap[j];
+        char *copy = absdup(dirfd, path);  // the path dup() opens again, of any length
+        if (copy) {
             fds()->path[out] = copy;
             fds()->flags[out] = flags;
         }
@@ -408,14 +875,16 @@ EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags,
     return out;
 }
 
+// the mode of O_CREAT is the variable argument (va points at it)
+EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
+    return open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);
+}
+
 // dup(): the same file opened again, at the same position (a copy of it: WASI 0.1 can not share the offset)
 EXPORT("__syscall_dup") i32 sc_dup(i32 fd) {
     if (fd < 0 || fd >= MAXFD || !fds()->path[fd]) return -52;  // ENOSYS: a stream, a socket or a pipe
     i32 flags = fds()->flags[fd] & ~(0100 | 0200 | 01000);       // not O_CREAT, O_EXCL, O_TRUNC again
-    char ap[PATHMAX];
-    i32 n = slen(fds()->path[fd]);
-    for (i32 j = 0; j <= n; j++) ap[j] = fds()->path[fd][j];
-    i32 nfd = sc_openat(AT_FDCWD, ap, flags, 0);
+    i32 nfd = open_at(AT_FDCWD, fds()->path[fd], flags, 0, 1);  // (the new descriptor's record is another one)
     if (nfd < 0) return nfd;
     u64 pos = 0;
     if (!(flags & 0200000) && !w_fd_tell(fd, &pos)) w_fd_seek(nfd, (i64)pos, 0, &pos);
@@ -434,6 +903,7 @@ EXPORT("__syscall_dup3") i32 sc_dup3(i32 oldfd, i32 newfd, i32 flags) {
         return -e;
     }
     fd_forget(newfd);
+    if (newfd >= 0 && ckp(newfd)) *ckp(newfd) = 0;  // the cookie of the descriptor that was there is stale
     if (d < MAXFD && newfd >= 0 && newfd < MAXFD) {  // the record follows the number
         fds()->path[newfd] = fds()->path[d];
         fds()->flags[newfd] = fds()->flags[d];
@@ -456,12 +926,18 @@ EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
     i32 e = w_fd_filestat_get(fd, fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
+    if (fd <= 2) *(u32 *)((u8 *)buf + 4) = 0020666;  // the standard streams are character devices (Pyodide's fstat(1))
     return 0;
 }
 
 EXPORT("__syscall_newfstatat") i32 sc_newfstatat(i32 dirfd, const char *path, void *buf, i32 flags) {
-    if (!path[0]) return sc_fstat64(dirfd, buf);  // AT_EMPTY_PATH
-    return stat_path(dirfd, path, buf, !(flags & 0x100));
+    if (!path[0] && (flags & 0x1000)) {  // AT_EMPTY_PATH: the descriptor itself, or the cwd
+        if (dirfd != AT_FDCWD) return sc_fstat64(dirfd, buf);
+        char dot[2];
+        dot[0] = '.', dot[1] = 0;
+        return stat_path(AT_FDCWD, dot, buf, 1);
+    }
+    return stat_path(dirfd, path, buf, !(flags & 0x100));  // an empty path is ENOENT
 }
 
 EXPORT("__syscall_readlinkat") i32 sc_readlinkat(i32 dirfd, const char *path, char *buf, i32 len) {
@@ -469,29 +945,42 @@ EXPORT("__syscall_readlinkat") i32 sc_readlinkat(i32 dirfd, const char *path, ch
     const char *p;
     i32 n, used = 0, fd = resolve(dirfd, path, &p, &n, dot);
     i32 e = w_path_readlink(fd, p, n, buf, len, &used);
-    return e ? -e : used;
+    if (e) return -e;
+    if (mt()->ntarget) {  // a link made with an absolute target: what the program stored, not the relative one it holds
+        u64 fs[8];
+        Meta *r = w_path_filestat_get(fd, 0, p, n, fs) ? 0 : meta_find(fs[0], fs[1]);
+        if (r && r->target) {
+            i32 tl = slen(r->target);
+            used = tl < len ? tl : len;
+            for (i32 j = 0; j < used; j++) buf[j] = r->target[j];
+        }
+    }
+    return used;
 }
 
+// access: the recorded (or default) mode bits, whoever asks (Pyodide's nodePermissions: any of the user, group, other bits)
 EXPORT("__syscall_faccessat") i32 sc_faccessat(i32 dirfd, const char *path, i32 mode, i32 flags) {
-    (void)mode;
+    if (mode & ~7) return -FE_INVAL;
     u64 fs[8];
-    char dot[2];
-    const char *p;
-    i32 n, fd = resolve(dirfd, path, &p, &n, dot);
-    i32 e = w_path_filestat_get(fd, (flags & 0x100) ? 0 : 1, p, n, fs);
-    return e ? -e : 0;
+    i32 e = fx_lookup(dirfd, path, !(flags & 0x100), fs);
+    if (e) return -e;
+    Meta *r = meta_find(fs[0], fs[1]);
+    u32 bits = r ? r->mode : def_for((const u8 *)fs);
+    if (((mode & 4) && !(bits & 0444)) || ((mode & 2) && !(bits & 0222)) || ((mode & 1) && !(bits & 0111))) return -FE_ACCES;
+    return 0;
 }
 
 // WASI dirents {d_next u64, d_ino u64, d_namlen u32, d_type u8, name} -> linux_dirent64
 // {d_ino u64, d_off i64, d_reclen u16, d_type u8, name\0, padded to 8}
 EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
-    if (fd < 0 || fd >= MAXFD) return -EBADF;
-    u64 *ck = cookies();
+    if (fd < 0) return -EBADF;
+    u64 *ck = ckp(fd);
+    if (!ck) return -ENOMEM;
     i32 cap = count + 512;
     u8 *tmp = (u8 *)malloc((u32)cap);
     if (!tmp) return -ENOMEM;
     i32 used = 0;
-    i32 e = w_fd_readdir(fd, tmp, cap, ck[fd], &used);
+    i32 e = w_fd_readdir(fd, tmp, cap, *ck, &used);
     if (e) {
         free(tmp);
         return -e;
@@ -512,7 +1001,7 @@ EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
         for (u32 i = 0; i < nl; i++) d[19 + i] = tmp[in + 24 + i];
         for (i32 i = 19 + (i32)nl; i < reclen; i++) d[i] = 0;
         out += reclen;
-        ck[fd] = next;
+        *ck = next;
         in += 24 + (i32)nl;
     }
     free(tmp);
@@ -520,21 +1009,25 @@ EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
     return out;
 }
 
-EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
-    if (is_sock(fd) && op == 0x5421) {  // FIONBIO
-        const i32 *argp = va ? *(const i32 **)va : 0;  // va points at the variable arguments; the first is &flag
-        sock_set_nb(fd, argp && *argp != 0);
-        return 0;
-    }
-    return -ENOTTY;
-}
-
 static i32 is_sock(i32 fd);
 WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
 WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
 
-// fcntl: the flags are WASI's fdflags (append, nonblock) and rights; descriptors can not be duplicated in WASI 0.1 (ENOSYS).
+// the WASI filetype of an open descriptor (a socket is a stream socket), or -errno (EBADF)
+static i32 fd_type(i32 fd) {
+    if (is_sock(fd)) return 6;
+    u8 st[24] __attribute__((aligned(8)));
+    i32 e = w_fd_fdstat_get(fd, st);
+    return e ? -e : st[0];
+}
+// can the descriptor seek? The standard streams, sockets and character devices can not (Pyodide: stream.seekable)
+static i32 fd_seekable(i32 fd, i32 ft) { return fd > 2 && ft != 2 && ft != 5 && ft != 6; }
+
+// fcntl: the flags are WASI's fdflags (append, nonblock) and rights; an invalid descriptor is EBADF for every command (as
+// Pyodide's getStreamFromFD). The lock commands of this ABI are F_GETLK 12, F_SETLK 13, F_SETLKW 14: there is one process,
+// so a lock is always granted and F_GETLK reports F_UNLCK.
 EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
+    if (fd_type(fd) < 0) return -FE_BADF;
     switch (cmd) {
         case 1:  // F_GETFD: FD_CLOEXEC is not kept (there is no exec)
         case 2:  // F_SETFD
@@ -563,19 +1056,43 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
             i32 e = w_fd_fdstat_set_flags(fd, ff);
             return e ? -e : 0;
         }
-        case 6:  // F_SETLK
-        case 7:  // F_SETLKW: one process, so a lock is always granted
+        case 12: {  // F_GETLK: nobody else holds a lock -> l_type = F_UNLCK
+            u16 *fl = va ? *(u16 **)va : 0;
+            if (fl) *fl = 2;
+            return 0;
+        }
+        case 13:  // F_SETLK
+        case 14:  // F_SETLKW
             return 0;
         case 0:     // F_DUPFD (the minimum number is not honoured)
         case 1030:  // F_DUPFD_CLOEXEC
             return sc_dup(fd);
         default:
-            return -28;  // EINVAL
+            return -FE_INVAL;
     }
 }
 
-EXPORT("_emscripten_get_progname") void get_progname(char *buf, i32 len) {  // stringToUTF8: cut to len-1, always ended
-    const char name[7] = {'p', 'y', 't', 'h', 'o', 'n', 0};
+// lseek on a descriptor: a directory keeps its readdir cookie here (rewinddir is SEEK_SET 0, seekdir/telldir use the
+// d_off of the entries, getdents64 continues from it); the others go to WASI. Sockets can not seek.
+EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
+    if (is_sock(fd)) return FE_SPIPE;
+    i32 e = w_fd_seek(fd, off, whence, newoff);
+    if (e != FE_BADF) return e;  // WASI refuses a directory descriptor (EBADF): that one is ours
+    u8 st[24] __attribute__((aligned(8)));
+    if (w_fd_fdstat_get(fd, st) || st[0] != 3) return e;
+    u64 *ck = ckp(fd);
+    if (!ck) return ENOMEM;
+    i64 pos = whence == 1 ? (i64)*ck + off : off;  // SEEK_SET, SEEK_END (a directory has no size: as SET), SEEK_CUR
+    if (whence < 0 || whence > 2 || pos < 0) return FE_INVAL;
+    *ck = (u64)pos;
+    *newoff = (u64)pos;
+    return 0;
+}
+
+EXPORT("_emscripten_get_progname") void get_progname(char *buf, i32 len) {  // thisProgram, cut to len-1, always ended
+    u64 w[2] = {0, 0};  // "./this.program" from integer constants (no data section)
+    w[0] = 0x702e736968742f2eull, w[1] = 0x6d6172676f72ull;
+    const char *name = (const char *)w;
     if (len <= 0) return;
     i32 i = 0;
     for (; i < len - 1 && name[i]; i++) buf[i] = name[i];
@@ -959,30 +1476,64 @@ EXPORT("ffi_prep_closure_loc_js") i32 ffi_prep_closure_loc_js(void *closure, con
 // ================================================================== writing files (what installing a wheel needs)
 
 EXPORT("__syscall_mkdirat") i32 sc_mkdirat(i32 dirfd, const char *path, i32 mode) {
-    (void)mode;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
+    i32 de = dir_denies(fd, p, n, 1);
+    if (de) return -de;
     i32 e = w_mkdir(fd, p, n);
-    return e ? -e : 0;
+    if (e) return -e;
+    u64 fs[8];
+    if (!w_path_filestat_get(fd, 0, p, n, fs)) meta_created((const u8 *)fs, (u32)mode, 01777);
+    return 0;
 }
 
 EXPORT("__syscall_unlinkat") i32 sc_unlinkat(i32 dirfd, const char *path, i32 flags) {
+    if (flags && flags != 0x200) return -FE_INVAL;  // only AT_REMOVEDIR is a flag of unlinkat
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
+    u64 key[2];
+    i32 doomed = meta_doomed(fd, p, n, key);
+    i32 de = dir_denies(fd, p, n, 0);
+    if (de) return -de;
     i32 e = (flags & 0x200) ? w_rmdir(fd, p, n) : w_unlink(fd, p, n);  // AT_REMOVEDIR
-    return e ? -e : 0;
+    if (e) return -e;
+    if (doomed) meta_release(key[0], key[1]);
+    return 0;
 }
 
 EXPORT("__syscall_rmdir") i32 sc_rmdir(const char *path) { return sc_unlinkat(AT_FDCWD, path, 0x200); }
 
+static void relink(i32 dirfd, const char *path);
+static void relink_tree(const char *abs, i32 depth);
 EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath) {
     char d1[2], d2[2];
     const char *p1, *p2;
     i32 n1, n2, f1 = resolve(olddirfd, oldpath, &p1, &n1, d1), f2 = resolve(newdirfd, newpath, &p2, &n2, d2);
+    u64 key[2];
+    i32 doomed = meta_doomed(f2, p2, n2, key);  // a file or directory that the rename replaces
+    i32 de = dir_denies(f1, p1, n1, 0);
+    if (!de) de = dir_denies(f2, p2, n2, 2);
+    if (de) return -de;
     i32 e = w_rename(f1, p1, n1, f2, p2, n2);
-    return e ? -e : 0;
+    if (e) return -e;
+    if (doomed) {
+        u64 fs[8];
+        if (w_path_filestat_get(f2, 0, p2, n2, fs) || fs[0] != key[0] || fs[1] != key[1]) meta_release(key[0], key[1]);
+    }
+    if (mt()->ntarget) {
+        relink(newdirfd, newpath);  // a symlink with a stored absolute target is made again for its new place
+        u64 ns[8];
+        if (!w_path_filestat_get(f2, 0, p2, n2, ns) && *((u8 *)ns + 16) == 3) {  // a directory: every such link inside it too
+            char *abs = absdup(newdirfd, newpath);
+            if (abs) {
+                relink_tree(abs, 0);
+                free(abs);
+            }
+        }
+    }
+    return 0;
 }
 
 EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
@@ -1001,36 +1552,216 @@ EXPORT("__syscall_truncate64") i32 sc_truncate64(const char *path, i64 len) {
     return e ? -e : 0;
 }
 
+// fallocate as Pyodide's: mode 0 only (EOPNOTSUPP for KEEP_SIZE, PUNCH_HOLE...), the size grows to offset + len if it is smaller
 EXPORT("__syscall_fallocate") i32 sc_fallocate(i32 fd, i32 mode, i64 offset, i64 len) {
-    (void)mode;
-    i32 e = w_fd_allocate(fd, (u64)offset, (u64)len);
+    if (offset > (1ll << 53) || len > (1ll << 53) || offset < -(1ll << 53) || len < -(1ll << 53)) return -FE_FBIG;
+    if (mode != 0) return -FE_OPNOTSUPP;
+    if (offset < 0 || len < 0) return -FE_INVAL;
+    i32 ft = fd_type(fd);
+    if (ft < 0) return ft;
+    if (!fd_seekable(fd, ft)) return -FE_SPIPE;
+    u64 fs[8];
+    i32 e = w_fd_filestat_get(fd, fs);
+    if (e) return -e;
+    if ((u64)(offset + len) > fs[4]) {  // growing is a write: the recorded mode must allow it (Pyodide's ftruncate checks)
+        Meta *r = meta_find(fs[0], fs[1]);
+        if (r && !(r->mode & 0222)) return -FE_ACCES;
+        e = w_fd_set_size(fd, (u64)(offset + len));
+    }
     return e ? -e : 0;
 }
 
+// fdatasync: an open descriptor is synced; a stream (nothing to sync, WASI says EINVAL) succeeds, as in Pyodide
 EXPORT("__syscall_fdatasync") i32 sc_fdatasync(i32 fd) {
+    i32 ft = fd_type(fd);
+    if (ft < 0) return ft;
+    if (is_sock(fd) || fd <= 2) return 0;
     i32 e = w_fd_datasync(fd);
-    return e ? -e : 0;
+    // EBADF here is the missing right of a read-only descriptor (a valid one, checked above): nothing to sync
+    return e == 0 || e == FE_INVAL || e == FE_BADF || e == 58 /* ENOTSUP */ ? 0 : -e;
 }
 
-// advice only: nothing to do (the answer of every libc when the kernel ignores it)
+// advice only (nothing to do), but a bad descriptor is EBADF and a stream or a socket is ESPIPE
 EXPORT("__syscall_fadvise64") i32 sc_fadvise64(i32 fd, i64 offset, i64 len, i32 advice) {
-    (void)fd, (void)offset, (void)len, (void)advice;
-    return 0;
+    (void)offset, (void)len, (void)advice;
+    i32 ft = fd_type(fd);
+    if (ft < 0) return ft;
+    return fd_seekable(fd, ft) ? 0 : -FE_SPIPE;
+}
+
+// A symlink with an absolute target: wasmtime refuses it (EPERM), so the link holds the relative path from its own
+// directory (both are in the guest's root, or in the same mount) and the metadata table keeps what the program
+// stored, which readlink returns. -> the relative target (malloc'd), or 0 and an errno in *err.
+static char *rel_target(i32 dirfd, const char *linkpath, const char *target, i32 *err) {
+    char *la = absdup(dirfd, linkpath), *ta = absdup(AT_FDCWD, target), *real = 0, *r = 0;
+    *err = !ta || (!la && linkpath[0] == '/') ? ENOMEM : FE_BADF;
+    if (la && ta) {
+        i32 j = slen(la);
+        while (j > 1 && la[j - 1] == '/') la[--j] = 0;
+        while (j > 0 && la[j - 1] != '/') j--;
+        if (j > 1) la[j - 1] = 0;
+        else la[j] = 0;  // the root
+        *err = phys(la, la, 1, &real);  // the real directory of the link
+        if (!*err) {
+            char d1[2], d2[2];
+            const char *p1, *p2;
+            i32 n1, n2, f1 = resolve(AT_FDCWD, real, &p1, &n1, d1), f2 = resolve(AT_FDCWD, ta, &p2, &n2, d2);
+            if (f1 != f2) {
+                *err = FE_XDEV;  // the link and the target are in different mounts: not representable
+            } else {
+                i32 up = ncomp(p1);
+                r = (char *)malloc((u32)(up * 3 + n2 + 1));
+                if (!r) {
+                    *err = ENOMEM;
+                    goto done;
+                }
+                i32 k = 0;
+                for (i32 i = 0; i < up; i++) r[k++] = '.', r[k++] = '.', r[k++] = '/';
+                for (i32 i = 0; i < n2; i++) r[k++] = p2[i];
+                if (k > 0 && r[k - 1] == '/') k--;
+                r[k] = 0;
+                if (k == 0) r[0] = '.', r[1] = 0;
+            }
+        }
+    }
+done:
+    if (la) free(la);
+    if (ta) free(ta);
+    if (real) free(real);
+    return r;
 }
 
 EXPORT("__syscall_symlinkat") i32 sc_symlinkat(const char *target, i32 newdirfd, const char *linkpath) {
     char dot[2];
     const char *p;
-    i32 n, fd = resolve(newdirfd, linkpath, &p, &n, dot);
-    i32 e = w_symlink(target, slen(target), fd, p, n);  // the target is stored as it is
-    return e ? -e : 0;
+    i32 n, fd, err = 0;
+    char *rel = 0;
+    if (target[0] == '/') {
+        rel = rel_target(newdirfd, linkpath, target, &err);
+        if (!rel) return -err;
+    }
+    fd = resolve(newdirfd, linkpath, &p, &n, dot);  // after rel_target, which uses the path buffers too
+    const char *use = rel ? rel : target;
+    i32 de = dir_denies(fd, p, n, 1);
+    if (de) {
+        if (rel) free(rel);
+        return -de;
+    }
+    i32 e = w_symlink(use, slen(use), fd, p, n);
+    if (rel) free(rel);
+    if (e) return -e;
+    if (target[0] == '/') {  // remember what was stored
+        u64 fs[8];
+        if (!w_path_filestat_get(fd, 0, p, n, fs)) {
+            Meta *m = meta_put(fs[0], fs[1], 0777, 0, 0, 7);
+            char *tcopy = m ? dupn(target, (u32)slen(target)) : 0;
+            if (tcopy) m->target = tcopy, mt()->ntarget++;
+        }
+    }
+    return 0;
+}
+
+// A symlink made with an absolute target holds a path relative to its directory: after a rename to another directory it
+// is made again for the new place (the record follows to the new inode)
+static void relink(i32 dirfd, const char *path) {
+    char dot[2];
+    const char *p;
+    i32 n, fd = resolve(dirfd, path, &p, &n, dot);
+    u64 fs[8];
+    if (w_path_filestat_get(fd, 0, p, n, fs)) return;
+    Meta *r = meta_find(fs[0], fs[1]);
+    if (!r || !r->target || *((u8 *)fs + 16) != 7) return;
+    char *target = dupn(r->target, (u32)slen(r->target));
+    if (!target) return;
+    u32 mode = r->mode, uid = r->uid, gid = r->gid;
+    u64 dev = fs[0], ino = fs[1];
+    i32 err;
+    char *rel = rel_target(dirfd, path, target, &err);
+    if (rel) {
+        fd = resolve(dirfd, path, &p, &n, dot);
+        if (!w_unlink(fd, p, n) && !w_symlink(rel, slen(rel), fd, p, n)) {
+            meta_del(dev, ino);
+            if (!w_path_filestat_get(fd, 0, p, n, fs)) {
+                Meta *m = meta_put(fs[0], fs[1], mode, uid, gid, 7);
+                if (m) {
+                    m->target = target;
+                    mt()->ntarget++;
+                    target = 0;
+                }
+            }
+        }
+        free(rel);
+    }
+    if (target) free(target);
+}
+
+// every symlink under the directory `abs` that has a stored absolute target is made again (symlinks are not followed)
+static void relink_tree(const char *abs, i32 depth) {
+    if (depth > 200) return;
+    char dot[2];
+    const char *p;
+    i32 n, fd = resolve(AT_FDCWD, abs, &p, &n, dot), dfd = -1;
+    u64 all = (1ull << 30) - 1;
+    if (w_path_open(fd, 0, p, n, 2 /* O_DIRECTORY */, all & ~((1ull << 6) | (1ull << 22)), 0, 0, &dfd)) return;
+    u32 cap = 4096;
+    u8 *buf = (u8 *)malloc(cap);
+    u64 cookie = 0;
+    while (buf) {
+        i32 used = 0;
+        if (w_fd_readdir(dfd, buf, (i32)cap, cookie, &used) || used == 0) break;
+        i32 in = 0;
+        while (in + 24 <= used) {
+            u64 next = *(u64 *)(buf + in);
+            u32 nl = *(u32 *)(buf + in + 16);
+            u8 ft = buf[in + 20];
+            if (in + 24 + (i32)nl > used) break;
+            char *name = dupn((const char *)buf + in + 24, nl);
+            in += 24 + (i32)nl;
+            cookie = next;
+            if (!name) continue;
+            if (!(nl == 1 && name[0] == '.') && !(nl == 2 && name[0] == '.' && name[1] == '.') && (ft == 7 || ft == 3)) {
+                u32 al = (u32)slen(abs);
+                char *child = (char *)malloc(al + nl + 2);
+                if (child) {
+                    for (u32 i = 0; i < al; i++) child[i] = abs[i];
+                    u32 k = al;
+                    if (k == 0 || child[k - 1] != '/') child[k++] = '/';
+                    for (u32 i = 0; i <= nl; i++) child[k + i] = name[i];
+                    if (ft == 7) relink(AT_FDCWD, child);
+                    else relink_tree(child, depth + 1);
+                    free(child);
+                }
+            }
+            free(name);
+        }
+        if (in == 0) {  // one entry does not fit the buffer: a bigger one
+            free(buf);
+            cap *= 2;
+            buf = (u8 *)malloc(cap);
+        }
+    }
+    if (buf) free(buf);
+    w_fd_close(dfd);
 }
 
 EXPORT("__syscall_linkat") i32 sc_linkat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath, i32 flags) {
     char d1[2], d2[2];
     const char *p1, *p2;
+    char *real = 0;
+    if (flags & ~0x400) return -FE_INVAL;
+    if (flags & 0x400) {  // AT_SYMLINK_FOLLOW: wasmtime refuses it, so the link is followed here and the file linked
+        char *abs = absdup(olddirfd, oldpath);
+        if (!abs) return -FE_BADF;
+        i32 pe = phys(abs, abs, 1, &real);
+        free(abs);
+        if (pe) return -pe;
+        oldpath = real;
+        olddirfd = AT_FDCWD;
+    }
     i32 n1, n2, f1 = resolve(olddirfd, oldpath, &p1, &n1, d1), f2 = resolve(newdirfd, newpath, &p2, &n2, d2);
-    i32 e = w_link(f1, (flags & 0x400) ? 1 : 0, p1, n1, f2, p2, n2);  // AT_SYMLINK_FOLLOW
+    i32 e = dir_denies(f2, p2, n2, 1);
+    if (!e) e = w_link(f1, 0, p1, n1, f2, p2, n2);
+    if (real) free(real);
     return e ? -e : 0;
 }
 
@@ -1039,159 +1770,114 @@ EXPORT("__syscall_getuid32_js") i32 sc_getuid(void) { return 0; }
 EXPORT("__syscall_geteuid32") i32 sc_geteuid(void) { return 0; }
 EXPORT("__syscall_getgid32") i32 sc_getgid(void) { return 0; }
 EXPORT("__syscall_getegid32") i32 sc_getegid(void) { return 0; }
-EXPORT("__syscall_umask_js") i32 sc_umask(i32 mask) { (void)mask; return 022; }  // the previous mask; WASI has none
+// the umask is kept here (WASI has none): the previous mask is returned, creation calls apply it to the recorded mode
+EXPORT("__syscall_umask_js") i32 sc_umask(i32 mask) {
+    MetaT *t = mt();
+    i32 old = (i32)t->umask;
+    t->umask = (u32)mask & 0777;
+    return old;
+}
 
 // exit(): the process ends, with the code (Emscripten's JavaScript glue throws; here WASI says it)
 EXPORT("exit") void sc_exit(i32 code) { w_proc_exit(code); }
 
-// permissions and times: accepted and ignored (WASI preview1 has no modes; times are not needed here)
-EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 a, i32 b, i32 c, i32 d) { (void)a, (void)b, (void)c, (void)d; return 0; }
-EXPORT("__syscall_chmod") i32 sc_chmod(i32 a, i32 b) { (void)a, (void)b; return 0; }
-EXPORT("__syscall_fchmod") i32 sc_fchmod(i32 a, i32 b) { (void)a, (void)b; return 0; }
-EXPORT("__syscall_fchmodat2") i32 sc_fchmodat2(i32 a, i32 b, i32 c, i32 d) { (void)a, (void)b, (void)c, (void)d; return 0; }
+// utimensat: the times are WASI's (path_filestat_set_times, fd_filestat_set_times). UTIME_NOW and UTIME_OMIT are
+// the special nanoseconds; a null path (futimens) or an empty one is the descriptor itself, as Pyodide's allowEmpty.
+EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, const u8 *times, i32 flags) {
+    u64 tv[2] = {0, 0};
+    i32 ff = 0;
+    if (!times) {
+        ff = 2 | 8;
+    } else {
+        for (i32 k = 0; k < 2; k++) {
+            i64 sec = *(const i64 *)(times + 16 * k);
+            i32 ns = *(const i32 *)(times + 16 * k + 8);
+            if (ns == 0x3fffffff) {  // UTIME_NOW
+                ff |= 2 << (2 * k);
+            } else if (ns != 0x3ffffffe) {  // not UTIME_OMIT
+                if (ns < 0 || ns >= 1000000000 || sec < 0 || sec > 18446744072ll) return -FE_INVAL;
+                tv[k] = (u64)sec * 1000000000ull + (u64)ns;
+                ff |= 1 << (2 * k);
+            }
+        }
+    }
+    if (path && path[0]) {
+        char dot[2];
+        const char *p;
+        i32 n, fd = resolve(dirfd, path, &p, &n, dot);
+        i32 e = w_path_set_times(fd, (flags & 0x100) ? 0 : 1, p, n, tv[0], tv[1], ff);  // AT_SYMLINK_NOFOLLOW
+        return e ? -e : 0;
+    }
+    i32 e;
+    if (dirfd == AT_FDCWD) {
+        char dot[2];
+        dot[0] = '.', dot[1] = 0;
+        const char *p;
+        i32 n, fd = resolve(AT_FDCWD, dot, &p, &n, dot);
+        e = w_path_set_times(fd, 1, p, n, tv[0], tv[1], ff);
+    } else {
+        e = w_fd_set_times(dirfd, tv[0], tv[1], ff);
+    }
+    return e ? -e : 0;
+}
+
+// chmod: the permission bits (and setuid, setgid, sticky) of the record; the file must exist
+static i32 set_mode(const u64 *fs, i32 mode) {
+    Meta *r = meta_for((const u8 *)fs);
+    if (!r) return -ENOMEM;
+    meta_setmode(mt(), r, (u32)mode & 07777);
+    return 0;
+}
+EXPORT("__syscall_chmod") i32 sc_chmod(const char *path, i32 mode) {
+    u64 fs[8];
+    i32 e = fx_lookup(AT_FDCWD, path, 1, fs);
+    return e ? -e : set_mode(fs, mode);
+}
+EXPORT("__syscall_fchmod") i32 sc_fchmod(i32 fd, i32 mode) {
+    u64 fs[8];
+    i32 e = w_fd_filestat_get(fd, fs);
+    if (e) return -e;
+    return is_sock(fd) ? 0 : set_mode(fs, mode);
+}
+EXPORT("__syscall_fchmodat2") i32 sc_fchmodat2(i32 dirfd, const char *path, i32 mode, i32 flags) {
+    u64 fs[8];
+    i32 e = fx_lookup(dirfd, path, !(flags & 0x100), fs);  // AT_SYMLINK_NOFOLLOW: the link itself, as Pyodide
+    return e ? -e : set_mode(fs, mode);
+}
 
 // ================================================================== ffi_call_js: ctypes calls
 // libffi's emscripten port calls through JavaScript (`wasmTable.get(fn)(...args)`), which takes any callee type. The host
-// does the same (loader.ffi_call: any arity, 64-bit, floats, structs, variadic calls). FFI_STATIC (tools/gen_ffi.py) is
-// the variant for a build without such a host: a call_indirect with the type the cif describes, for up to 8 integer or
-// pointer arguments and, with floats or 64-bit values, up to 4; it traps for anything else, and for a callee of
-// another type than the cif's.
-#ifndef FFI_STATIC
+// does the same (loader.ffi_call: any arity, 64-bit, floats, structs, variadic calls).
 EXPORT("ffi_call_js") void ffi_call_js(const void *cif, u32 fn, void *rvalue, void **avalue) { host_ffi_call(cif, fn, rvalue, avalue); }
-#else
-typedef struct {
-    u32 size;
-    u16 alignment, type;
-    void *elements;
-} ffi_type_t;
-typedef struct {
-    u32 abi, nargs;
-    ffi_type_t **arg_types, *rtype;
-} ffi_cif_t;
-
-static u32 int_arg(const ffi_type_t *t, const void *p) {
-    switch (t->type) {
-        case 5: return *(const u8 *)p;                    // UINT8
-        case 6: return (u32)(i32) * (const signed char *)p;  // SINT8
-        case 7: return *(const u16 *)p;                   // UINT16
-        case 8: return (u32)(i32) * (const short *)p;     // SINT16
-        case 1: case 9: case 10: case 14: return *(const u32 *)p;  // INT, UINT32, SINT32, POINTER
-        default: __builtin_trap();
-    }
-}
-
-typedef u32 (*f0)(void);
-typedef u32 (*f1)(u32);
-typedef u32 (*f2)(u32, u32);
-typedef u32 (*f3)(u32, u32, u32);
-typedef u32 (*f4)(u32, u32, u32, u32);
-typedef u32 (*f5)(u32, u32, u32, u32, u32);
-typedef u32 (*f6)(u32, u32, u32, u32, u32, u32);
-typedef u32 (*f7)(u32, u32, u32, u32, u32, u32, u32);
-typedef u32 (*f8)(u32, u32, u32, u32, u32, u32, u32, u32);
-typedef void (*v0)(void);
-typedef void (*v1)(u32);
-typedef void (*v2)(u32, u32);
-typedef void (*v3)(u32, u32, u32);
-typedef void (*v4)(u32, u32, u32, u32);
-typedef void (*v5)(u32, u32, u32, u32, u32);
-typedef void (*v6)(u32, u32, u32, u32, u32, u32);
-typedef void (*v7)(u32, u32, u32, u32, u32, u32, u32);
-typedef void (*v8)(u32, u32, u32, u32, u32, u32, u32, u32);
-
-#include "ffi_calls.h"  // generated: Arg and ffi_dispatch (tools/gen_ffi.py)
-
-// libffi type -> class of the wasm value: 0 i32 (integers, pointers), 1 i64, 2 f32, 3 f64; -1: not supported
-static i32 ffi_class(u16 t) {
-    switch (t) {
-        case 1: case 5: case 6: case 7: case 8: case 9: case 10: case 14: return 0;
-        case 11: case 12: return 1;  // UINT64, SINT64
-        case 2: return 2;            // FLOAT
-        case 3: return 3;            // DOUBLE
-        default: return -1;          // long double, structs by value
-    }
-}
-
-EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, void **avalue) {
-    u32 n = cif->nargs;
-    {  // floats and 64-bit values: the generated dispatch (up to 4 arguments)
-        i32 mixed = 0, rcls = cif->rtype->type == 0 ? -2 : ffi_class(cif->rtype->type);  // -2: void, -1: unsupported
-        if (rcls != 0 && rcls != -2) mixed = 1;
-        for (u32 i = 0; i < n && n <= 8; i++)
-            if (ffi_class(cif->arg_types[i]->type) != 0) mixed = 1;
-        if (mixed) {
-            if (n > 4 || rcls == -1) __builtin_trap();  // more than 4 mixed arguments, a struct or a long double
-            Arg args[4], ret;
-            u32 pid = 0;
-            for (u32 i = 0; i < n; i++) {
-                i32 c = ffi_class(cif->arg_types[i]->type);
-                if (c < 0) __builtin_trap();
-                const void *p = avalue[i];
-                if (c == 0) args[i].i = int_arg(cif->arg_types[i], p);
-                else if (c == 1) args[i].l = *(const u64 *)p;
-                else if (c == 2) args[i].f = *(const float *)p;
-                else args[i].d = *(const double *)p;
-                pid = pid * 4 + (u32)c;
-            }
-            u32 base = n == 0 ? 0 : n == 1 ? 1 : n == 2 ? 5 : n == 3 ? 21 : 85;
-            ffi_dispatch(fn, (base + pid) * 5 + (u32)(rcls == -2 ? 0 : rcls + 1), args, &ret);
-            if (rcls == 0) *(u32 *)rvalue = ret.i;
-            else if (rcls == 1) *(u64 *)rvalue = ret.l;
-            else if (rcls == 2) *(float *)rvalue = ret.f;
-            else if (rcls == 3) *(double *)rvalue = ret.d;
-            return;
-        }
-    }
-    u32 a[8];
-    if (n > 8) __builtin_trap();
-    for (u32 i = 0; i < 8; i++) a[i] = i < n ? int_arg(cif->arg_types[i], avalue[i]) : 0;
-    u16 rt = cif->rtype->type;
-    if (rt == 0) {
-        switch (n) {
-            case 0: ((v0)fn)(); break;
-            case 1: ((v1)fn)(a[0]); break;
-            case 2: ((v2)fn)(a[0], a[1]); break;
-            case 3: ((v3)fn)(a[0], a[1], a[2]); break;
-            case 4: ((v4)fn)(a[0], a[1], a[2], a[3]); break;
-            case 5: ((v5)fn)(a[0], a[1], a[2], a[3], a[4]); break;
-            case 6: ((v6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]); break;
-            case 7: ((v7)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;
-            default: ((v8)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;
-        }
-        return;
-    }
-    if (!(rt == 1 || (rt >= 5 && rt <= 10) || rt == 14)) __builtin_trap();
-    u32 r;
-    switch (n) {
-        case 0: r = ((f0)fn)(); break;
-        case 1: r = ((f1)fn)(a[0]); break;
-        case 2: r = ((f2)fn)(a[0], a[1]); break;
-        case 3: r = ((f3)fn)(a[0], a[1], a[2]); break;
-        case 4: r = ((f4)fn)(a[0], a[1], a[2], a[3]); break;
-        case 5: r = ((f5)fn)(a[0], a[1], a[2], a[3], a[4]); break;
-        case 6: r = ((f6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]); break;
-        case 7: r = ((f7)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;
-        default: r = ((f8)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;
-    }
-    *(u32 *)rvalue = r;
-}
-#endif
 
 // ================================================================== sockets: Emscripten's socket calls over the host's
 // WASI preview1 cannot create or connect a socket, so the host gives a few operations; a socket is a guest
 // descriptor (see the table below). The main module's fd_read / fd_write / fd_close / fd_fdstat_get come here first
 // (OpenSSL reads and writes its socket with read() and write()); other descriptors pass on to WASI.
 #define NET(n) __attribute__((import_module("net"), import_name(n)))
+// The host reads and writes the guest's structures (sockaddr, msghdr, option values, addrinfo) itself: these take pointers.
 NET("socket") i32 net_socket(i32 domain, i32 type, i32 proto);  // -> handle, or -errno
-NET("connect") i32 net_connect(i32 h, i32 family, i32 port, const u8 *addr);
-NET("send") i32 net_send(i32 h, const u8 *p, i32 n);
-NET("recv") i32 net_recv(i32 h, u8 *p, i32 n, i32 peek);
+NET("bind") i32 net_bind(i32 h, const u8 *sa, i32 len);
+NET("listen") i32 net_listen(i32 h, i32 backlog);
+NET("accept") i32 net_accept(i32 h, u8 *sa, u32 *lenp, i32 nb);  // -> the new handle; the peer's address into sa, *lenp
+NET("connect") i32 net_connect(i32 h, const u8 *sa, i32 len, i32 nb);  // nb: EINPROGRESS, the connection goes on
+// flags are musl's MSG_*; the adapter adds MSG_DONTWAIT for a non-blocking socket, and the host then never waits
+NET("sendto") i32 net_sendto(i32 h, const u8 *p, i32 n, i32 flags, const u8 *sa, i32 salen);
+NET("recvfrom") i32 net_recvfrom(i32 h, u8 *p, i32 n, i32 flags, u8 *sa, u32 *lenp);
+NET("sendmsg") i32 net_sendmsg(i32 h, const u32 *msg, i32 flags);
+NET("recvmsg") i32 net_recvmsg(i32 h, u32 *msg, i32 flags);
 NET("poll") i32 net_poll(i32 h, i32 events, i32 timeout_ms);  // -> revents
 NET("pollv") i32 net_pollv(i32 n, const i32 *hs, const i32 *events, i32 timeout_ms, i32 *revents);  // several sockets at once
 NET("close") i32 net_close(i32 h);
 NET("shutdown") i32 net_shutdown(i32 h, i32 how);
-NET("name") i32 net_name(i32 h, i32 peer, u8 *addr4, i32 *port);  // the local or peer IPv4 address and port
+NET("name") i32 net_name(i32 h, i32 peer, u8 *sa, u32 *lenp);  // the local or peer address
+NET("getopt") i32 net_getopt(i32 h, i32 level, i32 opt, u8 *val, u32 *lenp);
+NET("setopt") i32 net_setopt(i32 h, i32 level, i32 opt, const u8 *val, u32 len);
+NET("ioctl") i32 net_ioctl(i32 h, i32 op, i32 *argp);  // FIONREAD
 NET("resolve") i32 net_resolve(const char *name, i32 n, u8 *addr4);  // -> 0, or -errno
+NET("getaddrinfo") i32 net_getaddrinfo(const char *node, const char *service, const i32 *hint, u32 *out);
+NET("getnameinfo") i32 net_getnameinfo(const u8 *sa, i32 salen, char *node, i32 nodelen, char *serv, i32 servlen, i32 flags);
+NET("protobyname") u32 net_protobyname(const char *name);
 
 // A socket takes a real WASI descriptor number (a directory opened as a placeholder), so that numbers stay small
 // (select() takes less than 1024) and never clash with files; the table is indexed by that number.
@@ -1216,25 +1902,40 @@ static void sock_set_nb(i32 fd, i32 on) { socks()->nb[fd] = (u8)(on != 0); }
 
 #define EAGAIN_ 6
 #define ENOTSOCK_ 57
+#define EFAULT_ 21
+#define EINVAL_ 28
 #define MSG_DONTWAIT 0x40
-// a socket that must not block: does it have what is asked (events: 1 read, 4 write)? EAGAIN if not
+// a descriptor that is not a socket: EBADF if it is not open at all, else ENOTSOCK
+static i32 notsock(i32 fd) {
+    u8 st[24] __attribute__((aligned(8)));
+    return w_fd_fdstat_get(fd, st) ? -EBADF : -ENOTSOCK_;
+}
+static i32 nbflag(i32 fd) { return sock_nb(fd) ? MSG_DONTWAIT : 0; }
+// does the socket have what is asked (events: 1 read, 4 write)? An error or a hang-up is an answer too. EAGAIN if not
 static i32 would_block(i32 fd, i32 flags, i32 events) {
     if (!sock_nb(fd) && !(flags & MSG_DONTWAIT)) return 0;
-    return !(net_poll(hof(fd), events, 0) & events);
+    return !(net_poll(hof(fd), events, 0) & (events | 8 | 16));
 }
 
-EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a, i32 b, i32 c) {
-    (void)a, (void)b, (void)c;
+// a placeholder descriptor for a new socket: a directory opened, so the number is a real WASI one. -errno
+static i32 sock_fd(void) {
     u64 all = (1ull << 30) - 1, writes = (1ull << 6) | (1ull << 0) | (1ull << 8) | (1ull << 22);
     i32 fd = -1;
     char dot[2];  // "." built on the stack: a string literal would be a data section
     dot[0] = '.', dot[1] = 0;
-    i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);  // the placeholder
+    i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);
     if (e) return -33;  // EMFILE
     if (fd < 0 || fd >= MAXFD) {
         w_fd_close(fd);
         return -33;
     }
+    return fd;
+}
+
+EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a, i32 b, i32 c) {
+    (void)a, (void)b, (void)c;
+    i32 fd = sock_fd();
+    if (fd < 0) return fd;
     i32 h = net_socket(domain, type & ~(04000 | 02000000), proto);  // without SOCK_NONBLOCK, SOCK_CLOEXEC
     if (h < 0) {
         w_fd_close(fd);
@@ -1245,64 +1946,100 @@ EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a,
     return fd;
 }
 
+EXPORT("__syscall_bind") i32 sc_bind(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
+    (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return notsock(fd);
+    return net_bind(hof(fd), sa, len);
+}
+
+EXPORT("__syscall_listen") i32 sc_listen(i32 fd, i32 backlog, i32 a, i32 b, i32 c, i32 d) {
+    (void)a, (void)b, (void)c, (void)d;
+    if (!is_sock(fd)) return notsock(fd);
+    return net_listen(hof(fd), backlog);
+}
+
+EXPORT("__syscall_accept4") i32 sc_accept4(i32 fd, u8 *sa, u32 *lenp, i32 flags, i32 a, i32 b) {
+    (void)a, (void)b;
+    if (!is_sock(fd)) return notsock(fd);
+    if (flags & ~(04000 | 02000000)) return -EINVAL_;  // SOCK_NONBLOCK, SOCK_CLOEXEC
+    if (would_block(fd, 0, 1)) return -EAGAIN_;
+    i32 nfd = sock_fd();  // before the accept: no descriptor, the connection stays queued
+    if (nfd < 0) return nfd;
+    i32 h = net_accept(hof(fd), sa, lenp, sock_nb(fd));
+    if (h < 0) {
+        w_fd_close(nfd);
+        return h;
+    }
+    socks()->h[nfd] = h + 1;
+    socks()->nb[nfd] = (flags & 04000) != 0;
+    return nfd;
+}
+
 EXPORT("__syscall_connect") i32 sc_connect(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
-    (void)len, (void)a, (void)b, (void)c;
-    if (!is_sock(fd)) return -ENOTSOCK_;
-    // a non-blocking socket connects at once on the host (it can block there) and reports success, not EINPROGRESS
-    i32 family = *(const u16 *)sa, port = (sa[2] << 8) | sa[3];
-    return net_connect(hof(fd), family, port, family == 10 ? sa + 8 : sa + 4);
+    (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return notsock(fd);
+    return net_connect(hof(fd), sa, len, sock_nb(fd));
 }
 
-EXPORT("__syscall_sendto") i32 sc_sendto(i32 fd, const u8 *p, i32 n, i32 flags, i32 addr, i32 alen) {
-    (void)addr, (void)alen;
-    if (!is_sock(fd)) return -ENOTSOCK_;
+EXPORT("__syscall_sendto") i32 sc_sendto(i32 fd, const u8 *p, i32 n, i32 flags, const u8 *addr, i32 alen) {
+    if (!is_sock(fd)) return notsock(fd);
     if (would_block(fd, flags, 4)) return -EAGAIN_;
-    return net_send(hof(fd), p, n);
+    return net_sendto(hof(fd), p, n, flags | nbflag(fd), addr, alen);
 }
 
-EXPORT("__syscall_recvfrom") i32 sc_recvfrom(i32 fd, u8 *p, i32 n, i32 flags, i32 addr, i32 alen) {
-    (void)addr, (void)alen;
-    if (!is_sock(fd)) return -ENOTSOCK_;
+EXPORT("__syscall_recvfrom") i32 sc_recvfrom(i32 fd, u8 *p, i32 n, i32 flags, u8 *addr, u32 *alen) {
+    if (!is_sock(fd)) return notsock(fd);
     if (would_block(fd, flags, 1)) return -EAGAIN_;
-    return net_recv(hof(fd), p, n, flags & 2);  // MSG_PEEK
+    return net_recvfrom(hof(fd), p, n, flags | nbflag(fd), addr, alen);
+}
+
+// sendmsg / recvmsg: the iovecs and msg_name are the host's to read and write; no control data (msg_controllen stays 0,
+// and a message that carries some is EOPNOTSUPP)
+EXPORT("__syscall_sendmsg") i32 sc_sendmsg(i32 fd, const u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
+    (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return notsock(fd);
+    if (would_block(fd, flags, 4)) return -EAGAIN_;
+    return net_sendmsg(hof(fd), msg, flags | nbflag(fd));
+}
+
+EXPORT("__syscall_recvmsg") i32 sc_recvmsg(i32 fd, u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
+    (void)a, (void)b, (void)c;
+    if (!is_sock(fd)) return notsock(fd);
+    if (would_block(fd, flags, 1)) return -EAGAIN_;
+    return net_recvmsg(hof(fd), msg, flags | nbflag(fd));
 }
 
 EXPORT("__syscall_shutdown") i32 sc_shutdown(i32 fd, i32 how, i32 a, i32 b, i32 c, i32 d) {
     (void)a, (void)b, (void)c, (void)d;
-    if (!is_sock(fd)) return -57;
+    if (!is_sock(fd)) return notsock(fd);
     return net_shutdown(hof(fd), how);
 }
 
-static i32 sock_name(i32 fd, u8 *sa, u32 *lenp, i32 peer) {
-    if (!is_sock(fd)) return -57;
-    u8 a4[4];
-    i32 port = 0, e = net_name(hof(fd), peer, a4, &port);
-    if (e) return e;
-    u8 tmp[16];
-    for (i32 i = 0; i < 16; i++) tmp[i] = 0;
-    *(u16 *)tmp = 2;  // AF_INET
-    tmp[2] = (u8)(port >> 8), tmp[3] = (u8)port;
-    for (i32 i = 0; i < 4; i++) tmp[4 + i] = a4[i];
-    u32 n = *lenp < 16 ? *lenp : 16;
-    for (u32 i = 0; i < n; i++) sa[i] = tmp[i];
-    *lenp = 16;
-    return 0;
-}
 EXPORT("__syscall_getpeername") i32 sc_getpeername(i32 fd, u8 *sa, u32 *lenp, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
-    return sock_name(fd, sa, lenp, 1);
+    if (!is_sock(fd)) return notsock(fd);
+    if (!sa || !lenp) return -EFAULT_;
+    return net_name(hof(fd), 1, sa, lenp);
 }
 EXPORT("__syscall_getsockname") i32 sc_getsockname(i32 fd, u8 *sa, u32 *lenp, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
-    return sock_name(fd, sa, lenp, 0);
+    if (!is_sock(fd)) return notsock(fd);
+    if (!sa || !lenp) return -EFAULT_;
+    return net_name(hof(fd), 0, sa, lenp);
 }
 
-EXPORT("__syscall_getsockopt") i32 sc_getsockopt(i32 fd, i32 level, i32 opt, i32 *val, u32 *lenp, i32 a) {
+EXPORT("__syscall_getsockopt") i32 sc_getsockopt(i32 fd, i32 level, i32 opt, u8 *val, u32 *lenp, i32 a) {
     (void)a;
-    if (!is_sock(fd)) return -57;
-    // SO_TYPE: a stream (ssl checks it; the host's sockets here are TCP); SO_ERROR and the rest: 0 (connect blocks)
-    if (val && lenp && *lenp >= 4) *val = (level == 1 && opt == 3) ? 1 : 0, *lenp = 4;
-    return 0;
+    if (!is_sock(fd)) return notsock(fd);
+    if (!val || !lenp) return -EFAULT_;
+    return net_getopt(hof(fd), level, opt, val, lenp);  // the host's real value; ENOPROTOOPT for an option it has not
+}
+
+// setsockopt is a stub INSIDE pyodide.asm.wasm (it returns 0); the build (tools/patch_main.mjs) turns it into this import
+EXPORT("__syscall_setsockopt_host") i32 sc_setsockopt(i32 fd, i32 level, i32 opt, const u8 *val, u32 len, i32 a) {
+    (void)a;
+    if (!is_sock(fd)) return notsock(fd);
+    return net_setopt(hof(fd), level, opt, val, len);
 }
 
 // struct pollfd {int fd; short events, revents;}. Sockets are polled by the host, all in one call, with the timeout;
@@ -1310,6 +2047,7 @@ EXPORT("__syscall_getsockopt") i32 sc_getsockopt(i32 fd, i32 level, i32 opt, i32
 // one is ignored. A file that is ready, or an invalid descriptor, makes the sockets answer at once (nothing to wait for).
 #define POLLNVAL 32
 static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
+    if ((u32)n > MAXFD) return -EINVAL_;  // more entries than descriptors (RLIMIT_NOFILE)
     i32 ready = 0, nsock = 0, immediate = 0;
     i32 *buf = n > 0 ? (i32 *)malloc((u32)n * 3 * 4) : 0;  // handles, events, revents of the sockets
     i32 *hs = buf, *evs = buf + n, *revs = buf + 2 * n;
@@ -1317,7 +2055,7 @@ static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
         i32 fd = *(i32 *)(fds + 8 * k);
         i16 ev = *(i16 *)(fds + 8 * k + 4), rev = 0;
         if (fd >= 0 && is_sock(fd)) {
-            hs[nsock] = hof(fd), evs[nsock] = ev & 5, revs[nsock] = 0;
+            hs[nsock] = hof(fd), evs[nsock] = ev & 7, revs[nsock] = 0;  // POLLIN, POLLPRI, POLLOUT
             nsock++;
         } else if (fd >= 0) {
             u8 st[24] __attribute__((aligned(8)));
@@ -1344,42 +2082,42 @@ static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
 EXPORT("__syscall_poll") i32 sc_poll(u8 *fds, i32 n, i32 timeout) { return do_poll(fds, n, timeout); }
 EXPORT("__syscall_poll_nonblocking") i32 sc_poll_nb(u8 *fds, i32 n) { return do_poll(fds, n, 0); }
 
-// DNS: one IPv4 address, as Emscripten's own getaddrinfo (a single addrinfo; freeaddrinfo frees ai_addr and ai)
+// DNS, by the host. libc's gethostbyname has no way to fail through this call (Pyodide's JavaScript never fails: it
+// makes up an address): a name the host cannot resolve gives INADDR_NONE (255.255.255.255), which no connection reaches.
 EXPORT("_emscripten_lookup_name") u32 lookup_name(const char *name) {
     u8 a[4];
-    if (net_resolve(name, slen(name), a)) return 0;
+    if (net_resolve(name, slen(name), a)) return 0xffffffffu;
     return (u32)a[0] | ((u32)a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
 }
 
+// the whole list is one malloc'd block that freeaddrinfo (it frees the first node and its ai_addr) releases
 EXPORT("getaddrinfo") i32 getaddrinfo_(const char *node, const char *service, const i32 *hint, u32 *out) {
-    u8 a[4] = {0, 0, 0, 0};
-    i32 flags = hint ? hint[0] : 0, family = hint ? hint[1] : 0, type = hint ? hint[2] : 0, proto = hint ? hint[3] : 0;
-    if (family != 0 && family != 2) return -6;  // EAI_FAMILY: IPv4 only
-    if (node) {
-        if (net_resolve(node, slen(node), a)) return -2;  // EAI_NONAME
-    } else if (!(flags & 1)) {                            // not AI_PASSIVE: the loopback address
-        a[0] = 127, a[3] = 1;
-    }
-    i32 port = 0;
-    if (service) {
-        for (const char *p = service; *p; p++) {
-            if (*p < '0' || *p > '9') return -8;  // EAI_SERVICE: numeric ports only
-            port = port * 10 + (*p - '0');
-        }
-    }
-    u8 *sa = (u8 *)calloc(1, 16);
-    i32 *ai = (i32 *)calloc(1, 32);
-    *(u16 *)sa = 2, sa[2] = (u8)(port >> 8), sa[3] = (u8)port;
-    for (i32 i = 0; i < 4; i++) sa[4 + i] = a[i];
-    ai[0] = flags, ai[1] = 2, ai[2] = type ? type : 1, ai[3] = proto;
-    ai[4] = 16, ai[5] = (i32)sa, ai[6] = 0, ai[7] = 0;
-    *out = (u32)ai;
-    return 0;
+    return net_getaddrinfo(node, service, hint, out);
 }
 
-EXPORT("getnameinfo") i32 getnameinfo_(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f, i32 g) {
-    (void)a, (void)b, (void)c, (void)d, (void)e, (void)f, (void)g;
-    return -4;  // EAI_FAIL
+EXPORT("getnameinfo") i32 getnameinfo_(const u8 *sa, i32 salen, char *node, i32 nodelen, char *serv, i32 servlen, i32 flags) {
+    return net_getnameinfo(sa, salen, node, nodelen, serv, servlen, flags);
+}
+
+EXPORT("getprotobyname") u32 getprotobyname_(const char *name) { return net_protobyname(name); }
+
+// ioctl as Pyodide's JavaScript answers: a descriptor that is not open is EBADF; FIONREAD and FIONBIO belong to
+// sockets (a file has no ioctl: ENOTTY); the terminal requests are ENOTTY (no descriptor here is a terminal for
+// them); anything else is EINVAL.
+EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
+    u8 st[24] __attribute__((aligned(8)));
+    if (!is_sock(fd) && w_fd_fdstat_get(fd, st)) return -EBADF;
+    i32 *argp = va ? *(i32 **)va : 0;  // va points at the variable arguments; the first is the argument's address
+    if (op == 0x5421 || op == 0x541B) {  // FIONBIO, FIONREAD
+        if (!is_sock(fd)) return -ENOTTY;
+        if (!argp) return -21;  // EFAULT
+        if (op == 0x541B) return net_ioctl(hof(fd), op, argp);
+        sock_set_nb(fd, *argp != 0);
+        return 0;
+    }
+    if ((op >= 0x5401 && op <= 0x5408) || op == 0x540B || op == 0x540F || op == 0x5410 || op == 0x5413 || op == 0x5414)
+        return -ENOTTY;
+    return -28;  // EINVAL
 }
 
 // the main module's WASI calls, for socket descriptors
@@ -1388,7 +2126,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
-        i32 r = net_recv(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], 0);
+        i32 r = net_recvfrom(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], nbflag(fd), 0, 0);
         if (r < 0) {
             if (tot) break;
             return -r;
@@ -1406,12 +2144,13 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
-        i32 r = net_send(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1]);
+        i32 r = net_sendto(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1], nbflag(fd), 0, 0);
         if (r < 0) {
             if (tot) break;
             return -r;
         }
         tot += r;
+        if (r < (i32)iov[2 * k + 1]) break;
     }
     *nw = tot;
     return 0;
@@ -1419,6 +2158,7 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
 
 EXPORT("fd_close") i32 x_fd_close(i32 fd) {
     if (!is_sock(fd)) {
+        if (mt()->norphan) meta_closing(fd);
         fd_forget(fd);
         return w_fd_close(fd);
     }
@@ -1510,64 +2250,68 @@ EXPORT("_tzset_js") void tzset_js(i32 *timezone, i32 *daylight, char *std_name, 
 }
 
 // ================================================================== owners, nodes, messages, failures
-// Every file belongs to uid/gid 0 in this world, so chown to 0 (or -1: unchanged) changes nothing and succeeds,
-// and to anyone else is not permitted.
-static i32 chown_result(i32 uid, i32 gid) { return (uid == -1 || uid == 0) && (gid == -1 || gid == 0) ? 0 : -63; }  // EPERM
+// chown: any uid and gid is accepted (the process is root of a single-user world) and recorded; -1 leaves one as it is
+static i32 set_owner(const u64 *fs, i32 uid, i32 gid) {
+    Meta *r = meta_for((const u8 *)fs);
+    if (!r) return -ENOMEM;
+    if (uid != -1) r->uid = (u32)uid;
+    if (gid != -1) r->gid = (u32)gid;
+    return 0;
+}
 
 EXPORT("__syscall_fchownat") i32 sc_fchownat(i32 dirfd, const char *path, i32 uid, i32 gid, i32 flags) {
     u64 fs[8];
-    char dot[2];
-    const char *p;
-    i32 n, fd = resolve(dirfd, path, &p, &n, dot);
-    i32 e = w_path_filestat_get(fd, (flags & 0x100) ? 0 : 1, p, n, fs);  // AT_SYMLINK_NOFOLLOW; it must exist
-    return e ? -e : chown_result(uid, gid);
+    i32 e = fx_lookup(dirfd, path, !(flags & 0x100), fs);  // AT_SYMLINK_NOFOLLOW; it must exist
+    return e ? -e : set_owner(fs, uid, gid);
 }
 
 EXPORT("__syscall_fchown32") i32 sc_fchown32(i32 fd, i32 uid, i32 gid) {
     u64 fs[8];
     i32 e = w_fd_filestat_get(fd, fs);
-    return e ? -e : chown_result(uid, gid);
+    if (e) return -e;
+    return is_sock(fd) ? 0 : set_owner(fs, uid, gid);
 }
 
-// mknod: a regular file only; devices and FIFOs do not exist here
+// mknod: a regular file (made like open(O_CREAT|O_EXCL), with the mode and the umask); FIFOs, devices and sockets can not
+// be made over WASI (ENOSYS), and a mode with no type is EINVAL, as Pyodide's JavaScript
 EXPORT("__syscall_mknodat") i32 sc_mknodat(i32 dirfd, const char *path, i32 mode, i32 dev) {
     (void)dev;
     i32 type = mode & 0170000;
-    if (type != 0 && type != 0100000) return -52;  // ENOSYS
-    i32 fd = sc_openat(dirfd, path, 0100 | 0200 | 1, 0);  // O_CREAT | O_EXCL | O_WRONLY
+    if (type != 0100000 && type != 020000 && type != 060000 && type != 010000 && type != 0140000) return -FE_INVAL;
+    if (type != 0100000) return -FE_NOSYS;
+    i32 fd = open_at(dirfd, path, 0100 | 0200 | 1, (u32)mode, 0);  // O_CREAT | O_EXCL | O_WRONLY
     if (fd < 0) return fd;
     x_fd_close(fd);
     return 0;
 }
 
-// sendmsg / recvmsg on a stream socket: the iovec of the message, no addresses and no control data
-// (struct msghdr of wasm32: name, namelen, iov, iovlen, control, controllen, flags)
-EXPORT("__syscall_sendmsg") i32 sc_sendmsg(i32 fd, const u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
-    (void)a, (void)b, (void)c;
-    if (!is_sock(fd)) return -ENOTSOCK_;
-    if (would_block(fd, flags, 4)) return -EAGAIN_;
-    const u32 *iov = (const u32 *)msg[2];
-    i32 total = 0;
-    for (u32 k = 0; k < msg[3]; k++) {
-        i32 r = net_send(hof(fd), (const u8 *)iov[2 * k], (i32)iov[2 * k + 1]);
-        if (r < 0) return total ? total : r;
-        total += r;
-        if (r < (i32)iov[2 * k + 1]) break;
-    }
-    return total;
-}
-
-EXPORT("__syscall_recvmsg") i32 sc_recvmsg(i32 fd, u32 *msg, i32 flags, i32 a, i32 b, i32 c) {
-    (void)a, (void)b, (void)c;
-    if (!is_sock(fd)) return -ENOTSOCK_;
-    if (would_block(fd, flags, 1)) return -EAGAIN_;
-    const u32 *iov = (const u32 *)msg[2];
-    msg[1] = 0;  // msg_namelen: no source address
-    msg[5] = 0;  // msg_controllen: no control data (CPython parses the buffer by this length)
-    msg[6] = 0;  // msg_flags
-    for (u32 k = 0; k < msg[3]; k++)
-        if (iov[2 * k + 1]) return net_recv(hof(fd), (u8 *)iov[2 * k], (i32)iov[2 * k + 1], flags & 2);  // MSG_PEEK
+// statfs / fstatfs: the host answers with the numbers of the folder that backs the path (struct statfs of musl, 88 bytes)
+static i32 statfs_to(i32 preopen, u32 size, u8 *buf) {
+    u8 tmp[88] __attribute__((aligned(8)));
+    for (i32 i = 0; i < 88; i++) tmp[i] = 0;
+    i32 e = fs_statvfs(preopen, tmp);
+    if (e) return e;
+    for (u32 i = 0; i < size && i < 88; i++) buf[i] = tmp[i];
     return 0;
+}
+EXPORT("__syscall_statfs64") i32 sc_statfs64(const char *path, u32 size, u8 *buf) {
+    u64 fs[8];
+    i32 e = fx_lookup(AT_FDCWD, path, 1, fs);  // the path exists, as WASI (sandboxed) sees it, or this is its error
+    if (e) return -e;
+    char dot[2];
+    const char *p;
+    i32 n, pre = resolve(AT_FDCWD, path, &p, &n, dot);  // the preopen the path belongs to
+    return statfs_to(pre, size, buf);
+}
+EXPORT("__syscall_fstatfs64") i32 sc_fstatfs64(i32 fd, u32 size, u8 *buf) {
+    i32 ft = fd_type(fd);
+    if (ft < 0) return ft;
+    const char *bp = fd_base_path(fd);  // a stream, a socket, or no path known: the guest's root
+    char dot[2];
+    const char *p;
+    i32 n, pre = PREOPEN;
+    if (bp) pre = resolve(AT_FDCWD, bp, &p, &n, dot);
+    return statfs_to(pre, size, buf);
 }
 
 // system(): there are no processes. Outside Node the JavaScript glue answers system(NULL) 0 (no shell) and ENOSYS to a

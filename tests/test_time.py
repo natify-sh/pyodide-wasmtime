@@ -15,9 +15,17 @@ from conftest import Guest, check_file
 ZONES = ["UTC", "Europe/Kyiv", "America/New_York", "Australia/Lord_Howe", "Asia/Kolkata"]
 
 
-def run_in_zone(guest: Guest, script: str, tz: str) -> str:
+def run_in_zone(guest: Guest, script: str, tz: str, raw: bool = False) -> str:
     """The script in a fresh guest of the host process with TZ=tz (the guest's Date, as in Node, is the host's zone)."""
-    cmd = [sys.executable, "-m", "pyodide_wasmtime", "--flavor", guest.flavor, "-c", check_file(script)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pyodide_wasmtime",
+        "--flavor",
+        guest.flavor,
+        "-c",
+        script if raw else check_file(script),
+    ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env={**os.environ, "TZ": tz})
     assert r.returncode == 0, r.stderr
     return r.stdout
@@ -40,3 +48,31 @@ def test_local_time_in_the_hosts_zone(guest: Guest, tz: str) -> None:
         pytest.skip(f"the host has no zoneinfo for {tz}")
     out = run_in_zone(guest, "time_local.py", tz).splitlines()
     assert out == expected(f"time_local.{tz.replace('/', '_')}.expected")
+
+
+ABOVE_2GIB = """
+import ctypes as c
+big = [bytearray(1_100_000_000), bytearray(1_100_000_000)]  # the heap now reaches past 2 GiB
+buf = c.create_string_buffer(1 << 20)
+addr = c.addressof(buf)
+class T(c.Structure):
+    _fields_ = [(n, c.c_int) for n in "sec min hour mday mon year wday yday isdst".split()]
+    _fields_ += [("gmtoff", c.c_long), ("zone", c.c_char_p)]
+tm = T.from_buffer(buf)
+libc = c.CDLL(None)
+libc.mktime.restype = c.c_int64
+tm.sec, tm.min, tm.hour, tm.mday, tm.mon, tm.year, tm.isdst = 0, 0, 12, 1, 6, 120, -1
+t = libc.mktime(c.byref(tm))
+print(addr >= 2**31, t, tm.hour, tm.mday, tm.wday, tm.yday)
+tt = c.c_int64(1593604800)
+tm2 = T.from_buffer(buf, 256)
+libc.localtime_r(c.byref(tt), c.byref(tm2))
+print(tm2.hour, tm2.mday, tm2.year, tm2.gmtoff)
+"""
+
+
+def test_structs_above_2_gib_are_read_and_written_where_they_are(guest: Guest) -> None:
+    """An i32 above 2 GiB is a negative number in wasmtime-py: mktime/localtime on a struct tm up there must not touch
+    the other end of the memory."""
+    out = run_in_zone(guest, ABOVE_2GIB, "UTC", raw=True).splitlines()
+    assert out == ["True 1593604800 12 1 3 182", "12 1 120 0"]
