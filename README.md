@@ -12,9 +12,9 @@ pyodide-wasmtime                                                        # a REPL
 ```python
 from pyodide_wasmtime import Pyodide
 
-with Pyodide() as py:                      # the fused build; Pyodide("dynamic") for the other
-    py.run("import json; print(json.dumps({'a': 1}))")        # 0 if it ran, 1 if it raised, N for sys.exit(N)
-    py.run("import sys; sys.exit(3)")                         # -> 3, the interpreter stays usable
+with Pyodide() as py:  # the fused build; Pyodide("dynamic") for the other
+    py.run("import json; print(json.dumps({'a': 1}))")  # 0 if it ran, 1 if it raised, N for sys.exit(N)
+    py.run("import sys; sys.exit(3)")  # -> 3, the interpreter stays usable
 ```
 
 It is meant to run anything Pyodide runs without the browser's JavaScript: the standard library, binary Emscripten wheels
