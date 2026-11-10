@@ -49,7 +49,7 @@ More in [docs/EXPERIMENT.md](docs/EXPERIMENT.md) (the experiment this came from:
 and [docs/NOTES-FUSEDWASI-AND-TESTSUITE.md](docs/NOTES-FUSEDWASI-AND-TESTSUITE.md) (WASI 0.2 over fusedwasi, next).
 
 ## Build (CI does this; Node is a build tool only)
-One toolchain: **wasi-sdk 34's clang** builds `adapter.wasm`, `wasm-opt.wasm` and the guest's `_ssl`; Binaryen's `wasm-opt`/`wasm-merge` come from npm (`package.json` pins Pyodide and Binaryen; Dependabot tracks them).
+One toolchain: **wasi-sdk 34's clang** builds `adapter.wasm`, `wasm-opt.wasm` and the guest's `_ssl`; Binaryen's `wasm-opt`/`wasm-merge` and binaryen.js (`tools/patch_main.mjs`, which makes libc's `setsockopt` call the adapter) come from npm (`package.json` pins Pyodide and Binaryen; Dependabot tracks them).
 
 ```sh
 uv sync
