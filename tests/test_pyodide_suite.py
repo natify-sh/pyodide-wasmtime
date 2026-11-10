@@ -21,6 +21,7 @@ from textwrap import dedent
 from typing import Any
 
 import pytest
+from boot_modules import BOOT_MODULES
 from conftest import missing, testenv
 
 from pyodide_wasmtime import FLAVORS
@@ -41,6 +42,11 @@ import unittest
 from test.libregrtest.main import main
 sys.excepthook = sys.__excepthook__
 
+for _name in {boot_modules}:  # what Pyodide's own start-up has imported (tests/boot_modules.py)
+    try:
+        importlib.import_module(_name)
+    except Exception:
+        pass
 platform.platform(aliased=True)
 import _testcapi
 if hasattr(_testcapi, "raise_SIGINT_then_send_None"):
@@ -122,7 +128,7 @@ def test_cpython_core(suite_flavor: str, module: tuple[str, dict[str, Any]]):
         "--mount",
         f"/lib/python3.15/site-packages/test={t / 'suite' / 'test'}",
         "-c",
-        dedent(GUEST).format(name=name, ignore_tests=repr(ignore_tests)),
+        dedent(GUEST).format(name=name, ignore_tests=repr(ignore_tests), boot_modules=repr(BOOT_MODULES)),
     ]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout * TIMEOUT_FACTOR, 120))
