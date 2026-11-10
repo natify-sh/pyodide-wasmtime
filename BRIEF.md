@@ -15,6 +15,9 @@ package's, with the legacy wasm exceptions converted once to `exnref`. The packa
 * **Not a rebuild of Pyodide or of Emscripten.** One Pyodide build is supported (`PYODIDE_VERSION` 315.0.0-alpha.2, ABI `pyemscripten_2026_5_wasm32`); the adapter answers that build's imports.
 * **Not a sandbox against the host.** The guest's `/` is a temporary folder, but the host's sockets and fetch are real; `mounts` hand host folders over.
 * **Not a Node or a Binaryen user at run time.** Node and npm's Binaryen are **build** tools (`tools/*.sh`, CI). The run time needs wasmtime-py and the wasm files in the wheel.
+* **Not a Component Model component (for now).** Emscripten's ABI does not fit it: a wheel's `.so` imports the main module's memory, table, stack pointer, exception tag and `GOT.*` globals, which cannot cross component instances; the `env`
+  imports are Emscripten's JavaScript glue, not WIT; and `dlopen` needs a new core module at run time, which a component cannot create. So Fastly Compute, Spin and wasmCloud, which run components, are not targets. Stock CPython for WASI
+  (e.g. `componentize-py`) cannot load binary wheels at all (WASI has no `dlopen`); **loading Emscripten wheels at run time, by a host we control, is what this project does** and why it exists. Details and the open question: `docs/NOTES-FUSEDWASI-AND-TESTSUITE.md`, section 3.
 * **Not wasmhost.** [wasmhost](https://github.com/natify-sh/py-wasmhost) is the sibling (the WebAssembly API on many engines); this package came out of its experiments (`docs/EXPERIMENT.md`) but depends on nothing of it.
 
 ## The architecture in five lines
@@ -32,6 +35,7 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 
 * **Done (2026-11-10):** the package on branch `claude/ecstatic-cray-to1b3t` (not yet merged): both builds, CLI, API, wheel (13 MB), tests, CI written. Offline tests pass locally on both builds; a part of the official suite passes (see the PR / CI for the current numbers). CI has not yet run end to end.
 * **Next** (from [docs/NOTES-FUSEDWASI-AND-TESTSUITE.md](docs/NOTES-FUSEDWASI-AND-TESTSUITE.md)): read the CI run and fix what it shows; then the rest of the official suite (`test_python_socket.py`, the package tests of numpy/cffi/micropip/test-cpp-exceptions); WASI 0.2 over fusedwasi, replacing the `net` operations.
+* **Standards we follow:** core WebAssembly 3.0 (exnref, GC, function references), the `dylink.0` convention (LLVM/Emscripten tool-conventions) for side modules, PEP 783 for the wheel tag (`pyemscripten_YYYY_N_wasm32`), WASI 0.1 now and 0.2/0.3 for sockets, HTTP and files next (replacing our `net` operations). The `loader.*` interface (four functions) is our own extension and the contract between the adapter and a host.
 * **Waiting for the owner:** a pull request (the assistant does not open one); the decision about the license/size policy of Pyodide artifacts in the wheel (they are carried now; the alternative is a download at first run with a sha256 check); `CLAUDE.md` rules that were taken from wasmhost and are not yet confirmed for this project (below).
 
 ## Hard rules (short form; the full list is in CLAUDE.md)
