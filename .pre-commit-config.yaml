@@ -45,11 +45,4 @@ repos:
         pass_filenames: false
         files: '\.pyi?$'
 
-      - id: uv-pytest
-        name: pytest (offline, the fast part)
-        entry: uv
-        # The network tests and Pyodide's official suite have their own CI jobs.
-        args: ["run", "pytest", "-q", "-m", "not network and not suite"]
-        language: system
-        pass_filenames: false
-        files: '(\.py|pyproject\.toml)$'
+      # No pytest hook: the tests need the built wasm (tools/build_data.sh), which tests.yml builds and runs them on.
