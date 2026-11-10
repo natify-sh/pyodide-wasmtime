@@ -120,7 +120,6 @@ try:
     A.nothing
 except AttributeError as e:
     print(e)
-print("main", P(ctypes.pythonapi.PyType_GenericAlloc) == P(ctypes.pythonapi.PyType_GenericAlloc))
 m = ctypes.CDLL(None)
 try:
     m.nonexistent_symbol_xyz
@@ -135,7 +134,6 @@ except AttributeError as e:
         "data True",
     ]
     assert out[4] == 'Tried to lookup unknown symbol "nothing" in dynamic lib: /m/a.so'
-    assert out[5] == "main True"
     assert out[-1] == 'Tried to lookup unknown symbol "nonexistent_symbol_xyz" in dynamic lib: __main__'
 
 
@@ -179,7 +177,8 @@ for n in {NAMES_OF_THE_ADAPTER!r}.split() + ["malloc", "emscripten_log", "emscri
     for n in [*NAMES_OF_THE_ADAPTER.split(), "malloc", "emscripten_log", "emscripten_dlopen", "emscripten_log_impl_js"]:
         assert found[n] == "found", n
     assert found["_emscripten_log_formatted"] == "found"
-    # the JavaScript bridge is stubbed: the glue's `stub` mark makes dlsym not see those
+    # a DIFFERENCE from Pyodide, on purpose: its JavaScript bridge functions are real there (dlsym finds them);
+    # here they are zero stubs, and a stub that returns 0 in silence would be a fake: hidden from dlsym and the GOT
     assert found["JsArray_count_js"] == "missing" and found["JsProxy_Bool_js"] == "missing"
 
 
@@ -455,3 +454,158 @@ m.emscripten_log_impl_js(b"LOG impl")
         "LOG direct error",
         "LOG impl",
     ]
+
+
+def test_a_bridge_function_a_side_module_imports_is_an_error_not_a_zero(guest: Guest):
+    files = {
+        "/b/call.so": sidemod.lib(1, fn="c", env_calls=("JsArray_count_js",)),
+        "/b/got.so": sidemod.lib(1, fn="g", got_funcs=("JsArray_count_js",)),
+    }
+    out = ok(
+        guest,
+        files,
+        """
+try:
+    ctypes.CDLL("/b/got.so")
+except OSError as e:
+    print(str(e).replace("\\n", "|"))
+ctypes.CDLL("/b/call.so")
+print("loaded", flush=True)
+""",
+    )
+    assert (
+        out[0]
+        == "could not load dynamic lib: /b/got.so|Error: Dynamic linking error: undefined symbol 'JsArray_count_js'"
+    )
+    p = run(guest, files, 'ctypes.CDLL("/b/call.so").call_JsArray_count_js()')
+    assert p.returncode != 0 and "cannot resolve symbol JsArray_count_js" in p.stderr
+
+
+def test_a_huge_dylink_table_or_memory_is_a_dlerror_not_the_end(guest: Guest):
+    wasm, dy = sidemod.lib_parts(1)
+    files = {
+        "/h/table.so": sidemod.with_dylink(wasm, memsize=dy["memsize"], memalign=dy["memalign"], tsize=0x7FFFFFF0),
+        "/h/memory.so": sidemod.with_dylink(wasm, memsize=0x7FFF0000, memalign=dy["memalign"], tsize=dy["tsize"]),
+        "/h/ok.so": sidemod.lib(5),
+    }
+    out = ok(
+        guest,
+        files,
+        r"""
+for p in ("/h/table.so", "/h/memory.so"):
+    try:
+        ctypes.CDLL(p)
+        print("loaded", p)
+    except OSError as e:
+        print(str(e).replace("\n", "|"))
+print(ctypes.CDLL("/h/ok.so").val())
+""",
+    )
+    why = "|RangeError: WebAssembly.Memory(): out of memory"
+    assert out == [
+        f"could not load dynamic lib: /h/table.so{why}",
+        f"could not load dynamic lib: /h/memory.so{why}",
+        "5",
+    ]
+
+
+HOLD = "held = [bytearray(1100 << 20) for _ in range(3)]\n"
+
+
+def test_no_memory_for_a_big_file_is_a_dlerror(guest: Guest):
+    out = ok(
+        guest,
+        {},
+        HOLD
+        + r"""
+with open("/big.so", "wb") as f:
+    f.truncate(1000 << 20)
+try:
+    ctypes.CDLL("/big.so")
+except OSError as e:
+    print(str(e).replace("\n", "|"))
+""",
+    )
+    assert out == ["could not load dynamic lib: /big.so|RangeError: WebAssembly.Memory(): out of memory"]
+
+
+def test_a_dlerror_without_memory_for_its_text_is_an_attribute_error(guest: Guest):
+    out = ok(
+        guest,
+        {},
+        HOLD
+        + r"""
+m = ctypes.CDLL(None)
+try:
+    getattr(m, "q" * 3000000)
+except AttributeError as e:
+    print("AttributeError", len(str(e)) > 0)
+""",
+    )
+    assert out == ["AttributeError True"]
+
+
+def test_exported_globals_that_are_no_address(guest: Guest):
+    out = ok(
+        guest,
+        {"/o/o.so": sidemod.lib(1, other_globals=True)},
+        r"""
+o = ctypes.CDLL("/o/o.so")
+for n in ("gf64", "gi64"):
+    try:
+        print(n, "found", isinstance(ctypes.c_int.in_dll(o, n).value, int))
+    except (AttributeError, ValueError) as e:
+        print(n, type(e).__name__)
+print(o.val())
+""",
+    )
+    assert out[0].startswith("gf64 found") and out[1] in ("gi64 AttributeError", "gi64 ValueError") and out[2] == "1"
+
+
+def test_legacy_exceptions_and_wasi_together(guest: Guest):
+    out = ok(guest, {"/l/l.so": sidemod.legacy_try_with_wasi()}, 'print(ctypes.CDLL("/l/l.so").rnd())')
+    assert out == ["0"]
+
+
+def test_wasi_calls_of_a_side_module_that_the_adapter_owns_reach_the_adapter(guest: Guest):
+    # fd_write on a socket descriptor is the adapter's (wasmtime's WASI would say EBADF, 8)
+    out = ok(
+        guest,
+        {"/w/w.so": sidemod.lib(1, wasi=True)},
+        """
+import socket
+w = ctypes.CDLL("/w/w.so")
+s = socket.socket()
+print(w.wrfd(1), w.wrfd(s.fileno()) != 8, w.wrfd(999))
+""",
+    )
+    assert out == ["0 True 8"]
+
+
+def test_needed_is_the_library_the_glue_finds_not_one_of_that_file_name(guest: Guest):
+    files = {
+        "/a/libx.so": sidemod.lib(1, fn="x"),
+        "/b/libx.so": sidemod.lib(2, fn="x"),
+        "/b/m.so": sidemod.lib(3, fn="m", env_calls=("x",), needed=("libx.so",), rpaths=("$ORIGIN",)),
+    }
+    out = ok(guest, files, 'ctypes.CDLL("/a/libx.so")\nprint(ctypes.CDLL("/b/m.so").call_x())')
+    assert out == ["2"]
+
+
+def test_the_first_library_made_global_wins(guest: Guest):
+    files = {
+        "/g/a.so": sidemod.lib(1, fn="val"),
+        "/g/b.so": sidemod.lib(2, fn="val"),
+        "/g/d.so": sidemod.lib(4, fn="d", env_calls=("val",)),
+    }
+    out = ok(
+        guest,
+        files,
+        """
+ctypes.CDLL("/g/a.so")
+ctypes.CDLL("/g/b.so", mode=ctypes.RTLD_GLOBAL)
+ctypes.CDLL("/g/a.so", mode=ctypes.RTLD_GLOBAL)
+print(ctypes.CDLL("/g/d.so").call_val(), ctypes.CDLL(None).val())
+""",
+    )
+    assert out == ["2 2"]

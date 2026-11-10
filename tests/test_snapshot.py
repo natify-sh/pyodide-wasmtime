@@ -132,8 +132,10 @@ def test_key_changes_with_stdlib_stamp_and_dev(flavor, cache, monkeypatch):
         "import ctypes\nf = ctypes.pythonapi.Py_IsInitialized\n",
         "log = open('/pre.txt', 'w')\nlog.write('x')\n",
         "import os\nos.mkdir('/w')\nos.chdir('/w')\n",
+        "import mmap\nopen('/mm', 'wb').write(b'x' * 10)\nf = open('/mm', 'r+b')\n"
+        "m = mmap.mmap(f.fileno(), 10)\nf.close()\n",
     ],
-    ids=["ctypes-slot", "open-file", "chdir"],
+    ids=["ctypes-slot", "open-file", "chdir", "mmap-kept"],
 )
 def test_preload_with_unsnapshotable_state_is_not_saved(flavor, cache, pre):
     for _ in range(2):  # the program works on both starts
@@ -185,7 +187,7 @@ def test_no_stdin_does_not_break_the_key(flavor, cache, monkeypatch):
 def test_state_the_host_keeps_makes_the_snapshot_be_skipped(flavor, cache, preload):
     with Pyodide(flavor, preload=preload) as py:
         assert py.run("print('ok')") == 0
-        assert py.host_state and not py.restored
+        assert py.closures_out and not py.restored
     assert snaps(cache) == []
 
 
@@ -217,3 +219,23 @@ def test_the_host_time_zone_is_part_of_the_snapshot_key(flavor, cache, monkeypat
         (True, "('UTC-0000', 'UTC-0000')"),
         (False, "('UTC+0200', 'UTC+0300')"),
     ]
+
+
+def test_a_failed_dlopen_in_the_preload_leaves_the_loader_working(flavor, cache, capfd):
+    # the loader's state is wasm globals and host objects, which a snapshot (linear memory only) does not hold
+    pre = "import ctypes\ntry:\n    ctypes.CDLL('/nope.so')\nexcept OSError:\n    pass\n"
+    code = (
+        "import ctypes\n"
+        "try:\n    ctypes.CDLL('/nope2.so')\nexcept OSError as e:\n    print(str(e).replace(chr(10), '|'))\n"
+        "m = ctypes.CDLL(None)\nprint(ctypes.cast(m.PyType_GenericAlloc, ctypes.c_void_p).value is not None)\n"
+    )
+    outs = []
+    for _ in range(2):
+        with Pyodide(flavor, preload=pre) as py:
+            assert py.run(code) == 0
+            outs.append((py.restored, capfd.readouterr().out))
+    assert [r for r, _ in outs] == [False, True]
+    assert outs[0][1] == outs[1][1]
+    assert outs[1][1].splitlines()[0] == (
+        'could not load dynamic lib: /nope2.so|Error: Failed to find dynamic library "/nope2.so"'
+    )

@@ -62,6 +62,7 @@ def lib_parts(
     got_funcs: tuple[str, ...] = (),
     got_mems: tuple[str, ...] = (),
     data: tuple[str, ...] = (),
+    other_globals: bool = False,
     callbacks: bool = False,
     wasi: bool = False,
     garbage: int = 0,
@@ -98,12 +99,21 @@ def lib_parts(
     w.append("  (elem (global.get $tb) func $v)")
     for d in data:
         w.append(f'  (global (export "{d}") i32 (i32.const 0))')
+    if other_globals:  # exported globals that are no address: f64 and i64
+        w.append('  (global (export "gf64") f64 (f64.const 1.5))')
+        w.append('  (global (export "gi64") i64 (i64.const 7))')
     if wasi:  # fd_write of an empty buffer to stdout, and random_get of 8 bytes: 0 is success
         w.append('  (func (export "rnd") (result i32) (call $random_get (global.get $mb) (i32.const 8)))')
         w.append(
             '  (func (export "wr") (result i32) (i32.store (global.get $mb) (i32.add (global.get $mb) (i32.const 16)))'
             " (i32.store offset=4 (global.get $mb) (i32.const 0))"
             " (call $fd_write (i32.const 1) (global.get $mb) (i32.const 1) (i32.add (global.get $mb) (i32.const 8))))"
+        )
+        w.append(  # fd_write of an empty buffer to the descriptor given: a socket is the adapter's, not wasmtime's
+            '  (func (export "wrfd") (param i32) (result i32)'
+            " (i32.store (global.get $mb) (i32.add (global.get $mb) (i32.const 16)))"
+            " (i32.store offset=4 (global.get $mb) (i32.const 0))"
+            " (call $fd_write (local.get 0) (global.get $mb) (i32.const 1) (i32.add (global.get $mb) (i32.const 8))))"
         )
     if callbacks:
         w.append(
@@ -143,3 +153,30 @@ def guest_files(files: dict[str, bytes]) -> str:
         f"os.makedirs(os.path.dirname({p!r}), exist_ok=True)\nopen({p!r}, 'wb').write(bytes.fromhex({b.hex()!r}))\n"
         for p, b in files.items()
     )
+
+
+def legacy_try_with_wasi() -> bytes:
+    """A side module with a legacy `try ... catch_all` (wasmtime refuses it until the loader converts it) that also
+    imports WASI's random_get: `rnd()` fills 8 bytes of its memory and returns 0."""
+
+    def sec(i: int, body: bytes) -> bytes:
+        return bytes([i]) + uleb(len(body)) + body
+
+    def imp(m: str, f: str, desc: bytes) -> bytes:
+        return name(m) + name(f) + desc
+
+    types = sec(1, bytes([2, 0x60, 2, 0x7F, 0x7F, 1, 0x7F, 0x60, 0, 1, 0x7F]))
+    imports = sec(
+        2,
+        bytes([5])
+        + imp("env", "memory", bytes([2, 0, 1]))
+        + imp("env", "__indirect_function_table", bytes([1, 0x70, 0, 0]))
+        + imp("env", "__memory_base", bytes([3, 0x7F, 0]))
+        + imp("env", "__table_base", bytes([3, 0x7F, 0]))
+        + imp("wasi_snapshot_preview1", "random_get", bytes([0, 0])),
+    )
+    funcs = sec(3, bytes([1, 1]))
+    exports = sec(7, bytes([1]) + name("rnd") + bytes([0, 1]))
+    body = bytes([0, 0x06, 0x40, 0x01, 0x19, 0x01, 0x0B, 0x23, 0, 0x41, 8, 0x10, 0, 0x0B])  # try nop catch_all nop end
+    code = sec(10, bytes([1]) + uleb(len(body)) + body)
+    return with_dylink(b"\0asm\1\0\0\0" + types + imports + funcs + exports + code, memsize=16, memalign=4, tsize=0)
