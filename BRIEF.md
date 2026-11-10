@@ -12,7 +12,7 @@ package's, with the legacy wasm exceptions converted once to `exnref`. The packa
 ## What it is NOT
 
 * **Not Pyodide's JavaScript API.** `js`, `pyodide.ffi`, `JsProxy`/`PyProxy`, `loadPackage` from JS need the bridge; the 214 `env` imports that are the bridge, GL and the like are zero/null stubs. Tests that need them are N/A, not failures.
-* **Not a rebuild of Pyodide or of Emscripten.** One Pyodide build is supported (`PYODIDE_VERSION` 315.0.0-alpha.2, ABI `pyemscripten_2026_5_wasm32`); the adapter answers that build's imports.
+* **Not a rebuild of Pyodide or of Emscripten.** The one change to Pyodide's binary is made at build time (`tools/patch_main.mjs`): libc's `setsockopt`, which Emscripten compiles to `return 0` without calling the syscall, becomes a call of an import the adapter answers; each such stub needs its own patch. One Pyodide build is supported (`PYODIDE_VERSION` 315.0.0-alpha.2, ABI `pyemscripten_2026_5_wasm32`); the adapter answers that build's imports.
 * **Not a sandbox against the host.** The guest's `/` is a temporary folder, but the host's sockets and fetch are real; `mounts` hand host folders over.
 * **Not a Node or a Binaryen user at run time.** Node and npm's Binaryen are **build** tools (`tools/*.sh`, CI). The run time needs wasmtime-py and the wasm files in the wheel.
 * **Not a Component Model component (for now).** Emscripten's ABI does not fit it: a wheel's `.so` imports the main module's memory, table, stack pointer, exception tag and `GOT.*` globals, which cannot cross component instances; the `env`
