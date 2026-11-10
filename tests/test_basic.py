@@ -84,3 +84,49 @@ def test_two_interpreters_in_one_process(flavor: str):
         assert b.run("assert 'x' not in dir()") == 0
         assert a.run("assert x == 1") == 0
         assert a.run("raise SystemExit(3)") != 0
+
+
+def test_ctypes_calls_with_floats_and_64_bit_values(guest: Guest):
+    """ffi_call_js: mixed signatures (double, float, int64) through the generated call_indirect dispatch."""
+    p = guest.run(
+        "import ctypes\n"
+        "c = ctypes.CDLL(None)\n"
+        "def f(n, r, *a):\n    g = getattr(c, n); g.restype = r; g.argtypes = list(a); return g\n"
+        "d, fl, ll = ctypes.c_double, ctypes.c_float, ctypes.c_longlong\n"
+        "print(f('pow', d, d, d)(2.0, 10.0), f('fabsf', fl, fl)(-1.5), f('ldexp', d, d, ctypes.c_int)(3.0, 4),\n"
+        "      f('llabs', ll, ll)(-2**40), f('atof', d, ctypes.c_char_p)(b'2.5'), f('fma', d, d, d, d)(2.0, 3.0, 4.0))"
+    )
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.split() == ["1024.0", "1.5", "48.0", "1099511627776", "2.5", "10.0"]
+
+
+def test_dup_scandir_fwalk_and_rmtree(guest: Guest):
+    p = guest.run(
+        "import os, shutil\n"
+        "os.makedirs('/d/sub/deep')\nopen('/d/sub/f.txt', 'w').write('hello')\n"
+        "fd = os.open('/d/sub/f.txt', os.O_RDONLY); os.lseek(fd, 2, 0); d = os.dup(fd)\n"
+        "print(os.read(d, 10), sorted(e.name for e in os.scandir(os.open('/d/sub', os.O_RDONLY))),\n"
+        "      len(list(os.fwalk('/d'))))\n"
+        "shutil.rmtree('/d'); print(os.path.exists('/d'))"
+    )
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.split("\n")[:2] == ["b'llo' ['deep', 'f.txt'] 3", "False"]
+
+
+def test_chdir_symlink_and_honest_enosys(guest: Guest):
+    p = guest.run(
+        "import os, errno\n"
+        "os.makedirs('/a/b'); os.chdir('/a'); os.chdir('b'); print(os.getcwd())\n"
+        "open('f', 'w').write('x'); os.symlink('f', 'ln'); print(os.readlink('ln'), os.path.exists('/a/b/ln'))\n"
+        "for name, call in (('pipe', os.pipe), ('dup(1)', lambda: os.dup(1))):\n"
+        "    try: call()\n    except OSError as e: print(name, errno.errorcode[e.errno])"
+    )
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.split("\n")[:4] == ["/a/b", "f True", "pipe ENOSYS", "dup(1) ENOSYS"]
+
+
+def test_exit_codes(guest: Guest):
+    assert guest.run("import sys; sys.exit(3)").returncode == 3
+    assert guest.run("import os; os._exit(7)").returncode == 7
+    assert guest.run("1 / 0").returncode == 1
+    assert guest.run("import os; os.abort()").returncode == 134  # the guest trapped

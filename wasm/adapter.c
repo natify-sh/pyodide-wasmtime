@@ -1054,9 +1054,49 @@ typedef void (*v6)(u32, u32, u32, u32, u32, u32);
 typedef void (*v7)(u32, u32, u32, u32, u32, u32, u32);
 typedef void (*v8)(u32, u32, u32, u32, u32, u32, u32, u32);
 
+#include "ffi_calls.h"  // generated: Arg and ffi_dispatch (tools/gen_ffi.py)
+
+// libffi type -> class of the wasm value: 0 i32 (integers, pointers), 1 i64, 2 f32, 3 f64; -1: not supported
+static i32 ffi_class(u16 t) {
+    switch (t) {
+        case 1: case 5: case 6: case 7: case 8: case 9: case 10: case 14: return 0;
+        case 11: case 12: return 1;  // UINT64, SINT64
+        case 2: return 2;            // FLOAT
+        case 3: return 3;            // DOUBLE
+        default: return -1;          // long double, structs by value
+    }
+}
+
 EXPORT("ffi_call_js") void ffi_call_js(ffi_cif_t *cif, u32 fn, void *rvalue, void **avalue) {
-    u32 a[8];
     u32 n = cif->nargs;
+    {  // floats and 64-bit values: the generated dispatch (up to 4 arguments)
+        i32 mixed = 0, rcls = cif->rtype->type == 0 ? -2 : ffi_class(cif->rtype->type);  // -2: void, -1: unsupported
+        if (rcls != 0 && rcls != -2) mixed = 1;
+        for (u32 i = 0; i < n && n <= 8; i++)
+            if (ffi_class(cif->arg_types[i]->type) != 0) mixed = 1;
+        if (mixed) {
+            if (n > 4 || rcls == -1) __builtin_trap();  // more than 4 mixed arguments, a struct or a long double
+            Arg args[4], ret;
+            u32 pid = 0;
+            for (u32 i = 0; i < n; i++) {
+                i32 c = ffi_class(cif->arg_types[i]->type);
+                if (c < 0) __builtin_trap();
+                const void *p = avalue[i];
+                if (c == 0) args[i].i = int_arg(cif->arg_types[i], p);
+                else if (c == 1) args[i].l = *(const u64 *)p;
+                else if (c == 2) args[i].f = *(const float *)p;
+                else args[i].d = *(const double *)p;
+                pid = pid * 4 + (u32)c;
+            }
+            u32 base = n == 0 ? 0 : n == 1 ? 1 : n == 2 ? 5 : n == 3 ? 21 : 85;
+            ffi_dispatch(fn, (base + pid) * 5 + (u32)(rcls == -2 ? 0 : rcls + 1), args, &ret);
+            if (rcls == 1) *(u64 *)rvalue = ret.l;
+            else if (rcls == 2) *(float *)rvalue = ret.f;
+            else if (rcls == 3) *(double *)rvalue = ret.d;
+            return;
+        }
+    }
+    u32 a[8];
     if (n > 8) __builtin_trap();
     for (u32 i = 0; i < 8; i++) a[i] = i < n ? int_arg(cif->arg_types[i], avalue[i]) : 0;
     u16 rt = cif->rtype->type;

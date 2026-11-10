@@ -39,9 +39,9 @@ def test_fused_imports_only_wasi_loader_net():
     m = Module(_engine.engine(), need("pyodide_fused.wasm").read_bytes())
     assert sorted({i.module for i in m.imports}) == ["loader", "net", "wasi_snapshot_preview1"]
     counts = {mod: sum(i.module == mod for i in m.imports) for mod in ("wasi_snapshot_preview1", "loader", "net")}
-    # 33 WASI functions (27 + path_symlink, path_link, fd_allocate, fd_datasync, fd_fdstat_set_flags, proc_exit), the
-    # loader's 4 operations and the 9 of the host's sockets
-    assert counts == {"wasi_snapshot_preview1": 33, "loader": 4, "net": 9}
+    # 36 WASI imports (the main module's own and the adapter's: files, links, dup, fcntl, exit), the loader's 4
+    # operations and the 9 of the host's sockets
+    assert counts == {"wasi_snapshot_preview1": 36, "loader": 4, "net": 9}
 
 
 def test_the_package_carries_what_the_run_time_needs():
