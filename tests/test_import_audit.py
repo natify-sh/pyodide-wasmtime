@@ -53,12 +53,12 @@ def test_entries_are_well_formed(audit):
 
 
 def test_verdicts_agree_with_the_built_adapter(built, audit):
+    """An exported function can be anything but n/a (a lying `stub` and an always-failing `enosys` included);
+    one that is not exported is a stub, ENOSYS (a system call) or has no meaning without JavaScript."""
     _, answered = built
     for name, e in audit.items():
         if name in answered:
-            assert e["verdict"] in ("full", "partial"), (
-                f"{name} is exported by the adapter but the audit says {e['verdict']}"
-            )
+            assert e["verdict"] != "n/a", f"{name} is exported by the adapter but the audit says n/a"
         else:
             assert e["verdict"] in ("enosys", "stub", "n/a"), (
                 f"{name} is not answered but the audit says {e['verdict']}"
