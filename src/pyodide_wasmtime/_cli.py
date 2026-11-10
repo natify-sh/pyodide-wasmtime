@@ -10,21 +10,21 @@ import sys
 from . import PYODIDE_ABI, PYODIDE_VERSION, __version__
 from ._host import FLAVORS, Pyodide
 
-REPL = """\
-import ast, code, inspect, sys, types
+# The REPL's console lives in the guest (state between lines); the host reads the lines (readline, or prompt_toolkit
+# when installed) and pushes each one. The guest tells the host in /_repl whether the line needs more.
+SETUP = """\
+import ast, code, inspect, types
 try:
     import hostnet
     hostnet.install()
 except ImportError:
     hostnet = None
-AWAIT = {aw}
 
 
 class Console(code.InteractiveConsole):
-    # top-level await, as in Pyodide's REPL: the coroutine runs on hostnet's loop (no JavaScript, no threads)
-    def __init__(self):
-        super().__init__()
-        if AWAIT:
+    def __init__(self, aw):
+        super().__init__(__import__("__main__").__dict__)
+        if aw:  # top-level await, as in Pyodide's REPL: on hostnet's loop (no JavaScript, no threads)
             self.compile.compiler.flags |= ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
 
     def runcode(self, c):
@@ -38,8 +38,58 @@ class Console(code.InteractiveConsole):
             self.showtraceback()
 
 
-Console().interact(banner='Python ' + sys.version.split()[0] + ' on wasmtime (Pyodide {v})', exitmsg='')
+_console = Console({aw})
+import sys; print("Python " + sys.version.split()[0] + " on wasmtime (Pyodide {v})")
 """
+PUSH = """\
+import sys
+try:
+    _more = _console.push({line!r})
+except SystemExit:
+    open("/_repl", "w").write("exit")
+    raise
+sys.stdout.flush()
+open("/_repl", "w").write("more" if _more else "done")
+"""
+
+
+def _reader():
+    """The line reader: prompt_toolkit if installed (extra `repl`), else input() with the host's readline if any."""
+    try:
+        from prompt_toolkit import PromptSession
+
+        return PromptSession().prompt
+    except ImportError:
+        try:
+            import readline  # noqa: F401  (input() uses it when imported)
+        except ImportError:
+            pass
+        return input
+
+
+def repl(py: Pyodide, aw: bool) -> int:
+    py.run(SETUP.format(aw=aw, v=PYODIDE_VERSION))
+    assert py.root is not None
+    flag = py.root / "_repl"
+    read = _reader()
+    more = False
+    while True:
+        try:
+            line = read("... " if more else ">>> ")
+        except EOFError:
+            print()
+            return 0
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt")
+            py.run("_console.resetbuffer()")
+            more = False
+            continue
+        flag.unlink(missing_ok=True)
+        rc = py.run(PUSH.format(line=line))
+        state = flag.read_text() if flag.exists() else "done"
+        if state == "exit":
+            return rc
+        more = state == "more"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -77,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
     mounts = dict(m.split("=", 1) for m in ns.mount)
     argv0: list[str] | None = None
+    code: str | None
     if ns.code is not None:
         code = ns.code
         argv0 = ["-c", *([ns.file] if ns.file else []), *ns.args]
@@ -85,8 +136,10 @@ def main(argv: list[str] | None = None) -> int:
             code = f.read()
         argv0 = [ns.file, *ns.args]
     elif sys.stdin.isatty():
-        code = REPL.format(v=PYODIDE_VERSION, aw=ns.allow_top_level_await)
+        code = None
     else:
         code = sys.stdin.read()
     with Pyodide(ns.flavor, site=ns.site, mounts=mounts, data=ns.data, preopen_dev=ns.dev or None) as py:
+        if code is None:
+            return repl(py, ns.allow_top_level_await)
         return py.run(code, argv0)  # 0, 1 for an uncaught error, or the code of sys.exit()/os._exit()

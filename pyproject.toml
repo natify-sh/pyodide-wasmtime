@@ -38,6 +38,8 @@ pyodide-wasmtime = "pyodide_wasmtime._cli:main"
 
 [project.optional-dependencies]
 wasmtime = ["wasmtime>=50.0.1"]
+# optional: a nicer REPL (history, editing, multi-line paste); without it the REPL uses input()
+repl = ["prompt_toolkit>=3.0"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -56,6 +58,7 @@ dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "pytest-cov>=7.0.0",
+    "prompt_toolkit>=3.0",
     "ruff>=0.17.3",
     "wasmtime>=50.0.1",
 ]
