@@ -10,10 +10,36 @@ import sys
 from . import PYODIDE_ABI, PYODIDE_VERSION, __version__
 from ._host import FLAVORS, Pyodide
 
-REPL = (
-    "import code, sys; "
-    "code.interact(banner='Python ' + sys.version.split()[0] + ' on wasmtime (Pyodide {v})', exitmsg='')"
-)
+REPL = """\
+import ast, code, inspect, sys, types
+try:
+    import hostnet
+    hostnet.install()
+except ImportError:
+    hostnet = None
+AWAIT = {aw}
+
+
+class Console(code.InteractiveConsole):
+    # top-level await, as in Pyodide's REPL: the coroutine runs on hostnet's loop (no JavaScript, no threads)
+    def __init__(self):
+        super().__init__()
+        if AWAIT:
+            self.compile.compiler.flags |= ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
+
+    def runcode(self, c):
+        try:
+            r = types.FunctionType(c, self.locals)()
+            if inspect.iscoroutine(r):
+                r = hostnet.run(r)
+        except SystemExit:
+            raise
+        except BaseException:
+            self.showtraceback()
+
+
+Console().interact(banner='Python ' + sys.version.split()[0] + ' on wasmtime (Pyodide {v})', exitmsg='')
+"""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +62,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--data", metavar="DIR", help="the wasm files (default: the package's, or $PYODIDE_WASMTIME_DATA)")
     ap.add_argument("--dev", action="store_true", help="give the guest the host's /dev (OpenSSL reads /dev/urandom)")
+    ap.add_argument(
+        "--allow-top-level-await",
+        action="store_true",
+        help="in the REPL, accept `await` at the top level (run on the host-fetch event loop, as in Pyodide's REPL)",
+    )
     ap.add_argument("-v", "--verbose", action="store_true", help="log the loader and the network to stderr")
     ap.add_argument("--version", action="store_true", help="print the versions and exit")
     ns = ap.parse_args(argv)
@@ -54,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             code = f.read()
         argv0 = [ns.file, *ns.args]
     elif sys.stdin.isatty():
-        code = REPL.format(v=PYODIDE_VERSION)
+        code = REPL.format(v=PYODIDE_VERSION, aw=ns.allow_top_level_await)
     else:
         code = sys.stdin.read()
     with Pyodide(ns.flavor, site=ns.site, mounts=mounts, data=ns.data, preopen_dev=ns.dev or None) as py:
