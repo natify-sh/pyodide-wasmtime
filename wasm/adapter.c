@@ -884,6 +884,20 @@ EXPORT("_dlsym_js") u32 dlsym_js(i32 handle, const char *sym, u32 *index) {
             }
             return 0;
         }
+    // not a library loaded by dlopen: the main module (dlopen(NULL), ctypes.pythonapi) or RTLD_DEFAULT: the main
+    // module first, then the libraries, as the glue's global search does
+    u32 out[2] = {0, 0}, v = dl_sym(0, sym, slen(sym), out);
+    for (i32 k = -1; out[0] == 0 && k < L->n; k++) {
+        if (k >= 0) {
+            v = dl_sym(L->lib[k].id, sym, slen(sym), out);
+            if (out[0] == 1) v += L->lib[k].base;
+        }
+    }
+    if (out[0] == 1) return v;
+    if (out[0] == 2) {
+        *index = out[1];
+        return v;
+    }
     return 0;
 }
 
