@@ -34,6 +34,10 @@ def missing(what: str) -> None:
 @pytest.fixture(params=FLAVORS)
 def flavor(request: pytest.FixtureRequest) -> str:
     name = request.param
+    if name == "fused" and (os.environ.get("PYODIDE_WASMTIME_ASM_WASM") or os.environ.get("PYODIDE_WASMTIME_STDLIB")):
+        pytest.skip(
+            "PYODIDE_WASMTIME_ASM_WASM/STDLIB replace files of the dynamic build; the fused module cannot follow"
+        )
     if name not in available_flavors(data_dir()):
         missing(f"the {name} build is not in {data_dir()}")
     return name

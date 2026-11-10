@@ -23,6 +23,9 @@ stdin/stdout/stderr are terminals); the next start restores it instead of bootin
 takes ~0.2 s instead of ~2 s when P imports `asyncio`. The preload must only import and compute: it must not print (it prints at snapshot time only), and opening files or sockets, `chdir`, writing files, `dlopen` or `ctypes` symbol lookups make the snapshot be skipped (a normal start, the preload run once); with `site=` or `mounts=` there is none. The snapshot is frozen with its hash seed, so every restore shares one `PYTHONHASHSEED` (`random` is re-seeded).
 `PYODIDE_WASMTIME_SNAPSHOT=0` turns it off. Without `preload` nothing changes. The REPL uses it.
 
+Another Pyodide's files can be tried on the dynamic build: `Pyodide("dynamic", asm_wasm="pyodide.asm.wasm", stdlib="python_stdlib.zip")` (either one; the adapter and `wasm-opt.wasm` stay the package's),
+`pyodide-wasmtime --asm-wasm FILE --stdlib FILE ...`, or `$PYODIDE_WASMTIME_ASM_WASM` / `$PYODIDE_WASMTIME_STDLIB` (an argument wins; the tests honour the variables, the fused runs are skipped). They imply `dynamic`; the fused module is built for one Pyodide, so `fused` with them is an error. The snapshot key follows the files loaded. At start a warning on stderr says what is not the pinned build's: CPython's version string in the wasm (Pyodide's own is not in it), `env` imports the adapter does not know (`-v` lists ten), a missing `setsockopt` patch, a stdlib zip of another Python. Only the pinned build is tested; the adapter answers its imports.
+
 It is meant to run anything Pyodide runs without the browser's JavaScript: the standard library, binary Emscripten wheels
 (numpy and the rest of Pyodide's lock: `site=` folders, or `micropip` over the host's fetch or the guest's own TLS),
 files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs the JavaScript bridge (`js`, `pyodide.ffi`,

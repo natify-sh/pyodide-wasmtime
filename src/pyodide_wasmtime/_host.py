@@ -32,6 +32,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from . import _engine, _wasm
 log = logging.getLogger("pyodide_wasmtime")
 
 PYVER = "3.15"  # the Python of the pinned Pyodide (315.0.0-alpha.2 = 3.15.0rc1)
+PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited constant in the pinned pyodide.asm.wasm
 FLAVORS = ("fused", "dynamic")
 DATA = Path(__file__).resolve().parent / "data"
 
@@ -316,6 +318,57 @@ def available_flavors(data: Path) -> list[str]:
     return have
 
 
+def _override(path: str | os.PathLike[str] | None, var: str) -> Path | None:
+    """The file PATH, else $VAR (an asm_wasm or stdlib that replaces the data directory's): None if neither is set."""
+    p = path or os.environ.get(var)
+    if not p:
+        return None
+    if not Path(p).is_file():
+        raise FileNotFoundError(f"no such file: {p}" + ("" if path else f" (from ${var})"))
+    return Path(p)
+
+
+def override_warnings(asm: Path | None, stdlib: Path | None, data: Path) -> tuple[list[str], list[str]]:
+    """What differs in a pyodide.asm.wasm / python_stdlib.zip that is not the pinned build's: (warnings, details).
+    Reads bytes only (no compile). Pyodide's own version is not in the wasm, so CPython's version string is compared."""
+    warn: list[str] = []
+    detail: list[str] = []
+    if asm is not None:
+        b = asm.read_bytes()
+        seen = sorted({m.decode() for m in re.findall(rb"\x00(3\.\d+\.\d+(?:[abc]|rc)?\d*)\x00", b)})
+        if PYVER_FULL not in seen:
+            warn.append(
+                f"{asm} does not carry CPython {PYVER_FULL} (the pinned Pyodide's); its version strings: "
+                f"{', '.join(seen) or 'none found'} (only CPython's version is compared: Pyodide's is not in the wasm)"
+            )
+        imps = {n for m, n, k in _wasm.import_names(b) if k == 0 and m == "env"}
+        adapter, known = data / "adapter.wasm", data / "pyodide.asm.wasm"
+        if adapter.exists() and known.exists():  # answered: by the adapter, or audited as a stub in the pinned build
+            names = {n for m, n, k in _wasm.import_names(known.read_bytes()) if m == "env"}
+            names |= set(_wasm.export_names(adapter.read_bytes()))
+            new = sorted(imps - names)
+            if new:
+                warn.append(f"{asm} imports {len(new)} env functions that the adapter does not know (-v lists them)")
+                detail.append("unknown env imports: " + ", ".join(new[:10]) + (" ..." if len(new) > 10 else ""))
+        if "__syscall_setsockopt_host" not in imps:
+            warn.append(
+                f"{asm} lacks the setsockopt patch (tools/patch_main.mjs): setsockopt returns 0 and does nothing"
+            )
+    if stdlib is not None:
+        try:
+            with zipfile.ZipFile(stdlib) as z:
+                cfg = next(n for n in z.namelist() if re.fullmatch(r"_sysconfigdata_[^/]*\.py", n))
+                ver = re.search(r"'VERSION': '([^']*)'", z.read(cfg).decode())
+            found = ver.group(1) if ver else "?"
+        except (OSError, StopIteration, zipfile.BadZipFile):
+            found = "?"
+        if found != PYVER:
+            warn.append(
+                f"{stdlib} is for Python {found} (VERSION of its sysconfigdata), the host lays out Python {PYVER}"
+            )
+    return warn, detail
+
+
 def ca_bundle() -> bytes:
     """The host's CA certificates for the guest's OpenSSL (`SSL_CERT_FILE`): the environment's, Python's, system's."""
     files = [
@@ -398,14 +451,27 @@ class Pyodide:
         data: str | os.PathLike[str] | None = None,
         wasm_opt: str | os.PathLike[str] | None = None,
         preload: str | None = None,
+        asm_wasm: str | os.PathLike[str] | None = None,
+        stdlib: str | os.PathLike[str] | None = None,
     ) -> None:
         wt = _engine.require_wasmtime()
         self._wt = wt
         self.data = data_dir(data)
+        self.asm_wasm = _override(asm_wasm, "PYODIDE_WASMTIME_ASM_WASM")
+        self.stdlib = _override(stdlib, "PYODIDE_WASMTIME_STDLIB")
+        self._override_checked = False
         have = available_flavors(self.data)
+        overridden = self.asm_wasm is not None or self.stdlib is not None
+        if self.asm_wasm is not None and "dynamic" not in have and (self.data / "adapter.wasm").exists():
+            have.append("dynamic")  # the adapter is the package's, the main module is the given one
         if flavor is None:
             flavor = os.environ.get("PYODIDE_WASMTIME_FLAVOR") or (
-                "dynamic" if "dynamic" in have else (have[0] if have else "dynamic")
+                "dynamic" if overridden or "dynamic" in have else (have[0] if have else "dynamic")
+            )
+        if flavor == "fused" and overridden:
+            raise ValueError(
+                "asm_wasm/stdlib replace files of the dynamic build: "
+                "the fused module is built for one Pyodide (use dynamic)"
             )
         if flavor not in FLAVORS:
             raise ValueError(f"flavor must be one of {FLAVORS}, not {flavor!r}")
@@ -465,7 +531,9 @@ class Pyodide:
     def _setup_root(self) -> None:
         self.root = root = Path(tempfile.mkdtemp(prefix="pyodide_wasmtime_"))
         (root / "lib" / f"python{PYVER}" / "lib-dynload").mkdir(parents=True)  # CPython looks for it at start
-        shutil.copy(self.data / "python_stdlib.zip", root / "lib" / f"python{PYVER.replace('.', '')}.zip")
+        shutil.copy(
+            self.stdlib or self.data / "python_stdlib.zip", root / "lib" / f"python{PYVER.replace('.', '')}.zip"
+        )
         sp = root / "lib" / f"python{PYVER}" / "site-packages"
         sp.mkdir()
         for s in self.site:  # inside the preopen: WASI does not follow a link out of it
@@ -1913,6 +1981,13 @@ class Pyodide:
     def _start(self) -> None:
         wt = self._wt
         engine = _engine.engine()
+        if not self._override_checked:
+            self._override_checked = True
+            warn, detail = override_warnings(self.asm_wasm, self.stdlib, self.data)
+            for w in warn:
+                log.warning("pyodide-wasmtime: %s", w)
+            for d in detail:
+                log.info("pyodide-wasmtime: %s", d)
         self._setup_root()
         assert self.root is not None
         self.store = store = wt.Store(engine)
@@ -1963,7 +2038,7 @@ class Pyodide:
                 mods[i.module] = mods.get(i.module, 0) + 1
             self.summary = "fused: one module; its imports: " + ", ".join(f"{k} ({v})" for k, v in mods.items())
         else:
-            main_path = self.data / "pyodide.asm.wasm"
+            main_path = self.asm_wasm or self.data / "pyodide.asm.wasm"
             adapter_bytes = (self.data / "adapter.wasm").read_bytes()
             _wasm.check_sections(adapter_bytes)
             adapter_mod = _engine.load_module(self.data / "adapter.wasm")
@@ -2062,8 +2137,12 @@ class Pyodide:
     # ------------------------------------------------------------------ snapshot of the memory after `preload`
     def _snapshot_path(self) -> Path:
         files = [
-            "python_stdlib.zip",
-            *(["pyodide_fused.wasm"] if self.flavor == "fused" else ["pyodide.asm.wasm", "adapter.wasm"]),
+            self.stdlib or self.data / "python_stdlib.zip",
+            *(
+                [self.data / "pyodide_fused.wasm"]
+                if self.flavor == "fused"
+                else [self.asm_wasm or self.data / "pyodide.asm.wasm", self.data / "adapter.wasm"]
+            ),
         ]
 
         def isatty(fd: int) -> bool:  # WASI inherits the OS's fds, not Python's sys.std* objects
@@ -2077,7 +2156,7 @@ class Pyodide:
                 [
                     SNAPSHOT_VERSION,
                     self.flavor,
-                    [_engine._stamp((self.data / f).resolve()).decode() for f in files],
+                    [_engine._stamp(f.resolve()).decode() for f in files],
                     PYVER,
                     self.preload,
                     hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -2166,7 +2245,16 @@ class Pyodide:
     def _save(self, path: Path) -> None:
         """Write the snapshot from a throwaway interpreter (no site, no mounts), unless the preload changed what a
         snapshot does not hold: dlopen, table slots, closures, signals, open fds, the cwd, files."""
-        with Pyodide(self.flavor, preopen_dev=self.preopen_dev, env=self.env, data=self.data) as fresh:
+        fresh = Pyodide(
+            self.flavor,
+            preopen_dev=self.preopen_dev,
+            env=self.env,
+            data=self.data,
+            asm_wasm=self.asm_wasm,
+            stdlib=self.stdlib,
+        )
+        fresh._override_checked = True  # the warnings were given at this interpreter's start
+        with fresh:
             before = fresh._probe()
             rc = fresh.run(self.preload or "")
             if (

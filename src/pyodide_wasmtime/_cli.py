@@ -115,6 +115,16 @@ def main(argv: list[str] | None = None) -> int:
         help="a host folder visible in the guest (repeatable)",
     )
     ap.add_argument("--data", metavar="DIR", help="the wasm files (default: the package's, or $PYODIDE_WASMTIME_DATA)")
+    ap.add_argument(
+        "--asm-wasm",
+        metavar="FILE",
+        help="a pyodide.asm.wasm instead of the package's (implies --flavor dynamic; or $PYODIDE_WASMTIME_ASM_WASM)",
+    )
+    ap.add_argument(
+        "--stdlib",
+        metavar="FILE",
+        help="a python_stdlib.zip instead of the package's (implies --flavor dynamic; or $PYODIDE_WASMTIME_STDLIB)",
+    )
     ap.add_argument("--dev", action="store_true", help="give the guest the host's /dev (OpenSSL reads /dev/urandom)")
     ap.add_argument(
         "--allow-top-level-await",
@@ -129,6 +139,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if ns.verbose:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+    if (ns.asm_wasm or ns.stdlib) and ns.flavor == "fused":
+        ap.error(
+            "--asm-wasm and --stdlib replace files of the dynamic build: the fused module is built for one Pyodide"
+        )
+    flavor = ns.flavor or ("dynamic" if ns.asm_wasm or ns.stdlib else None)
     mounts = dict(m.split("=", 1) for m in ns.mount)
     argv0: list[str] | None = None
     code: str | None
@@ -145,7 +160,14 @@ def main(argv: list[str] | None = None) -> int:
         code = sys.stdin.read()
     preload = SETUP.format(aw=ns.allow_top_level_await) if code is None else None
     with Pyodide(
-        ns.flavor, site=ns.site, mounts=mounts, data=ns.data, preopen_dev=ns.dev or None, preload=preload
+        flavor,
+        site=ns.site,
+        mounts=mounts,
+        data=ns.data,
+        preopen_dev=ns.dev or None,
+        preload=preload,
+        asm_wasm=ns.asm_wasm,
+        stdlib=ns.stdlib,
     ) as py:
         if code is None:
             return repl(py)
