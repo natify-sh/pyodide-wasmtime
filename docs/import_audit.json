@@ -1352,7 +1352,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c getaddrinfo_ -> _host.py _n_getaddrinfo (the checks and the resolver: _sockaddr.py resolve_addrinfo): Pyodide's input checks in its order (EAI_NONAME for no node and no service, EAI_BADFLAGS, EAI_SOCKTYPE, EAI_FAMILY, parseInt of the service, EAI_SERVICE) and defaults (ai_socktype 1, ai_protocol 6 / 17); the answers come from the host's getaddrinfo, ALL addresses (IPv4 and IPv6), ai_canonname with AI_CANONNAME, AI_PASSIVE/NUMERICHOST/NUMERICSERV/ADDRCONFIG by the host, services by name from the host's table (and the same small table that is the guest's /etc/services). The list is one malloc'd block plus the first sockaddr, which is all freeaddrinfo frees (it does not follow ai_next). Differences from Pyodide on purpose: real addresses where its JS invents 172.29.x.x; IPv6 results (Pyodide's CPython has no IPv6, socket.has_ipv6 is False, so Python shows them as (10, raw bytes)); with socktype 0 one STREAM entry, as the JS (not glibc's three).",
+  "evidence": "adapter.c getaddrinfo_ -> _net.py Net._n_getaddrinfo (the checks and the resolver: _sockaddr.py resolve_addrinfo): Pyodide's input checks in its order (EAI_NONAME for no node and no service, EAI_BADFLAGS, EAI_SOCKTYPE, EAI_FAMILY, parseInt of the service, EAI_SERVICE) and defaults (ai_socktype 1, ai_protocol 6 / 17); the answers come from the host's getaddrinfo, ALL addresses (IPv4 and IPv6), ai_canonname with AI_CANONNAME, AI_PASSIVE/NUMERICHOST/NUMERICSERV/ADDRCONFIG by the host, services by name from the host's table (and the same small table that is the guest's /etc/services). The list is one malloc'd block plus the first sockaddr, which is all freeaddrinfo frees (it does not follow ai_next). Differences from Pyodide on purpose: real addresses where its JS invents 172.29.x.x; IPv6 results (Pyodide's CPython has no IPv6, socket.has_ipv6 is False, so Python shows them as (10, raw bytes)); with socktype 0 one STREAM entry, as the JS (not glibc's three).",
   "tested": "tests/test_sockets.py::test_getaddrinfo_lists_the_hosts_addresses, tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups, tests/test_sockets.py::test_ipv6_structures_are_written_and_read_right"
  },
  {
@@ -1360,7 +1360,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c getnameinfo_ -> _host.py _n_getnameinfo (the host's call: _sockaddr.py nameinfo): the host's getnameinfo on the sockaddr_in/in6 (scope id), NI_NUMERICHOST/NUMERICSERV/NAMEREQD/DGRAM by name, EAI_NONAME, EAI_FAMILY for a bad family or length, EAI_OVERFLOW when the buffer is too small. Pyodide: numeric only ('127.0.0.1', '80'); socket.gethostbyaddr('127.0.0.1') works through it in both.",
+  "evidence": "adapter.c getnameinfo_ -> _net.py Net._n_getnameinfo (the host's call: _sockaddr.py nameinfo): the host's getnameinfo on the sockaddr_in/in6 (scope id), NI_NUMERICHOST/NUMERICSERV/NAMEREQD/DGRAM by name, EAI_NONAME, EAI_FAMILY for a bad family or length, EAI_OVERFLOW when the buffer is too small. Pyodide: numeric only ('127.0.0.1', '80'); socket.gethostbyaddr('127.0.0.1') works through it in both.",
   "tested": "tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups, tests/test_sockets.py::test_ipv6_structures_are_written_and_read_right"
  },
  {
@@ -1890,7 +1890,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c do_poll -> _host.py _poll: one select.poll() call (select() where there is no poll) for all sockets with the timeout, revents POLLIN/PRI/OUT/ERR/HUP/NVAL as the host reports them (POLLOUT after a connect, POLLHUP after shutdown, POLLERR after a refused connect); nfds above MAXFD is EINVAL; a file is ready for what it is asked (Pyodide's pollOne: 5 for a stream without poll op) and an unopened descriptor is POLLNVAL.; a pipe end is ready from its buffer (PIPEFS's mask); a preopen's number (the root's 3, a mount's, /dev's) is no descriptor of the guest: POLLNVAL, and select() on it is EBADF (probe: Pyodide gives OSError 8 / revents 32)",
+  "evidence": "adapter.c do_poll -> _net.py Net._poll: one select.poll() call (select() where there is no poll) for all sockets with the timeout, revents POLLIN/PRI/OUT/ERR/HUP/NVAL as the host reports them (POLLOUT after a connect, POLLHUP after shutdown, POLLERR after a refused connect); nfds above MAXFD is EINVAL; a file is ready for what it is asked (Pyodide's pollOne: 5 for a stream without poll op) and an unopened descriptor is POLLNVAL.; a pipe end is ready from its buffer (PIPEFS's mask); a preopen's number (the root's 3, a mount's, /dev's) is no descriptor of the guest: POLLNVAL, and select() on it is EBADF (probe: Pyodide gives OSError 8 / revents 32)",
   "tested": "tests/test_sockets.py::test_poll_waits_for_the_socket_that_gets_data, tests/test_sockets.py::test_poll_times_out_on_idle_sockets, tests/test_sockets.py::test_a_ready_file_does_not_wait_for_an_idle_socket, tests/test_sockets.py::test_poll_reports_an_invalid_descriptor, tests/test_sockets.py::test_poll_reports_a_hang_up, tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes, tests/test_review_fixes.py::test_poll_and_select_of_a_preopen_number_are_invalid"
  },
  {
@@ -2070,7 +2070,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_accept4, _host.py _n_accept: the peer address is written to the sockaddr and its length; SOCK_NONBLOCK is kept, SOCK_CLOEXEC accepted, other flags EINVAL; a non-blocking listener without a pending connection is EAGAIN; the new descriptor is taken before accepting, so EMFILE leaves the connection queued. Pyodide: needs `ws` on Node. A non-blocking accept never waits on the host.",
+  "evidence": "adapter.c sc_accept4, _net.py Net._n_accept: the peer address is written to the sockaddr and its length; SOCK_NONBLOCK is kept, SOCK_CLOEXEC accepted, other flags EINVAL; a non-blocking listener without a pending connection is EAGAIN; the new descriptor is taken before accepting, so EMFILE leaves the connection queued. Pyodide: needs `ws` on Node. A non-blocking accept never waits on the host.",
   "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_asyncio.py::test_an_asyncio_server_and_its_clients_in_one_guest, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
@@ -2078,7 +2078,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_bind, _host.py _n_bind: sockaddr_in and sockaddr_in6 (scope id) read from the guest, errno of the host (EADDRINUSE...), a family that is not the socket's is EAFNOSUPPORT. SO_REUSEADDR is whatever the program set with setsockopt (real now, see __syscall_setsockopt_host). Pyodide: needs `ws` on Node. Probe: socket().bind(('127.0.0.1', 0)) in both packagings; real Pyodide: fatal 'Cannot find module ws' at listen.",
+  "evidence": "adapter.c sc_bind, _net.py Net._n_bind: sockaddr_in and sockaddr_in6 (scope id) read from the guest, errno of the host (EADDRINUSE...), a family that is not the socket's is EAFNOSUPPORT. SO_REUSEADDR is whatever the program set with setsockopt (real now, see __syscall_setsockopt_host). Pyodide: needs `ws` on Node. Probe: socket().bind(('127.0.0.1', 0)) in both packagings; real Pyodide: fatal 'Cannot find module ws' at listen.",
   "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts"
  },
  {
@@ -2086,7 +2086,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_connect, _host.py _n_connect: sockaddr_in/in6 with the length checked; a non-blocking socket starts the connection and gets EINPROGRESS (completion: poll POLLOUT, then SO_ERROR), a blocking one waits; settimeout works through CPython's poll + SO_ERROR (ECONNREFUSED/ETIMEDOUT as the kernel says). Pyodide's connect needs `ws`.",
+  "evidence": "adapter.c sc_connect, _net.py Net._n_connect: sockaddr_in/in6 with the length checked; a non-blocking socket starts the connection and gets EINPROGRESS (completion: poll POLLOUT, then SO_ERROR), a blocking one waits; settimeout works through CPython's poll + SO_ERROR (ECONNREFUSED/ETIMEDOUT as the kernel says). Pyodide's connect needs `ws`.",
   "tested": "tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes, tests/test_asyncio.py::test_asyncio_run_sleeps_and_talks_to_a_server_on_the_host"
  },
  {
@@ -2094,7 +2094,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_getpeername -> _host.py _n_name, as getsockname; an unconnected socket is ENOTCONN (the host's answer).",
+  "evidence": "adapter.c sc_getpeername -> _net.py Net._n_name, as getsockname; an unconnected socket is ENOTCONN (the host's answer).",
   "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_udp_has_addresses_in_both_directions"
  },
  {
@@ -2102,7 +2102,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_getsockname -> _host.py _n_name: the host writes a sockaddr_in or sockaddr_in6 (28 bytes, scope id) cut to the caller's length, *lenp = the real size; NULL pointers EFAULT. Probe: bound, connected, unbound, UDP.",
+  "evidence": "adapter.c sc_getsockname -> _net.py Net._n_name: the host writes a sockaddr_in or sockaddr_in6 (28 bytes, scope id) cut to the caller's length, *lenp = the real size; NULL pointers EFAULT. Probe: bound, connected, unbound, UDP.",
   "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_sockaddr_translation_round_trips"
  },
  {
@@ -2110,7 +2110,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_getsockopt -> _host.py _n_getopt: the host's real value, found by NAME in a table of musl's option numbers (SOL_SOCKET, IP, TCP, IPV6 levels); SO_TYPE/SO_DOMAIN/SO_PROTOCOL in musl's numbers; SO_ERROR as the guest's errno; an option or level the table lacks is ENOPROTOOPT (Pyodide: ENOPROTOOPT for everything but SO_ERROR). What a program set with setsockopt is read back (TCP_NODELAY 1 after setting 1).",
+  "evidence": "adapter.c sc_getsockopt -> _net.py Net._n_getopt: the host's real value, found by NAME in a table of musl's option numbers (SOL_SOCKET, IP, TCP, IPV6 levels); SO_TYPE/SO_DOMAIN/SO_PROTOCOL in musl's numbers; SO_ERROR as the guest's errno; an option or level the table lacks is ENOPROTOOPT (Pyodide: ENOPROTOOPT for everything but SO_ERROR). What a program set with setsockopt is read back (TCP_NODELAY 1 after setting 1).",
   "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes, tests/test_sockets.py::test_setsockopt_is_real"
  },
  {
@@ -2118,7 +2118,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_listen, _host.py _n_listen (a negative backlog is SOMAXCONN). Pyodide: fatal without `ws`.",
+  "evidence": "adapter.c sc_listen, _net.py Net._n_listen (a negative backlog is SOMAXCONN). Pyodide: fatal without `ws`.",
   "tested": "tests/test_sockets.py::test_a_server_socket_binds_listens_and_accepts, tests/test_sockets.py::test_errors_are_emscriptens_numbers"
  },
  {
@@ -2126,7 +2126,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_recvfrom -> _host.py _n_recvfrom: the sender's address is written (sockaddr_in/in6 and its length; 0 for a connected stream), MSG_PEEK, MSG_WAITALL, MSG_DONTWAIT, MSG_TRUNC; a datagram is read whole so that a short buffer truncates it as the kernel does. A non-blocking socket or MSG_DONTWAIT never waits on the host (a dropped datagram is EAGAIN); a huge length is clamped.",
+  "evidence": "adapter.c sc_recvfrom -> _net.py Net._n_recvfrom: the sender's address is written (sockaddr_in/in6 and its length; 0 for a connected stream), MSG_PEEK, MSG_WAITALL, MSG_DONTWAIT, MSG_TRUNC; a datagram is read whole so that a short buffer truncates it as the kernel does. A non-blocking socket or MSG_DONTWAIT never waits on the host (a dropped datagram is EAGAIN); a huge length is clamped.",
   "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_msg_dontwait, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
@@ -2134,7 +2134,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_recvmsg -> _host.py _n_recvmsg: ALL iovecs are filled in order, msg_name/msg_namelen written, msg_flags carries MSG_TRUNC, msg_controllen stays 0 (no ancillary data on the host side), as Pyodide. iovlen above 1024 is EMSGSIZE, a bad iovec EFAULT, before anything is read.",
+  "evidence": "adapter.c sc_recvmsg -> _net.py Net._n_recvmsg: ALL iovecs are filled in order, msg_name/msg_namelen written, msg_flags carries MSG_TRUNC, msg_controllen stays 0 (no ancillary data on the host side), as Pyodide. iovlen above 1024 is EMSGSIZE, a bad iovec EFAULT, before anything is read.",
   "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_recvmsg_returns_no_control_data, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
@@ -2142,7 +2142,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_sendmsg -> _host.py _n_sendmsg: msg_name honoured, all iovecs joined in one send; control data (SCM_RIGHTS...) is EOPNOTSUPP, never dropped (no host primitive carries it). A non-blocking socket or MSG_DONTWAIT never waits on the host: a partial count, or EAGAIN.",
+  "evidence": "adapter.c sc_sendmsg -> _net.py Net._n_sendmsg: msg_name honoured, all iovecs joined in one send; control data (SCM_RIGHTS...) is EOPNOTSUPP, never dropped (no host primitive carries it). A non-blocking socket or MSG_DONTWAIT never waits on the host: a partial count, or EAGAIN.",
   "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps"
  },
  {
@@ -2150,7 +2150,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_sendto -> _host.py _n_sendto: the destination sockaddr (in and in6) is honoured, MSG_* bits are translated by name (MSG_OOB, DONTROUTE, EOR, MORE; MSG_NOSIGNAL moot, DONTWAIT by the adapter), one the host lacks is EOPNOTSUPP; a non-blocking socket that cannot take data is EAGAIN. A non-blocking socket or MSG_DONTWAIT never waits on the host: a partial count, or EAGAIN.",
+  "evidence": "adapter.c sc_sendto -> _net.py Net._n_sendto: the destination sockaddr (in and in6) is honoured, MSG_* bits are translated by name (MSG_OOB, DONTROUTE, EOR, MORE; MSG_NOSIGNAL moot, DONTWAIT by the adapter), one the host lacks is EOPNOTSUPP; a non-blocking socket that cannot take data is EAGAIN. A non-blocking socket or MSG_DONTWAIT never waits on the host: a partial count, or EAGAIN.",
   "tested": "tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_a_non_blocking_send_never_waits, tests/test_sockets.py::test_bad_guest_pointers_and_sizes_are_errors_not_traps, tests/test_sockets.py::test_errors_are_emscriptens_numbers"
  },
  {
@@ -2169,7 +2169,7 @@
    "known gap, the descriptor numbering of BACKLOG W5/D5: WASI hands out numbers that are neither the lowest free nor the last freed (after os.close(0) the next os.open gives 4, Pyodide 0; probe rv/p5.py), the first descriptor of a program is 4 (3 is the root), and a number from 1024 on is not supported",
    "FD_CLOEXEC of a socket: deliberate difference (owner): FD_CLOEXEC is kept per descriptor number for EVERY descriptor (a bit per number: set by openat O_CLOEXEC, socket/accept4 SOCK_CLOEXEC, pipe2, dup3, F_DUPFD_CLOEXEC, F_SETFD; cleared by close and by dup/F_DUPFD; read by F_GETFD), as POSIX does; Python passes O_CLOEXEC/SOCK_CLOEXEC on everything (PEP 446), so os.get_inheritable is False for what Python opens here and True in Pyodide (whose F_GETFD is constant 0 and F_SETFD a no-op; F_DUPFD_CLOEXEC is EINVAL there). os.set_inheritable(fd, True) stays a no-op in both: the main module's libc answers FIOCLEX/FIONCLEX with 0 itself before the system call (fcntl F_SETFD works). CPython here has no pipe2, so os.pipe() is pipe() plus that same ioctl and reports inheritable True in both."
   ],
-  "evidence": "adapter.c sc_socket (a placeholder WASI descriptor, SOCK_NONBLOCK kept), _host.py _n_socket: AF_INET and AF_INET6 (the host's own answer if it has no IPv6: EAFNOSUPPORT), SOCK_STREAM/SOCK_DGRAM (other types ESOCKTNOSUPPORT, Pyodide: EINVAL), a protocol that does not fit the type EPROTONOSUPPORT (as Pyodide). Probe: fused and dynamic. Every host error is translated by name to Emscripten's errno (ENOTSUP/EOPNOTSUPP is 138), also the Windows WSAE* numbers (_consts.py guest_errno); a net operation never raises into the wasm: EFAULT for a pointer outside the memory, EIO (logged) for the unforeseen.. WASI may hand out a number of 1024 or more after many files were opened and closed: sock_fd then holds those (up to 8192, once per allocation, fd_alloc too) while it opens more until a smaller number comes, and closes them again; SOCK_CLOEXEC is kept (F_GETFD)",
+  "evidence": "adapter.c sc_socket (a placeholder WASI descriptor, SOCK_NONBLOCK kept), _net.py Net._n_socket: AF_INET and AF_INET6 (the host's own answer if it has no IPv6: EAFNOSUPPORT), SOCK_STREAM/SOCK_DGRAM (other types ESOCKTNOSUPPORT, Pyodide: EINVAL), a protocol that does not fit the type EPROTONOSUPPORT (as Pyodide). Probe: fused and dynamic. Every host error is translated by name to Emscripten's errno (ENOTSUP/EOPNOTSUPP is 138), also the Windows WSAE* numbers (_consts.py guest_errno); a net operation never raises into the wasm: EFAULT for a pointer outside the memory, EIO (logged) for the unforeseen.. WASI may hand out a number of 1024 or more after many files were opened and closed: sock_fd then holds those (up to 8192, once per allocation, fd_alloc too) while it opens more until a smaller number comes, and closes them again; SOCK_CLOEXEC is kept (F_GETFD)",
   "tested": "tests/test_sockets.py::test_many_sockets_can_be_opened_and_closed, tests/test_sockets.py::test_select_works_and_descriptors_are_small, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_host_errors_are_translated_by_name_on_every_os, tests/test_sockets.py::test_the_net_wrapper_turns_every_exception_into_an_errno, tests/test_sockets.py::test_the_accessors_check_the_memory, tests/test_review_fixes.py::test_descriptors_work_after_many_files_were_opened_and_closed, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor"
  },
  {
@@ -2177,7 +2177,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "NOT in Pyodide's own import list: pyodide.asm.wasm has setsockopt as a libc stub with the system call inlined as 'returns 0' (func $17466; Emscripten's JavaScript has no setsockopt, so Pyodide ignores every setsockopt). The build (tools/patch_main.mjs, binaryen.js from npm, run by tools/build_data.sh before the exnref conversion) replaces that function's body with a call to this import and sets errno from a negative result. adapter.c sc_setsockopt -> _host.py _n_setopt: the option by NAME in the host's socket module, ENOPROTOOPT for one it has not; SO_REUSEADDR is not applied on a non-POSIX host (it means 'steal the port' there). Probe: TCP_NODELAY 0 -> set 1 -> reads 1, SO_KEEPALIVE and SO_REUSEADDR the same, in both packagings (before the patch: 0).",
+  "evidence": "NOT in Pyodide's own import list: pyodide.asm.wasm has setsockopt as a libc stub with the system call inlined as 'returns 0' (func $17466; Emscripten's JavaScript has no setsockopt, so Pyodide ignores every setsockopt). The build (tools/patch_main.mjs, binaryen.js from npm, run by tools/build_data.sh before the exnref conversion) replaces that function's body with a call to this import and sets errno from a negative result. adapter.c sc_setsockopt -> _net.py Net._n_setopt: the option by NAME in the host's socket module, ENOPROTOOPT for one it has not; SO_REUSEADDR is not applied on a non-POSIX host (it means 'steal the port' there). Probe: TCP_NODELAY 0 -> set 1 -> reads 1, SO_KEEPALIVE and SO_REUSEADDR the same, in both packagings (before the patch: 0).",
   "tested": "tests/test_sockets.py::test_setsockopt_is_real, tests/test_asyncio.py::test_an_asyncio_server_and_its_clients_in_one_guest"
  }
 ]

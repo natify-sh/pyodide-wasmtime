@@ -26,7 +26,7 @@ package's, with the legacy wasm exceptions converted once to `exnref`. The packa
 data/ (in the wheel):  pyodide.asm.wasm (exnref) + adapter.wasm  -> "dynamic": linked at run time (shim from the import list, trampoline, fixup)
                        pyodide_fused.wasm (tools/fuse.py, wasm-merge) -> "fused": one core module, only instantiated
                        python_stdlib.zip, wasm-opt.wasm (Binaryen 132 as wasm32-wasip1: converts a wheel's legacy exceptions at dlopen, in-process)
-_host.py (Pyodide)  WASI = wasmtime's own; loader ops (instantiate/scope/sym/got_set/call/error); net ops (sockets); fs op (statvfs); the host's fetch; run() = PyRun_SimpleString
+_host.py (Pyodide)  WASI = wasmtime's own; loader ops (instantiate/scope/sym/got_set/call/error); net ops (sockets) and the host's fetch (_net.py Net); fs op (statvfs); run() = PyRun_SimpleString
 _engine.py          the engine, the machine-code cache (~/.cache/pyodide-nojs), wasm-opt.wasm run in-process
 tests/              offline + network + Pyodide's official CPython suite, each on BOTH builds;  CI: build.yml -> tests.yml / publish.yml
 ```
@@ -73,7 +73,7 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 | how the adapter works, what it answers, what was found | `docs/EXPERIMENT.md` |
 | WASI 0.2 over fusedwasi, the official test suite plan | `docs/NOTES-FUSEDWASI-AND-TESTSUITE.md` |
 | the adapter | `wasm/adapter.c` (includes the sections in `wasm/adapter/*.h`) |
-| the host | `src/pyodide_nojs/_host.py` (class `Pyodide`), `_consts.py`, `_timecalc.py`, `_sockaddr.py`, `_cif.py` (functions without state), `_engine.py`, `_wasm.py`, `guest/hostnet.py` |
+| the host | `src/pyodide_nojs/_host.py` (class `Pyodide`), `_guest.py` (`Guest`, the shared handle), `_net.py` (`Net`, the sockets and the fetch, with their state), `_consts.py`, `_timecalc.py`, `_sockaddr.py`, `_cif.py` (functions without state), `_engine.py`, `_wasm.py`, `guest/hostnet.py` |
 | the build | `tools/` (`fetch.sh`, `build_data.sh`, `build_adapter.sh`, `build_binaryen.sh`, `build_ssl.sh`, `prepare_testenv.sh`, `fuse.py`), `package.json` (the pinned versions) |
 | licenses of the bundled binaries | `licenses/NOTICE` |
 
