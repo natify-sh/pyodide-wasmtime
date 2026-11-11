@@ -505,3 +505,41 @@ os.write(2, repr(msg).encode() + b"\\n")
     assert "[8, 8, 8, 8, 8, 8]" in p.stderr and "Traceback" not in p.stderr
     p = guest.run("import os\nos.close(2)\nraise ValueError('boom')")
     assert p.returncode == 1 and p.stdout == "" and "boom" not in p.stderr, p
+
+
+def test_set_blocking_on_a_number_above_the_descriptor_table_keeps_the_table_intact(guest: Guest) -> None:
+    """A directory held above 1024 (WASI hands out such numbers after many opens) has no slot in the adapter's table:
+    set_blocking succeeds as it does in Pyodide (not kept), and must not write into the neighbouring arrays."""
+    out = run(
+        guest,
+        """
+held = [os.open(base, os.O_RDONLY | os.O_DIRECTORY) for _ in range(1100)]
+x = max(held)
+print(x >= 1024)
+before = [fcntl.fcntl(n, fcntl.F_GETFD) for n in (0, 1, 2, 4)]
+os.set_blocking(x, False)
+os.set_blocking(max(held), False)
+fcntl.ioctl(x, termios.FIONBIO, b"\\\\1\\\\0\\\\0\\\\0")
+print(before == [fcntl.fcntl(n, fcntl.F_GETFD) for n in (0, 1, 2, 4)])
+""",
+    )
+    assert out == ["True", "True"]
+
+
+def test_the_end_of_a_run_reports_a_failed_flush_as_cpython_does(guest: Guest) -> None:
+    """A closed descriptor (EBADF) is skipped at the end of a run; any other error of the final flush is a message on
+    stderr and status 120 (CPython's shutdown), and a non-zero status of the program itself is kept."""
+    code = """
+import sys, errno
+class S:
+    def write(self, s): return len(s)
+    def flush(self): raise OSError(%s, 'x')
+sys.stdout = S()
+%s
+"""
+    p = guest.run(code % ("errno.EIO", ""))
+    assert p.returncode == 120 and "Exception ignored in" in p.stderr and "] x" in p.stderr, p
+    p = guest.run(code % ("errno.EIO", "sys.exit(3)"))
+    assert p.returncode == 3 and "Exception ignored in" in p.stderr and "] x" in p.stderr, p
+    p = guest.run(code % ("errno.EBADF", ""))
+    assert p.returncode == 0 and "Exception ignored" not in p.stderr, p

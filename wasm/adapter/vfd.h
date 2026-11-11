@@ -100,6 +100,7 @@ static i32 nb_keeps(i32 fd) {
 static i32 nb_set(i32 fd, i32 on) {
     Vt *T = vt();
     if (!T) return -ENOMEM;
+    if (fd < 0 || fd >= MAXFD) return 0;  // a number the table has no slot for (WASI gave it above MAXFD): accepted, not kept
     if (!T->o[fd]) {
         Obj *o = (Obj *)calloc(1, sizeof(Obj));
         if (!o) return -ENOMEM;

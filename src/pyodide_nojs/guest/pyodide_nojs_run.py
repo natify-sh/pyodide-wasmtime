@@ -1,6 +1,7 @@
 """What the host runs in the guest: the start (`start`) and one `run` of the user's code."""
 
 # pyright: reportAttributeAccessIssue=false
+import errno
 import sys
 import traceback
 
@@ -55,12 +56,18 @@ def run(src_path, rc_path):
                 except BaseException as e2:
                     e2.__traceback__ = e2.__traceback__.tb_next if e2.__traceback__ else None
                     traceback.print_exception(e2)
-        except OSError:
-            pass
+        except OSError as e3:
+            if e3.errno != errno.EBADF:
+                raise
     for s in (sys.stdout, sys.stderr):  # a stream whose descriptor the program closed: Pyodide never flushes at the end
         try:
             s.flush()
-        except OSError:
-            pass
+        except OSError as e4:
+            if e4.errno != errno.EBADF:  # as CPython's shutdown: a message, status 120 (the program's own status stays)
+                rc = rc or 120
+                try:
+                    print(f"Exception ignored in: {s!r}\n{type(e4).__name__}: {e4}", file=sys.__stderr__)
+                except OSError:
+                    pass
     with open(rc_path, "w") as f:
         f.write(str(rc))
