@@ -45,6 +45,7 @@ static void fd_move_meta(i32 from, i32 to) {
     fd_forget(to);
     fds()->path[to] = fds()->path[from], fds()->flags[to] = fds()->flags[from];
     fds()->path[from] = 0;
+    if (!ckp(from > to ? from : to)) return;  // the table grows (and moves) here, not between the two pointers
     u64 *a = ckp(from), *b = ckp(to);
     if (a && b) *b = *a, *a = 0;
 }
@@ -460,7 +461,7 @@ EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
     return (is_virt(fd) || !w_fd_fdstat_get(rfd(fd), st)) ? -FE_NOTDIR : -FE_BADF;  // a stream: not a directory
 }
 
-// nocheck: dup() opens the same file again, which no permission can forbid
+// nocheck: mmap opens the same file again (from its path record), which no permission can forbid
 static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck) {
     char dot[2];
     const char *p;
@@ -501,7 +502,7 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
         u64 *ck = ckp(out);
         if (ck) *ck = 0;  // a new descriptor lists its directory from the start
         fd_forget(out);
-        char *copy = absdup(dirfd, path);  // the path dup() opens again, of any length
+        char *copy = absdup(dirfd, path);  // the path mmap opens again, of any length
         if (copy) {
             fds()->path[out] = copy;
             fds()->flags[out] = flags;
@@ -512,7 +513,9 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
 
 // the mode of O_CREAT is the variable argument (va points at it)
 EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
-    return open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);
+    i32 fd = open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);
+    if (fd >= 0) cloexec_set(fd, flags & 02000000);  // O_CLOEXEC: kept per number, as POSIX does (there is no exec)
+    return fd;
 }
 
 EXPORT("__syscall_stat64") i32 sc_stat64(const char *path, void *buf) { return stat_path(AT_FDCWD, path, buf, 1); }
@@ -646,10 +649,9 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
     if (fd_type(fd) < 0) return -FE_BADF;
     switch (cmd) {
         case 1:  // F_GETFD: FD_CLOEXEC is kept per number (there is no exec: only the answer is real)
-            return fd < MAXFD ? vt()->cloexec[fd] : 0;
+            return cloexec_get(fd);
         case 2:  // F_SETFD
-            if (fd < MAXFD) vt()->cloexec[fd] = (*(const i32 *)va & 1) != 0;
-            return 0;
+            return cloexec_set(fd, *(const i32 *)va & 1);
         case 3: {  // F_GETFL
             if (is_sock(fd)) return 2 | (sock_nb(fd) ? 04000 : 0);  // O_RDWR, O_NONBLOCK
             if (is_pipe(fd)) return (vobj(fd)->kind == K_PIPEW) | vobj(fd)->fl;  // O_WRONLY / O_RDONLY, and what F_SETFL set

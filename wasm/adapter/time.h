@@ -86,6 +86,11 @@ EXPORT("clock_time_get") i32 x_clock_time_get(i32 id, u64 precision, u64 *out) {
 }
 EXPORT("clock_res_get") i32 x_clock_res_get(i32 id, u64 *out) {
     if ((u32)id > 3) return FE_INVAL;
+    if (id == 0) {  // the realtime clock's resolution is Date.now()'s, 1 ms, in the glue (WASI says 1 ns)
+        i32 e = w_clock_res_get(0, out);
+        if (!e) *out = 1000000;
+        return e;
+    }
     return id < 2 ? w_clock_res_get(id, out) : host_cpuclock(id, 1, out);
 }
 

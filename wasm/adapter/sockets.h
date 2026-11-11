@@ -80,7 +80,9 @@ EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a,
         return h;
     }
     i32 e = sock_new(fd, h, (type & 04000) != 0);  // SOCK_NONBLOCK
-    return e ? e : fd;
+    if (e) return e;
+    cloexec_set(fd, type & 02000000);  // SOCK_CLOEXEC
+    return fd;
 }
 
 EXPORT("__syscall_bind") i32 sc_bind(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
@@ -108,7 +110,9 @@ EXPORT("__syscall_accept4") i32 sc_accept4(i32 fd, u8 *sa, u32 *lenp, i32 flags,
         return h;
     }
     i32 e = sock_new(nfd, h, (flags & 04000) != 0);
-    return e ? e : nfd;
+    if (e) return e;
+    cloexec_set(nfd, flags & 02000000);
+    return nfd;
 }
 
 EXPORT("__syscall_connect") i32 sc_connect(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
@@ -198,7 +202,7 @@ static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
             if (rev) immediate = 1;
         } else if (fd >= 0) {
             u8 st[24] __attribute__((aligned(8)));
-            if (w_fd_fdstat_get(fd, st)) rev = POLLNVAL;
+            if (is_pre(fd) || w_fd_fdstat_get(fd, st)) rev = POLLNVAL;  // a preopen is no descriptor of the guest
             else rev = (i16)(ev & 5);
             if (rev) immediate = 1;
         }
@@ -241,8 +245,9 @@ EXPORT("getnameinfo") i32 getnameinfo_(const u8 *sa, i32 salen, char *node, i32 
 EXPORT("getprotobyname") u32 getprotobyname_(const char *name) { return net_protobyname(name); }
 
 // ioctl as Pyodide's JavaScript answers: a descriptor that is not open is EBADF; FIONREAD and FIONBIO belong to
-// sockets (a file has no ioctl: ENOTTY); the terminal requests are ENOTTY (no descriptor here is a terminal for
-// them); anything else is EINVAL.
+// sockets (a file has no ioctl: ENOTTY; a pipe: FIONREAD is the bytes buffered, FIONBIO is EINVAL); the terminal
+// requests are ENOTTY (no descriptor here is a terminal for them); anything else is EINVAL. (FIOCLEX and FIONCLEX never
+// come here: the main module's libc answers them with 0 itself, so os.set_inheritable(fd, True) is a no-op; F_SETFD works.)
 EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     u8 st[24] __attribute__((aligned(8)));
     if (is_pre(fd) || (!is_sock(fd) && w_fd_fdstat_get(fd, st))) return -EBADF;
@@ -327,9 +332,11 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
 // pread, pwrite and fsync of the main module: a socket or a pipe has no offset (ESPIPE), a pipe can not be synced (EINVAL)
 WASI("fd_sync") i32 w_fd_sync(i32 fd);
 EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
+    if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
     return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pread(rfd(fd), iov, n, off, nread);
 }
 EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
+    if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;
     return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pwrite(rfd(fd), iov, n, off, nw);
 }
 EXPORT("fd_sync") i32 x_fd_sync(i32 fd) { return is_pre(fd) ? FE_BADF : is_pipe(fd) ? FE_INVAL : is_sock(fd) ? 0 : w_fd_sync(rfd(fd)); }

@@ -565,8 +565,11 @@ static Lib *load_lib(Libs *L, const char *path, i32 global, u32 scope, i32 depth
         u64 relocs[3], ctors[3];
         relocs[0] = 0x615f6d7361775f5full, relocs[1] = 0x7461645f796c7070ull, relocs[2] = 0x73636f6c65725f61ull;
         ctors[0] = 0x635f6d7361775f5full, ctors[1] = 0x726f74635f6c6c61ull, ctors[2] = 0x73ull;
-        dl_call(id, (const char *)relocs, 24);  // __wasm_apply_data_relocs
-        dl_call(id, (const char *)ctors, 17);   // __wasm_call_ctors
+        // a trap or exit() in either is a failed load, as in the glue (its try/catch makes the OSError); -1: the host says why
+        if (dl_call(id, (const char *)relocs, 24) < 0 || dl_call(id, (const char *)ctors, 17) < 0) {  // __wasm_apply_data_relocs, __wasm_call_ctors
+            fail(L, 11, 0, 0);
+            goto failed;
+        }
     }
 
     x->base = base, x->memsize = m.memsize, x->tbase = tbase, x->tsize = m.tsize;

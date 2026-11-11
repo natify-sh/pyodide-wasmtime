@@ -6,8 +6,9 @@
 #include "state.h"
 #include "metadata.h"
 
-// A guest descriptor number is always a real WASI descriptor (WASI's allocator gives the lowest free number, so the
-// numbers are as a kernel's and never clash). What a number stands for is an OBJECT, shared by the numbers that dup()
+// A guest descriptor number is always a real WASI descriptor (so the numbers never clash with the ones the adapter opens
+// itself; WASI's allocator gives neither the lowest free number nor the last freed one: after close(0) an open gives 4
+// where a kernel gives 0, the known gap that the renumbering of BACKLOG W5 closes). What a number stands for is an OBJECT, shared by the numbers that dup()
 // made of it: a file or directory (K_FILE: the WASI descriptor that really holds it, `w`; the file offset is its own,
 // so it is shared), a socket (K_SOCK: the host's handle in `w`), the two ends of a pipe (K_PIPER, K_PIPEW). A number
 // without an entry is a plain WASI descriptor (opened by openat, or a standard stream) that nobody has duplicated.
@@ -44,7 +45,8 @@ typedef struct {
 } Obj;
 typedef struct {
     Obj *o[MAXFD];
-    u8 cloexec[MAXFD];  // FD_CLOEXEC, per number
+    u8 cloexec[MAXFD];  // FD_CLOEXEC, per number (every descriptor, also the ones with no object)
+    u8 stdgone;         // bit n: the number n (0..2) was closed once, so it is no standard stream any more
     u32 npipe;
 } Vt;
 __asm__(".globaltype vt_state, i32\nvt_state:\n");
@@ -84,27 +86,56 @@ static i32 rfd(i32 fd) {
     return o && o->kind == K_FILE ? o->w : fd;
 }
 // is the (WASI) descriptor a standard stream?
-static i32 fd_std(i32 w) {
+static i32 fd_std(i32 w) {  // by the object (a number below 3 that was closed and opened again is a file)
     Obj *o = vobj(w);
-    return o ? o->std : w >= 0 && w <= 2;
+    if (o) return o->std;
+    return w >= 0 && w <= 2 && !(vt() && (vt()->stdgone >> w & 1));
+}
+static i32 cloexec_get(i32 fd) {  // -ENOMEM when the table can not be made
+    Vt *T = vt();
+    return !T ? -ENOMEM : fd >= 0 && fd < MAXFD ? T->cloexec[fd] : 0;
+}
+static i32 cloexec_set(i32 fd, i32 on) {
+    Vt *T = vt();
+    if (!T) return -ENOMEM;
+    if (fd >= 0 && fd < MAXFD) T->cloexec[fd] = (u8)(on != 0);
+    return 0;
 }
 
 // a placeholder descriptor for a new number: a directory opened, so the number is a real WASI one. -errno
+// WASI may hand out a number of MAXFD or more (after many files were opened and closed): those are held while more are
+// opened, up to HOLD of them, until a smaller one comes; then all the held are closed again.
+#define HOLD 2048
 static i32 sock_fd(void) {
     u64 all = (1ull << 30) - 1, writes = (1ull << 6) | (1ull << 0) | (1ull << 8) | (1ull << 22);
-    i32 fd = -1;
+    i32 fd = -1, r, held = 0, *hv = 0;
     char dot[2];  // "." built on the stack: a string literal would be a data section
     dot[0] = '.', dot[1] = 0;
-    i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);
-    if (e) return -33;  // EMFILE
-    if (fd < 0 || fd >= MAXFD) {
-        w_fd_close(fd);
-        return -33;
+    for (;;) {
+        fd = -1;
+        i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);
+        if (e) {
+            r = -33;  // EMFILE
+            break;
+        }
+        if (fd >= 0 && fd < MAXFD) {
+            r = fd;
+            break;
+        }
+        if (!hv) hv = (i32 *)calloc(HOLD, 4);
+        if (fd < 0 || !hv || held == HOLD) {
+            w_fd_close(fd);
+            r = -33;
+            break;
+        }
+        hv[held++] = fd;
     }
-    return fd;
+    while (held > 0) w_fd_close(hv[--held]);
+    free(hv);
+    return r;
 }
 // the lowest free number from `min` on (exactly `min` if `exact`: a dup2 target, free by now), as a placeholder. WASI
-// hands out the number last freed, not the lowest: so placeholders are opened until the wanted number comes, and the
+// hands out neither the lowest number nor the last freed (see the top): so placeholders are opened until the wanted number comes, and the
 // others closed again, the highest first (the lowest is then the next to be given out).
 static i32 fd_alloc(i32 min, i32 exact) {
     u8 st[24] __attribute__((aligned(8)));
@@ -142,6 +173,7 @@ static void pipe_drop(Pipe *p) {  // the buffered bytes are of no use to a pipe 
 }
 static i32 fd_release(i32 fd) {  // close(): the number goes; the object when it was the last one
     Obj *o = vobj(fd);
+    if (fd >= 0 && fd <= 2 && vt()) vt()->stdgone |= (u8)(1 << fd);
     if (!o) {  // a plain descriptor
         if (fd >= 0 && fd < MAXFD && vt()) vt()->cloexec[fd] = 0;
         if (mt()->norphan) meta_closing(fd);
