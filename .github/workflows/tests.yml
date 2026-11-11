@@ -11,6 +11,8 @@ on:
     paths-ignore: &non-code-paths
       - "**.md"
       - "LICENSE"
+      - "licenses/**"
+      - ".claude/**"
   pull_request:
     paths-ignore: *non-code-paths
   workflow_dispatch:
