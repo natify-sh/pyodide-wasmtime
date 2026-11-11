@@ -663,7 +663,7 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
             i32 r = (rights & (1ull << 1)) != 0, w = (rights & (1ull << 6)) != 0;
             i32 fl = r && w ? 2 : w ? 1 : 0;  // O_RDWR, O_WRONLY, O_RDONLY
             if (ff & 1) fl |= 02000;          // O_APPEND
-            if (ff & 4) fl |= 04000;          // O_NONBLOCK
+            if ((ff & 4) || (vobj(fd) && vobj(fd)->nb)) fl |= 04000;  // O_NONBLOCK (a stream's or directory's is kept by us)
             return fl;
         }
         case 4: {  // F_SETFL: append and nonblock only
@@ -676,6 +676,7 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
                 vobj(fd)->fl = (vobj(fd)->fl & ~289792) | (flags & 289792);
                 return 0;
             }
+            if (nb_keeps(fd)) return nb_set(fd, flags & 04000);
             if (flags & 02000) ff |= 1;
             if (flags & 04000) ff |= 4;
             i32 e = w_fd_fdstat_set_flags(rfd(fd), ff);

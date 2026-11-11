@@ -74,6 +74,9 @@ EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, 
 EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
     if (is_pre(fd)) return -FE_BADF;
     if (is_virt(fd)) return -FE_INVAL;
+    i32 ft = fd_type(fd);  // a standard stream and a directory: EINVAL (a tty, a pipe; Pyodide)
+    if (ft < 0) return ft;
+    if (fd_std(rfd(fd)) || ft == 3) return -FE_INVAL;
     i32 e = w_fd_set_size(rfd(fd), (u64)len);
     return e ? -e : 0;
 }

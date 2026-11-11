@@ -287,6 +287,7 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
         *argp = (i32)vobj(fd)->pipe->size;
         return 0;
     }
+    if (op == 0x5421 && nb_keeps(fd)) return argp ? nb_set(fd, *argp != 0) : -21;  // a stream or directory: succeeds, as Pyodide
     if (op == 0x5421 || op == 0x541B) {  // FIONBIO, FIONREAD
         if (!is_sock(fd)) return -ENOTTY;
         if (!argp) return -21;  // EFAULT
@@ -368,6 +369,12 @@ EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;
     return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pwrite(rfd(fd), iov, n, off, nw);
 }
-EXPORT("fd_sync") i32 x_fd_sync(i32 fd) { return is_pre(fd) ? FE_BADF : is_pipe(fd) ? FE_INVAL : is_sock(fd) ? 0 : w_fd_sync(rfd(fd)); }
+EXPORT("fd_sync") i32 x_fd_sync(i32 fd) {
+    if (is_pre(fd)) return FE_BADF;
+    if (is_pipe(fd)) return FE_INVAL;
+    if (is_sock(fd)) return 0;
+    i32 ft = fd_type(fd);  // a standard stream and a directory have nothing to sync: success, as Pyodide
+    return ft < 0 ? -ft : fd_std(rfd(fd)) || ft == 3 ? 0 : w_fd_sync(rfd(fd));
+}
 
 #endif

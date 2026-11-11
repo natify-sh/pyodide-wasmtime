@@ -39,7 +39,7 @@ typedef struct {
 typedef struct {
     i32 kind, ref, w;
     i32 fl;  // a pipe end's status flags (F_SETFL)
-    u8 nb;   // a socket's O_NONBLOCK
+    u8 nb;   // O_NONBLOCK of a socket, a standard stream or a directory (WASI can not hold it for the last two)
     u8 std;  // a standard stream (fstat says character device)
     Pipe *pipe;
 } Obj;
@@ -90,6 +90,24 @@ static i32 fd_std(i32 w) {  // by the object (a number below 3 that was closed a
     Obj *o = vobj(w);
     if (o) return o->std;
     return w >= 0 && w <= 2 && !(vt() && (vt()->stdgone >> w & 1));
+}
+// A standard stream or a directory takes F_SETFL/FIONBIO as Pyodide does (and WASI refuses: EBADF), keeping the flag in the
+// number's object (made here for a plain descriptor), so that F_GETFL and the duplicates agree. 0 or -errno.
+static i32 nb_keeps(i32 fd) {
+    u8 st[24] __attribute__((aligned(8)));
+    return !is_virt(fd) && (fd_std(rfd(fd)) || (!w_fd_fdstat_get(rfd(fd), st) && st[0] == 3));
+}
+static i32 nb_set(i32 fd, i32 on) {
+    Vt *T = vt();
+    if (!T) return -ENOMEM;
+    if (!T->o[fd]) {
+        Obj *o = (Obj *)calloc(1, sizeof(Obj));
+        if (!o) return -ENOMEM;
+        o->kind = K_FILE, o->ref = 1, o->w = fd, o->std = (u8)fd_std(fd);
+        T->o[fd] = o;
+    }
+    T->o[fd]->nb = (u8)(on != 0);
+    return 0;
 }
 static i32 cloexec_get(i32 fd) {  // -ENOMEM when the table can not be made
     Vt *T = vt();

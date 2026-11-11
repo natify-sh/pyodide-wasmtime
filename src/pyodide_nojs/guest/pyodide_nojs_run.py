@@ -46,15 +46,21 @@ def run(src_path, rc_path):
     except BaseException as e:
         rc = 1
         e.__traceback__ = e.__traceback__.tb_next if e.__traceback__ else None  # not our frame (a SyntaxError has none)
-        if sys.excepthook is sys.__excepthook__:
-            traceback.print_exception(e)
-        else:
-            try:
-                sys.excepthook(type(e), e, e.__traceback__)
-            except BaseException as e2:
-                e2.__traceback__ = e2.__traceback__.tb_next if e2.__traceback__ else None
-                traceback.print_exception(e2)
-    sys.stdout.flush()
-    sys.stderr.flush()
+        try:  # (OSError: the program closed descriptor 2, so there is nowhere to say it; Pyodide's runPython throws it)
+            if sys.excepthook is sys.__excepthook__:
+                traceback.print_exception(e)
+            else:
+                try:
+                    sys.excepthook(type(e), e, e.__traceback__)
+                except BaseException as e2:
+                    e2.__traceback__ = e2.__traceback__.tb_next if e2.__traceback__ else None
+                    traceback.print_exception(e2)
+        except OSError:
+            pass
+    for s in (sys.stdout, sys.stderr):  # a stream whose descriptor the program closed: Pyodide never flushes at the end
+        try:
+            s.flush()
+        except OSError:
+            pass
     with open(rc_path, "w") as f:
         f.write(str(rc))

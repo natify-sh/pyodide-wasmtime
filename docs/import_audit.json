@@ -1336,8 +1336,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_ioctl, as Pyodide's JavaScript: a descriptor that is not open is EBADF; FIONBIO and FIONREAD on a socket (FIONREAD: the host's byte count, the next datagram's size for UDP), ENOTTY on a file (no ioctl op); the terminal requests (TCGETS... TIOCSWINSZ) ENOTTY: Pyodide answers them only for its emulated stdio ttys, and a WASI descriptor can not be asked about a terminal; every other request EINVAL. Probe on real Pyodide and ours: FIONREAD socket b'\\0\\0\\0\\0' both, file/TCGETS ENOTTY both, bad fd EBADF both, 0x5555 EINVAL both, isatty(0) False both.. A pipe: FIONREAD is the bytes buffered, FIONBIO is EINVAL (PIPEFS). FIOCLEX/FIONCLEX never reach it: the main module's libc answers them with 0 (both here and in Pyodide)",
-  "tested": "tests/test_sockets.py::test_ioctl_answers_as_pyodide, tests/test_sockets.py::test_a_non_blocking_socket_does_not_block"
+  "evidence": "adapter.c sc_ioctl, as Pyodide's JavaScript: a descriptor that is not open is EBADF; FIONBIO and FIONREAD on a socket (FIONREAD: the host's byte count, the next datagram's size for UDP), ENOTTY on a file (no ioctl op); the terminal requests (TCGETS... TIOCSWINSZ) ENOTTY: Pyodide answers them only for its emulated stdio ttys, and a WASI descriptor can not be asked about a terminal; every other request EINVAL. FIONBIO on a standard stream (0-2) or a directory succeeds, as in Pyodide (it was EBADF): the flag is kept in the number's object and read back by F_GETFL/get_blocking (Pyodide's own get_blocking(0..2) is False after nothing was set; ours stays True, POSIX). Probe on real Pyodide and ours: FIONREAD socket b'\\0\\0\\0\\0' both, file/TCGETS ENOTTY both, bad fd EBADF both, 0x5555 EINVAL both, isatty(0) False both.. A pipe: FIONREAD is the bytes buffered, FIONBIO is EINVAL (PIPEFS). FIOCLEX/FIONCLEX never reach it: the main module's libc answers them with 0 (both here and in Pyodide)",
+  "tested": "tests/test_sockets.py::test_ioctl_answers_as_pyodide, tests/test_sockets.py::test_a_non_blocking_socket_does_not_block, tests/test_descriptors.py::test_standard_streams_and_directories_sync_truncate_and_set_nonblocking"
  },
  {
   "name": "getprotobyname",
@@ -1464,8 +1464,8 @@
    "known gap, the descriptor numbering of BACKLOG W5/D5: WASI hands out numbers that are neither the lowest free nor the last freed (after os.close(0) the next os.open gives 4, Pyodide 0; probe rv/p5.py), the first descriptor of a program is 4 (3 is the root), ; F_DUPFD with a minimum of 1024 or more is EINVAL (Pyodide accepts up to 4095)",
    "known gap (W5): after os.dup2(fd, 1000) every later dup/pipe/socket opens and closes about 1000 placeholder directories (200 dup+close take 0.014 s before and 2.9 s after; probe rv/p7.py). Likewise after 1200 files were opened and closed WASI hands out numbers above 1024 and a dup opens about 1200 placeholders to reach the lowest (measured with the numbers held once per allocation: the first os.dup(2) 0.015-0.023 s, 5 more dup+close 0.04-0.09 s; with the numbers held again for every placeholder it was 1.7-5.6 s and 18 s; before any hold the call failed with EMFILE)"
   ],
-  "evidence": "adapter: sc_fcntl64: EBADF for a closed descriptor for every command (Pyodide's getStreamFromFD); F_DUPFD/F_DUPFD_CLOEXEC give the lowest free number from the argument on (fd_dup; a negative argument is EINVAL, as Pyodide) for files, directories, 0/1/2, sockets and pipes; F_GETFL/F_SETFL of a pipe end are its access mode and the bits of Emscripten's mask (O_NONBLOCK shared by the dups); F_GETLK (12) reports F_UNLCK, F_SETLK/F_SETLKW (13, 14) are granted (one process): fcntl.lockf and flock work; other commands EINVAL. Probes (pipes_b.py) on real Pyodide, fused and dynamic: F_DUPFD 10/40/taken/-1/bad fd and the flags of pipes the same.",
-  "tested": "tests/test_files.py::test_fcntl_locks_and_invalid_descriptors, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, tests/test_descriptors.py::test_f_dupfd_takes_the_lowest_free_number_from_the_argument, ::test_pipe2_flags, ::test_dup_of_pipe_ends, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor"
+  "evidence": "adapter: sc_fcntl64: EBADF for a closed descriptor for every command (Pyodide's getStreamFromFD); F_DUPFD/F_DUPFD_CLOEXEC give the lowest free number from the argument on (fd_dup; a negative argument is EINVAL, as Pyodide) for files, directories, 0/1/2, sockets and pipes; F_GETFL/F_SETFL of a pipe end are its access mode and the bits of Emscripten's mask (O_NONBLOCK shared by the dups); F_SETFL of O_NONBLOCK on a standard stream or a directory succeeds, as in Pyodide (WASI refuses it: EBADF before), the flag kept in the number's object (shared by dup, read back by F_GETFL and os.get_blocking; the read side is POSIX's 0/1/1, not Pyodide's 2048/2049, the owner keeps it; a directory's F_GETFL is its access mode 0, Pyodide's is 624640); F_GETLK (12) reports F_UNLCK, F_SETLK/F_SETLKW (13, 14) are granted (one process): fcntl.lockf and flock work; other commands EINVAL. Probes (pipes_b.py) on real Pyodide, fused and dynamic: F_DUPFD 10/40/taken/-1/bad fd and the flags of pipes the same.",
+  "tested": "tests/test_files.py::test_fcntl_locks_and_invalid_descriptors, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, tests/test_descriptors.py::test_f_dupfd_takes_the_lowest_free_number_from_the_argument, ::test_standard_streams_and_directories_sync_truncate_and_set_nonblocking, ::test_pipe2_flags, ::test_dup_of_pipe_ends, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor"
  },
  {
   "name": "__syscall_openat",
@@ -1761,8 +1761,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c:948-951; probe: ftruncate -1 EINVAL, read-only EINVAL, 3 → 3, 5 GiB → 5368709120: identical in both",
-  "tested": "no"
+  "evidence": "adapter.c:948-951; probe: ftruncate -1 EINVAL, read-only EINVAL, 3 → 3, 5 GiB → 5368709120: identical in both. A standard stream (0-2) or a directory is EINVAL (it was EBADF), as a tty/pipe on Linux and as Pyodide (one probe file on the real Pyodide and both packagings: identical)",
+  "tested": "tests/test_descriptors.py::test_standard_streams_and_directories_sync_truncate_and_set_nonblocking"
  },
  {
   "name": "__syscall_getcwd",

@@ -446,3 +446,62 @@ print(open(base + "/moved").read())
 """,
     )
     assert out == ["QQ23456789"]
+
+
+def test_standard_streams_and_directories_sync_truncate_and_set_nonblocking(guest: Guest) -> None:
+    """The real Pyodide: fsync of 0-2 and of a directory is None, FIONBIO / F_SETFL O_NONBLOCK / os.set_blocking succeed
+    on them, ftruncate is EINVAL. The read side stays POSIX's (get_blocking(0..2) True, F_GETFL 0/1/1), but a flag that
+    was set is read back, and shared by dup (Pyodide's own F_GETFL values 2048/2049 are not copied)."""
+    out = run(
+        guest,
+        """
+def r(fn):
+    try:
+        x = fn()
+        return "ok" if x is None or isinstance(x, bytes) else x
+    except OSError as e:
+        return errno.errorcode.get(e.errno, e.errno)
+
+d = os.open(base + "/d", os.O_RDONLY | os.O_DIRECTORY)
+for n, fd in (("0", 0), ("1", 1), ("2", 2), ("dir", d)):
+    a = [r(lambda: os.fsync(fd)), r(lambda: os.ftruncate(fd, 0)), os.get_blocking(fd)]
+    a += [r(lambda: fcntl.ioctl(fd, termios.FIONBIO, b"\\1\\0\\0\\0")), os.get_blocking(fd)]
+    a += [r(lambda: os.set_blocking(fd, True)), os.get_blocking(fd)]
+    a += [r(lambda: os.set_blocking(fd, False)), os.get_blocking(fd)]
+    d2 = os.dup(fd)
+    a += [os.get_blocking(d2), bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK)]
+    os.close(d2)
+    a += [r(lambda: fcntl.fcntl(fd, fcntl.F_SETFL, 0)), os.get_blocking(fd)]
+    a += [r(lambda: fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK)), os.get_blocking(fd)]
+    a += [r(lambda: fcntl.ioctl(fd, termios.FIONBIO, b"\\0\\0\\0\\0")), os.get_blocking(fd)]
+    print(n, *a)
+print([fcntl.fcntl(n, fcntl.F_GETFL) for n in (0, 1, 2)])
+print(r(lambda: os.fsync(99)), r(lambda: os.ftruncate(99, 0)), r(lambda: os.set_blocking(99, False)))
+""",
+    )
+    line = "ok EINVAL True ok False ok True ok False False True 0 True 0 False ok True"
+    assert out == [f"{n} {line}" for n in ("0", "1", "2", "dir")] + ["[0, 1, 1]", "EBADF EBADF EBADF"]
+
+
+def test_a_program_that_closes_1_or_2_ends_without_a_shutdown_error(guest: Guest) -> None:
+    """os.close(1): write/read/fstat/fsync on it are EBADF, print() raises it, and the end of the run does not flush the
+    dead stream again (it printed `OSError: [Errno 8]` and exited 255; Pyodide has no such end). The number of the next
+    open() differs from Pyodide's (BACKLOG W5), so it is not asserted."""
+    code = """
+import os
+def r(fn):
+    try:
+        fn()
+        return "ok"
+    except OSError as e:
+        return e.errno
+os.close(1)
+msg = [r(lambda: os.write(1, b"x")), r(lambda: os.read(1, 1)), r(lambda: os.fstat(1)), r(lambda: os.fsync(1))]
+msg += [r(lambda: print("x")), r(lambda: os.fsync(1))]
+os.write(2, repr(msg).encode() + b"\\n")
+"""
+    p = guest.run(code)
+    assert p.returncode == 0 and p.stdout == "", p
+    assert "[8, 8, 8, 8, 8, 8]" in p.stderr and "Traceback" not in p.stderr
+    p = guest.run("import os\nos.close(2)\nraise ValueError('boom')")
+    assert p.returncode == 1 and p.stdout == "" and "boom" not in p.stderr, p
