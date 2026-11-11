@@ -49,9 +49,9 @@ def test_exit_status(guest: Guest, code: str, status: int) -> None:
 
 def test_cpu_time_clocks_are_the_hosts(guest: Guest) -> None:
     """N3 (and D12): the CPU-time clocks answer with the host's CPU time (where wasmtime says EBADF and Pyodide gives
-    the monotonic clock): a busy loop advances them, a sleep does not."""
+    the monotonic clock): a busy loop advances them, a wait that the host blocks on does not."""
     code = """
-import time, ctypes, errno
+import time, ctypes, errno, select, socket
 def burn(clock):  # until the clock itself has advanced 0.1 s (a clock that does not advance ends at 5 s)
     t0, end = clock(), time.monotonic() + 5
     while clock() - t0 < 0.1 and time.monotonic() < end: pass
@@ -59,8 +59,11 @@ def burn(clock):  # until the clock itself has advanced 0.1 s (a clock that does
 TH, PR, ck = time.CLOCK_THREAD_CPUTIME_ID, time.CLOCK_PROCESS_CPUTIME_ID, time.clock_gettime
 print(burn(time.process_time), burn(lambda: ck(TH)), burn(lambda: ck(PR)))
 p, t = time.process_time(), ck(TH)
-time.sleep(1.0)  # spins: 0.25 of 0.5 s idle, 0.5-0.6 of 1 s loaded; Pyodide's clock is the wall clock: all of it
-print(time.process_time() - p < 0.9, ck(TH) - t < 0.9)
+a, b = socket.socketpair()
+w0 = time.monotonic()
+select.select([a], [], [], 1.0)  # the HOST waits (a guest time.sleep spins: all of the wall time when idle)
+waited = time.monotonic() - w0
+print(waited >= 0.9 and time.process_time() - p < 0.5, waited >= 0.9 and ck(TH) - t < 0.5)
 print(time.clock_getres(time.CLOCK_PROCESS_CPUTIME_ID) > 0, time.clock_getres(time.CLOCK_THREAD_CPUTIME_ID) > 0)
 print(ctypes.CDLL(None).clock() > 0)
 for cid in (4, 99, -1):
