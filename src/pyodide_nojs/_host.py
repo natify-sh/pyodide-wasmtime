@@ -64,7 +64,7 @@ BASE_ENV = [
 ]
 # What the interpreter reads at start only: removed from os.environ once it runs, as in Pyodide (which sets them in its
 # configuration). Never taken from the host's environment.
-INIT_ENV = [("PYTHONHOME", "/"), ("PYTHONDONTWRITEBYTECODE", "1")]
+TESTENV_HINT = " (the tests' testenv is made by `sh tools/prepare_testenv.sh pyo-build`)"
 GUEST_OWN_ENV = {"PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH"}  # `inherit_env` does not override these
 
 MAX_MEMORY = 4 << 30  # the main module's memory: 65536 pages
@@ -226,33 +226,18 @@ SERVICES = {
 
 # Run at every start: /tmp and /home/pyodide are 0o777 in Pyodide, and the guest's modes are the adapter's own
 # records, not the host's; stdout is line buffered, as Pyodide's (a line printed before a trap or os._exit is kept);
-# sys.path as Pyodide has it (the stdlib zip, lib-dynload, then site-packages; no /lib/python3.15, which is not there).
+# '' first in sys.path as Pyodide's JavaScript puts it after the init (not with PYTHONSAFEPATH); with site= the
+# user's packages come before the stdlib zip (a real _ssl over the zip's stub, as before).
 _AT_START = (
-    "def _start(gone, site_first):\n"  # a function: nothing of it stays in __main__
+    "def _start(site_first):\n"  # a function: nothing of it stays in __main__
     "    import os, sys\n"
     "    for d in ('/tmp', '/home/pyodide'): os.chmod(d, 0o777)\n"
     "    sys.stdout.reconfigure(line_buffering=True)\n"
-    "    first = [] if sys.flags.safe_path else ['']\n"  # PYTHONSAFEPATH: no '' first
+    "    if not sys.flags.safe_path and sys.path[:1] != ['']: sys.path.insert(0, '')\n"  # also run after a restore
     f"    sp = '/lib/python{PYVER}/site-packages'\n"
-    # with site= the user's packages come before the stdlib zip (a real _ssl over the zip's stub, as before)
-    f"    rest = [p for p in sys.path if p not in ('', '/lib/python{PYVER}', sp)]\n"
-    "    sys.path[:] = first + ([sp] if site_first else []) + rest + ([] if site_first else [sp])\n"
-    "    sys.executable = '/home/pyodide/this.program'\n"  # the web's value (Node's: a script path); not a file
-    "    old = sys._stdlib_dir\n"
-    f"    new = sys._stdlib_dir = '/lib/python{PYVER.replace('.', '')}.zip'\n"
-    # the frozen modules were laid out under the old stdlib dir at init: they follow it (importlib asserts it)
-    "    for m in (list(sys.modules.values()) if isinstance(old, str) else ()):\n"
-    "        spec = getattr(m, '__spec__', None)\n"
-    "        st = getattr(spec, 'loader_state', None)\n"
-    "        fn = getattr(st, 'filename', None)\n"
-    "        if isinstance(fn, str) and fn.startswith(old + '/'):\n"
-    "            st.filename = new + fn[len(old):]\n"
-    "            if getattr(m, '__file__', None) == fn: m.__file__ = st.filename\n"
-    "            for lst in (getattr(m, '__path__', None), getattr(spec, 'submodule_search_locations', None)):\n"
-    "                if isinstance(lst, list):\n"
-    "                    mv = [new + q[len(old):] if q.startswith(old + '/') else q for q in lst]\n"
-    "                    lst[:] = list(dict.fromkeys(mv))\n"
-    "    for k in gone: os.environ.pop(k, None)\n"
+    "    if site_first and sp in sys.path:\n"
+    "        sys.path.remove(sp)\n"
+    "        sys.path.insert(0 if sys.flags.safe_path else 1, sp)\n"
 )
 
 # What the guest runs for one `run()`: the user's code in __main__, SystemExit as an exit status (the interpreter must
@@ -546,6 +531,10 @@ class Pyodide:
         self.flavor = flavor
         self.site = [site] if isinstance(site, (str, os.PathLike)) else list(site or [])
         self.mounts = {k: str(v) for k, v in (mounts or {}).items()}
+        for what, folders in (("site", self.site), ("mount", self.mounts.values())):
+            for f in folders:
+                if not os.path.isdir(f):
+                    raise FileNotFoundError(f"{what} folder not found: {f}{TESTENV_HINT}")
         self.preopen_dev = bool(os.environ.get("PREOPEN_DEV")) if preopen_dev is None else preopen_dev
         self.env = dict(env or {})
         self.inherit_env = inherit_env
@@ -619,12 +608,9 @@ class Pyodide:
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
         (root / "etc" / "services").write_text("".join(f"{n} {p}/{pr}\n" for (n, pr), p in SERVICES.items()))
         shutil.copy(Path(__file__).with_name("guest") / "hostnet.py", sp)
-        # the frozen `encodings` package looks in /lib/python3.15/encodings, which does not exist: the stdlib is the
-        # zip (Pyodide's JavaScript sets this up); without it every codec but the frozen ones is missing
         # Pyodide's _socket was built without the constant SO_REUSEADDR (musl's value is 2), which asyncio and
         # socketserver look up; setsockopt itself is real (tools/patch_main.mjs)
         (sp / "sitecustomize.py").write_text(
-            f"import encodings\nencodings.__path__.append('/lib/python{PYVER.replace('.', '')}.zip/encodings')\n"
             "import _socket\n_socket.SO_REUSEADDR = 2\n"
             + (
                 "import pyodide_lock\n"
@@ -2429,15 +2415,25 @@ class Pyodide:
                     log.warning("--inherit-env: %r is not valid UTF-8 and is not passed to the guest", k)
                     continue
                 env[k] = v
-        env.update(INIT_ENV)
         env.update(SSL_CERT_FILE="/etc/ssl/cert.pem", REQUESTS_CA_BUNDLE="/etc/ssl/cert.pem")
         env.update(self.env)
         return list(env.items())
 
     def _at_start(self) -> str:
-        """Run at every start: the variables only the interpreter's start needed go (unless the user gave them)."""
-        gone = [k for k, _ in INIT_ENV if k not in self.env]
-        return _AT_START + f"_start({gone!r}, {bool(self.site)!r})\ndel _start\n"
+        return _AT_START + f"_start({bool(self.site)!r})\ndel _start\n"
+
+    def _guest_cstr(self, b: bytes) -> int:
+        store = self.store
+        p = self.ex["malloc"](store, len(b) + 1) & 0xFFFFFFFF
+        self.memory.write(store, b + b"\0", p)
+        return p
+
+    def _chdir_home(self) -> None:
+        """Pyodide's JavaScript starts the guest in HOME (the cwd is not in a snapshot: this is run after a restore)."""
+        p = self._guest_cstr(b"/home/pyodide")
+        rc = self.ex["chdir"](self.store, p)
+        self.ex["free"](self.store, p)
+        assert rc == 0, "chdir to /home/pyodide failed"
 
     # ------------------------------------------------------------------ snapshot of the memory after `preload`
     def _snapshot_path(self) -> Path:
@@ -2500,12 +2496,18 @@ class Pyodide:
             path = self._snapshot_path()
             if self._restore(path, slots):
                 self.restored = self._started = True
+                self._chdir_home()
                 # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
                 self.run(self._at_start() + 'import sys; "random" in sys.modules and __import__("random").seed()')
                 return
         self.ex["emscripten_stack_init"](store)
         self.ex["__wasm_call_ctors"](store)
-        self.ex["Py_Initialize"](store)
+        self._chdir_home()
+        # Pyodide's own main(): PyConfig (home "/", stdlib_dir the zip, no bytecode, argv), Py_InitializeFromConfig; its
+        # argv[0] is Emscripten's thisProgram, "./this.program", which CPython resolves against the cwd
+        argv = self.ex["malloc"](store, 8) & 0xFFFFFFFF
+        self.memory.write(store, self._guest_cstr(b"./this.program").to_bytes(4, "little") + bytes(4), argv)
+        self.ex["__main_argc_argv"](store, 1, argv)
         self._started = True
         self.run(self._at_start())
         if self.preload is not None and self.run(self.preload) == 0 and path is not None:

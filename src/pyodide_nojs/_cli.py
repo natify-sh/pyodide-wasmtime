@@ -9,7 +9,7 @@ import os
 import sys
 
 from . import PYODIDE_ABI, PYODIDE_VERSION, __version__
-from ._host import FLAVORS, Pyodide
+from ._host import FLAVORS, TESTENV_HINT, Pyodide
 
 CWD_MOUNT = "/host"  # where --mount-cwd puts the host's current folder
 
@@ -166,6 +166,10 @@ def main(argv: list[str] | None = None) -> int:
             if "=" not in item:
                 ap.error(f"{opt} {item!r}: expected {'GUEST=HOST' if opt == '--mount' else 'K=V'}")
     mounts = dict(m.split("=", 1) for m in ns.mount)
+    for opt, folders in (("site", ns.site), ("mount", mounts.values())):
+        for f in folders:
+            if not os.path.isdir(f):
+                ap.error(f"{opt} folder not found: {f}{TESTENV_HINT}")
     if ns.mount_cwd:
         mounts[CWD_MOUNT] = os.getcwd()
     argv0: list[str] | None = None

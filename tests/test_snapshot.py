@@ -46,6 +46,18 @@ def test_same_as_normal_start(flavor, cache, capfd):
     assert want[0][0] == 1 and want_second[0][0] == 0
 
 
+def test_restored_start_state_is_pyodides(flavor, cache, capfd):
+    from test_review_fixes import STARTUP_STATE, STARTUP_WANT
+
+    for want_restored in (False, True):
+        with Pyodide(flavor, preload=PRE) as py:
+            assert py.run(STARTUP_STATE) == 0
+            assert py.restored is want_restored
+        out = capfd.readouterr().out.splitlines()
+        # sys.argv is main's [''] in both; the cwd is not in the snapshot: set again after the restore
+        assert out == STARTUP_WANT
+
+
 def test_restore_does_not_boot_python(flavor, cache, monkeypatch):
     names: list[str] = []
     orig = engine.LazyExports.__getitem__
@@ -53,12 +65,12 @@ def test_restore_does_not_boot_python(flavor, cache, monkeypatch):
     with Pyodide(flavor, preload=PRE) as py:  # the control: a normal start is seen by the spy
         py.run("pass")
         assert not py.restored
-    assert "Py_Initialize" in names and "PyRun_SimpleString" in names
+    assert "__main_argc_argv" in names and "PyRun_SimpleString" in names
     names.clear()
     with Pyodide(flavor, preload=PRE) as py:
         assert py.run("print(f(0))") == 0
         assert py.restored
-    assert "Py_Initialize" not in names and "__wasm_call_ctors" not in names
+    assert "__main_argc_argv" not in names and "__wasm_call_ctors" not in names
 
 
 def test_key_changes_with_preload_and_env(flavor, cache):

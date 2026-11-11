@@ -1268,7 +1268,7 @@
   "class": "hook",
   "verdict": "n/a",
   "gaps": [],
-  "evidence": "not answered by the adapter (a no-op in the shim/stub): keeps a JavaScript runtime from exiting while an async operation (a dlopen, a promise) is pending; the host calls are synchronous and the guest has no event loop to keep alive. Nothing in Python reaches it with an effect that could differ",
+  "evidence": "not answered by the adapter (a no-op in the shim/stub): keeps a JavaScript runtime from exiting while an async operation (a dlopen, a promise) is pending; the host calls are synchronous and the guest has no event loop to keep alive (Pyodide's main() calls it once at start: the start here runs main too, and the call is a no-op). Nothing in Python reaches it with an effect that could differ",
   "tested": "no"
  },
  {

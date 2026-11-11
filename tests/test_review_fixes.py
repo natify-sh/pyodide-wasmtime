@@ -181,6 +181,46 @@ def test_sys_executable_is_the_web_pyodides(guest: Guest) -> None:
     assert out[1].startswith("pyodide-nojs"), out
 
 
+STARTUP_STATE = """
+import os, sys, zipimport
+print(sys.executable, sys._base_executable, sys.orig_argv, sys.argv)
+print(sys.path[:3], sys._stdlib_dir, os.getcwd(), os.listdir('/home/pyodide'))
+print(zipimport.__file__, zipimport.__spec__.loader_state.filename, os.__file__)
+print(sys.dont_write_bytecode, sys.flags.inspect, sys.prefix)
+import _pyodide_core
+"""
+# Pyodide's own values (the real 315.0.0a2 on Node: executable and orig_argv are the script's path there, the web has
+# Emscripten's default thisProgram "./this.program"; PYTHONINSPECT=1 of Pyodide's JavaScript is not mirrored)
+STARTUP_WANT = [
+    "/home/pyodide/this.program /home/pyodide/this.program ['./this.program'] ['']",
+    "['', '/lib/python315.zip', '/lib/python3.15/lib-dynload'] /lib/python315.zip /home/pyodide []",
+    "/lib/python315.zip/zipimport.py /lib/python315.zip/zipimport.py /lib/python315.zip/os.py",
+    "True 0 /",
+]
+
+
+def test_startup_state_is_pyodides(flavor: str, capfd: pytest.CaptureFixture[str]) -> None:
+    with Pyodide(flavor) as py:  # not the CLI: it sets sys.argv to what it was given
+        assert py.run(STARTUP_STATE) == 0
+    assert capfd.readouterr().out.splitlines() == STARTUP_WANT
+
+
+def test_missing_site_and_mount_folders_are_said_plainly(flavor: str, tmp_path: Path) -> None:
+    gone = str(tmp_path / "gone")
+    with pytest.raises(FileNotFoundError, match=f"site folder not found: {gone}"):
+        Pyodide(flavor, site=gone)
+    with pytest.raises(FileNotFoundError, match=f"mount folder not found: {gone}"):
+        Pyodide(flavor, mounts={"/m": gone})
+    for opt in ("--site", "--mount"):
+        arg = gone if opt == "--site" else f"/m={gone}"
+        r = subprocess.run(
+            [sys.executable, "-m", "pyodide_nojs", "--flavor", flavor, opt, arg, "-c", "pass"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 2 and f"folder not found: {gone}" in r.stderr and "Traceback" not in r.stderr, r.stderr
+
+
 def test_run_returns_the_status_as_a_process_exit_would(flavor: str) -> None:
     """Batch 1 L9: `sys.exit(256)` returned 256 and `os._exit(256)` returned 0."""
     codes = ["sys.exit(256)", "sys.exit(256 + 5)", "sys.exit(-1)", "sys.exit(2**70)", "sys.exit(3)", "os._exit(256)"]
