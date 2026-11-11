@@ -2433,7 +2433,8 @@ class Pyodide:
         p = self._guest_cstr(b"/home/pyodide")
         rc = self.ex["chdir"](self.store, p)
         self.ex["free"](self.store, p)
-        assert rc == 0, "chdir to /home/pyodide failed"
+        if rc != 0:  # not an assert: it must hold under python -O too
+            raise RuntimeError("chdir to /home/pyodide failed (does a mount= replace /home?)")
 
     # ------------------------------------------------------------------ snapshot of the memory after `preload`
     def _snapshot_path(self) -> Path:
@@ -2505,9 +2506,12 @@ class Pyodide:
         self._chdir_home()
         # Pyodide's own main(): PyConfig (home "/", stdlib_dir the zip, no bytecode, argv), Py_InitializeFromConfig; its
         # argv[0] is Emscripten's thisProgram, "./this.program", which CPython resolves against the cwd
+        # (argv and its string stay allocated: 23 bytes, as the stack copies of Emscripten's callMain would be)
         argv = self.ex["malloc"](store, 8) & 0xFFFFFFFF
         self.memory.write(store, self._guest_cstr(b"./this.program").to_bytes(4, "little") + bytes(4), argv)
-        self.ex["__main_argc_argv"](store, 1, argv)
+        rc = self.ex["__main_argc_argv"](store, 1, argv)
+        if rc:
+            raise RuntimeError(f"Pyodide's main() returned {rc}: CPython did not start")
         self._started = True
         self.run(self._at_start())
         if self.preload is not None and self.run(self.preload) == 0 and path is not None:
