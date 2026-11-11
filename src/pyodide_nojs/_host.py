@@ -13,7 +13,6 @@ Two builds of the same sources, one `Pyodide` class:
 
 from __future__ import annotations
 
-import calendar
 import contextlib
 import ctypes
 import errno
@@ -34,103 +33,61 @@ import traceback
 import urllib.error
 import urllib.request
 import weakref
-import zipfile
-from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from . import _engine, _wasm
+from . import _engine, _timecalc, _wasm
+from ._consts import (
+    _GLOBAL_WHY,
+    _JS_MODULES,
+    _U32,
+    BASE_ENV,
+    EOPNOTSUPP,
+    ESOCKTNOSUPPORT,
+    FLAVORS,
+    GUEST,
+    GUEST_ERRNO,
+    GUEST_OWN_ENV,
+    GUEST_SUFFIXES,
+    MAX_MEMORY,
+    MAX_TABLE,
+    PYVER,
+    SERVICE_EXPORTS,
+    SERVICES,
+    SNAPSHOT_VERSION,
+    TESTENV_HINT,
+    WASI_ERRNO,
+    GuestExit,
+    GuestFault,
+    MainExports,
+    _Big,
+    _from_wasm,
+    _num,
+    _override,
+    _s32,
+    _to_wasm,
+    available_flavors,
+    data_dir,
+    guest_errno,
+    override_warnings,
+)
 
 log = logging.getLogger("pyodide_nojs")
 
-PYVER = "3.15"  # the Python of the pinned Pyodide (315.0.0-alpha.2 = 3.15.0rc1)
-PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited constant in the pinned pyodide.asm.wasm
-FLAVORS = ("fused", "dynamic")
-DATA = Path(__file__).resolve().parent / "data"
-GUEST = Path(__file__).resolve().parent / "guest"  # Python that runs in the guest: copied to its site-packages
-GUEST_SUFFIXES = (".py", ".pth")  # of the files copied, and of the files the snapshot key covers
-
-# The guest's whole environment (the host's is never passed unless `inherit_env`): what Pyodide has on Node
-# (Emscripten's USER, LOGNAME, PATH, PWD, LANG; HOME from its loader), and LD_LIBRARY_PATH (where NEEDED are sought).
-BASE_ENV = [
-    ("USER", "web_user"),
-    ("LOGNAME", "web_user"),
-    ("PATH", "/"),
-    ("PWD", "/"),
-    ("HOME", "/home/pyodide"),
-    ("LANG", "en_US.UTF-8"),
-    ("LD_LIBRARY_PATH", f"/usr/lib:/lib/python{PYVER}/site-packages"),
+# what the package, its tools and its tests import from here
+__all__ = [
+    "BASE_ENV",
+    "FLAVORS",
+    "PYVER",
+    "TESTENV_HINT",
+    "GuestExit",
+    "GuestFault",
+    "Pyodide",
+    "available_flavors",
+    "data_dir",
+    "guest_errno",
+    "override_warnings",
 ]
-# What the interpreter reads at start only: removed from os.environ once it runs, as in Pyodide (which sets them in its
-# configuration). Never taken from the host's environment.
-TESTENV_HINT = " (the tests' testenv is made by `sh tools/prepare_testenv.sh pyo-build`)"
-GUEST_OWN_ENV = {"PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH"}  # `inherit_env` does not override these
-
-MAX_MEMORY = 4 << 30  # the main module's memory: 65536 pages
-MAX_TABLE = 10_000_000  # the glue's WebAssembly.Table limit in V8
-SNAPSHOT_VERSION = 1  # the layout of a snapshot file; part of its key
-
-# the host's sockets: errors in WASI's numbering, which is Emscripten's
-WASI_ERRNO = {
-    n: i
-    for i, n in enumerate(
-        "SUCCESS 2BIG ACCES ADDRINUSE ADDRNOTAVAIL AFNOSUPPORT AGAIN ALREADY BADF BADMSG BUSY CANCELED CHILD "
-        "CONNABORTED CONNREFUSED CONNRESET DEADLK DESTADDRREQ DOM DQUOT EXIST FAULT FBIG HOSTUNREACH IDRM ILSEQ "
-        "INPROGRESS INTR INVAL IO ISCONN ISDIR LOOP MFILE MLINK MSGSIZE MULTIHOP NAMETOOLONG NETDOWN NETRESET "
-        "NETUNREACH NFILE NOBUFS NODEV NOENT NOEXEC NOLCK NOLINK NOMEM NOMSG NOPROTOOPT NOSPC NOSYS NOTCONN NOTDIR "
-        "NOTEMPTY NOTRECOVERABLE NOTSOCK NOTSUP NOTTY NXIO OVERFLOW OWNERDEAD PERM PIPE PROTO PROTONOSUPPORT "
-        "PROTOTYPE RANGE ROFS SPIPE SRCH STALE TIMEDOUT TXTBSY XDEV NOTCAPABLE".split()
-    )
-}
-
-# musl's (Linux's) numbers, which the guest uses, by the NAME of the host's constant; the host's own numbers differ
-# The guest's errno numbers are Emscripten's (system/lib/libc/musl/arch/emscripten/bits/errno.h): WASI's for the
-# names WASI has, and its own 137.. for the rest; ENOTSUP is EOPNOTSUPP = 138 (not WASI's NOTSUP, 58).
-GUEST_ERRNO = {
-    **WASI_ERRNO,
-    "NOTSUP": 138,
-    "OPNOTSUPP": 138,
-    "SOCKTNOSUPPORT": 137,
-    "PFNOSUPPORT": 139,
-    "SHUTDOWN": 140,
-    "HOSTDOWN": 142,
-    "WOULDBLOCK": WASI_ERRNO["AGAIN"],
-    "DEADLOCK": WASI_ERRNO["DEADLK"],
-}
-ESOCKTNOSUPPORT, EOPNOTSUPP = GUEST_ERRNO["SOCKTNOSUPPORT"], GUEST_ERRNO["OPNOTSUPP"]
-# Windows reports socket errors as WSAE* numbers (and its errno.errorcode has them only there): by number, so that the
-# translation is the same on every OS
-WSA_ERRNO = {
-    10004: "INTR", 10009: "BADF", 10013: "ACCES", 10014: "FAULT", 10022: "INVAL", 10024: "MFILE",
-    10035: "AGAIN", 10036: "INPROGRESS", 10037: "ALREADY", 10038: "NOTSOCK", 10039: "DESTADDRREQ",
-    10040: "MSGSIZE", 10041: "PROTOTYPE", 10042: "NOPROTOOPT", 10043: "PROTONOSUPPORT",
-    10044: "SOCKTNOSUPPORT", 10045: "OPNOTSUPP", 10046: "PFNOSUPPORT", 10047: "AFNOSUPPORT",
-    10048: "ADDRINUSE", 10049: "ADDRNOTAVAIL", 10050: "NETDOWN", 10051: "NETUNREACH", 10052: "NETRESET",
-    10053: "CONNABORTED", 10054: "CONNRESET", 10055: "NOBUFS", 10056: "ISCONN", 10057: "NOTCONN",
-    10058: "SHUTDOWN", 10060: "TIMEDOUT", 10061: "CONNREFUSED", 10064: "HOSTDOWN", 10065: "HOSTUNREACH",
-}  # fmt: skip
-
-
-def guest_errno(code: int | None) -> int:
-    """A host errno (any OS: by its name, or the WSAE number) -> the guest's positive errno; EIO, logged, if unknown."""
-    name = WSA_ERRNO.get(code or 0) or errno.errorcode.get(code or 0, "EIO")[1:]
-    if name not in GUEST_ERRNO:
-        log.warning("[net] host error %r has no guest errno: EIO", code)
-        return GUEST_ERRNO["IO"]
-    return GUEST_ERRNO[name]
-
-
-class GuestFault(Exception):
-    """A guest pointer or length outside its memory: EFAULT, never a trap of the host."""
-
-
-class GuestExit(Exception):
-    """The guest called proc_exit (exit(), os._exit(), a signal's default action): the status, 0-255."""
-
-    def __init__(self, status: int) -> None:
-        super().__init__(status)
-        self.status = status
-
 
 MSG_FLAGS = {
     1: "MSG_OOB",
@@ -201,171 +158,6 @@ EAI_CODES = {
     )  # fmt: skip
     if hasattr(socket, "EAI_" + n)
 }
-# /etc/services of the guest (musl reads it for getservbyname/getservbyport), and getaddrinfo's fallback
-SERVICES = {
-    (n, pr): port
-    for n, port, prs in (
-        ("echo", 7, "tcp udp"),
-        ("ftp", 21, "tcp"),
-        ("ssh", 22, "tcp"),
-        ("telnet", 23, "tcp"),
-        ("smtp", 25, "tcp"),
-        ("domain", 53, "tcp udp"),
-        ("http", 80, "tcp"),
-        ("pop3", 110, "tcp"),
-        ("ntp", 123, "udp"),
-        ("imap", 143, "tcp"),
-        ("https", 443, "tcp"),
-        ("imaps", 993, "tcp"),
-        ("pop3s", 995, "tcp"),
-    )  # fmt: skip
-    for pr in prs.split()
-}
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# JavaScript's numbers, for the calls that Emscripten's glue makes as `wasmTable.get(fn)(...args)` (ffi_call_js, the
-# trampoline): an i32 parameter takes a Number (a fraction is cut, a missing value is 0), an i64 only a BigInt, a float
-# a Number (a missing value is NaN); anything else is a TypeError, as in JavaScript.
-class _Big(int):
-    """A BigInt (what libffi's JavaScript reads for 64-bit values), as against a Number."""
-
-
-def _to_wasm(v: Any, t: str) -> Any:
-    if t == "i32":
-        if isinstance(v, _Big):
-            raise TypeError("Cannot mix BigInt and other types")
-        if isinstance(v, float):
-            v = int(v) if v == v and abs(v) != float("inf") else 0
-        v = (v or 0) & 0xFFFFFFFF
-        return v - (1 << 32) if v >> 31 else v
-    if t == "i64":
-        if not isinstance(v, _Big):
-            raise TypeError(f"Cannot convert {v} to a BigInt")
-        v &= 0xFFFFFFFFFFFFFFFF
-        return v - (1 << 64) if v >> 63 else v
-    if t in ("f32", "f64"):
-        if isinstance(v, _Big):
-            raise TypeError("Cannot mix BigInt and other types")
-        return float("nan") if v is None else float(v)
-    raise TypeError(f"a function parameter of type {t} cannot be called from a C signature")
-
-
-def _from_wasm(res: Any, results: list[str]) -> Any:
-    """A wasm result as the JavaScript value: None (undefined) for no result, a BigInt for an i64."""
-    if not results:
-        return None
-    if len(results) > 1:
-        return float("nan")
-    return _Big(res) if results[0] == "i64" else res
-
-
-def _num(v: Any, bits: int) -> int:
-    """A Number (or undefined) stored into an unsigned typed array of `bits`: cut, wrapped; a BigInt is a TypeError."""
-    if isinstance(v, _Big):
-        raise TypeError("Cannot mix BigInt and other types")
-    if isinstance(v, float):
-        v = int(v) if v == v and abs(v) != float("inf") else 0
-    return (v or 0) & ((1 << bits) - 1)
-
-
-def _days_from_civil(y: int, m: int, d: int) -> int:  # proleptic Gregorian (H. Hinnant)
-    y -= m <= 2
-    era = y // 400
-    yoe = y - era * 400
-    doe = yoe * 365 + yoe // 4 - yoe // 100 + (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
-    return era * 146097 + doe - 719468
-
-
-def _civil_from_days(z: int) -> tuple[int, int, int]:
-    z += 719468
-    era = z // 146097
-    doe = z - era * 146097
-    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
-    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
-    mp = (5 * doy + 2) // 153
-    m = mp + (3 if mp < 10 else -9)
-    return yoe + era * 400 + (m <= 2), m, doy - (153 * mp + 2) // 5 + 1
-
-
-_U32 = 0xFFFFFFFF
-_DATE_LIMIT = 8_640_000_000_000  # JavaScript's Date holds +-8.64e15 ms
-
-
-def _js_make(year: int, mon: int, mday: int, h: int, mi: int, s: int) -> int | None:
-    """MakeDate(MakeDay(year, mon, mday), MakeTime(h, mi, s, 0)) of V8, in seconds; None is NaN. A year 0..99 is 19xx
-    (the Date constructor and Date.UTC do that), a year or month beyond V8's limits is NaN."""
-    if 0 <= year <= 99:
-        year += 1900
-    if not (-1_000_000 <= year <= 1_000_000 and -10_000_000 <= mon <= 10_000_000):
-        return None
-    year += mon // 12
-    return (_days_from_civil(year, mon % 12 + 1, 1) + mday - 1) * 86400 + h * 3600 + mi * 60 + s
-
-
-def data_dir(path: str | os.PathLike[str] | None = None) -> Path:
-    """Where the wasm files are: PATH, else $PYODIDE_NOJS_DATA, else the package's own `data`."""
-    return Path(path or _engine.env("PYODIDE_NOJS_DATA") or DATA)
-
-
-def available_flavors(data: Path) -> list[str]:
-    have = []
-    if (data / "pyodide_fused.wasm").exists():
-        have.append("fused")
-    if (data / "pyodide.asm.wasm").exists() and (data / "adapter.wasm").exists():
-        have.append("dynamic")
-    return have
-
-
-def _override(path: str | os.PathLike[str] | None, var: str) -> Path | None:
-    """The file PATH, else $VAR (an asm_wasm or stdlib that replaces the data directory's): None if neither is set."""
-    p = path or _engine.env(var)
-    if not p:
-        return None
-    if not Path(p).is_file():
-        raise FileNotFoundError(f"no such file: {p}" + ("" if path else f" (from ${var})"))
-    return Path(p)
-
-
-def override_warnings(asm: Path | None, stdlib: Path | None, data: Path) -> tuple[list[str], list[str]]:
-    """What differs in a pyodide.asm.wasm / python_stdlib.zip that is not the pinned build's: (warnings, details).
-    Reads bytes only (no compile). Pyodide's own version is not in the wasm, so CPython's version string is compared."""
-    warn: list[str] = []
-    detail: list[str] = []
-    if asm is not None:
-        b = asm.read_bytes()
-        seen = sorted({m.decode() for m in re.findall(rb"\x00(3\.\d+\.\d+(?:[abc]|rc)?\d*)\x00", b)})
-        if PYVER_FULL not in seen:
-            warn.append(
-                f"{asm} does not carry CPython {PYVER_FULL} (the pinned Pyodide's); its version strings: "
-                f"{', '.join(seen) or 'none found'} (only CPython's version is compared: Pyodide's is not in the wasm)"
-            )
-        imps = {n for m, n, k in _wasm.import_names(b) if k == 0 and m == "env"}
-        adapter, known = data / "adapter.wasm", data / "pyodide.asm.wasm"
-        if adapter.exists() and known.exists():  # answered: by the adapter, or audited as a stub in the pinned build
-            names = {n for m, n, k in _wasm.import_names(known.read_bytes()) if m == "env"}
-            names |= set(_wasm.export_names(adapter.read_bytes()))
-            new = sorted(imps - names)
-            if new:
-                warn.append(f"{asm} imports {len(new)} env functions that the adapter does not know (-v lists them)")
-                detail.append("unknown env imports: " + ", ".join(new[:10]) + (" ..." if len(new) > 10 else ""))
-        if "__syscall_setsockopt_host" not in imps:
-            warn.append(
-                f"{asm} lacks the setsockopt patch (tools/patch_main.mjs): setsockopt returns 0 and does nothing"
-            )
-    if stdlib is not None:
-        try:
-            with zipfile.ZipFile(stdlib) as z:
-                cfg = next(n for n in z.namelist() if re.fullmatch(r"_sysconfigdata_[^/]*\.py", n))
-                ver = re.search(r"'VERSION': '([^']*)'", z.read(cfg).decode())
-            found = ver.group(1) if ver else "?"
-        except (OSError, StopIteration, zipfile.BadZipFile):
-            found = "?"
-        if found != PYVER:
-            warn.append(
-                f"{stdlib} is for Python {found} (VERSION of its sysconfigdata), the host lays out Python {PYVER}"
-            )
-    return warn, detail
 
 
 def ca_bundle() -> bytes:
@@ -387,42 +179,6 @@ def ca_bundle() -> bytes:
             seen.add(f)
             out += Path(f).read_bytes() + b"\n"
     return out
-
-
-def _s32(x: int) -> int:
-    """x as the signed i32 wasmtime-py wants for a parameter or a result."""
-    x &= 0xFFFFFFFF
-    return x - (1 << 32) if x >> 31 else x
-
-
-class MainExports(Mapping):
-    """The main module's symbols as dlsym and the GOT see them: its (lazy) exports, those of the adapter in the
-    dynamic build (`extra`), and not the JavaScript bridge's stubs (`hidden`)."""
-
-    def __init__(self, base: Mapping) -> None:
-        self.base, self.extra, self.hidden = base, {}, set()
-
-    def __getitem__(self, name: str) -> Any:
-        if name in self.hidden:
-            raise KeyError(name)
-        if name in self.extra:
-            return self.extra[name]
-        return self.base[name]
-
-    def __iter__(self) -> Iterator[str]:
-        for n in self.base:
-            if n not in self.hidden and n not in self.extra:
-                yield n
-        yield from (n for n in self.extra if n not in self.hidden)
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
-
-
-# exports of the adapter that only the host calls: the guest's dlsym and GOT do not see them (Pyodide has no such name)
-SERVICE_EXPORTS = ("__nojs_sigcell_addr", "__nojs_set_runtime")
-_JS_MODULES = ("env", "GOT.mem", "GOT.func", "wasi_snapshot_preview1")  # the glue's import object
-_GLOBAL_WHY = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
 
 
 class Pyodide:
@@ -1759,104 +1515,15 @@ class Pyodide:
             return struct.unpack("<f", raw[:4])[0]
         return None
 
-    # ------------------------------------------------------------------ local time: Emscripten's JS date helpers
-    # `_localtime_js`, `_mktime_js` and `_tzset_js` read the time zone of the process through `Date` (the host's: its
-    # TZ and zoneinfo). Here the host's C library answers the offset at an instant (`time.localtime`), and the rest is
-    # what the JavaScript does with it: its rules for a local time that does not exist or happens twice, its errors
-    # beyond +-8.64e12 s, its habit of reading a year 0..99 as 19xx in `new Date(year, ...)`, and offsets in whole
-    # minutes (getTimezoneOffset cuts a seconds part of an old local mean time; the fields of the date keep it).
-    @staticmethod
-    def _gmtoff(t: int) -> int:
-        """Seconds east of UTC at the instant t."""
-        try:
-            lt = time.localtime(t)
-        except (OverflowError, OSError, ValueError):  # a C library with a narrow time_t (Windows): the nearest it has
-            t = min(max(t, 0), 32535215999)
-            lt = time.localtime(t)
-        off = lt.tm_gmtoff
-        if (
-            off is None or abs(off) > 2 * 86400
-        ):  # not an offset (Windows gives one at 2**31 and beyond): from the fields
-            off = calendar.timegm(lt[:6]) - t
-        return off
-
-    def _minutes(self, t: int) -> int:
-        """-Date.getTimezoneOffset() at the instant t: minutes east, cut towards zero."""
-        return int(self._gmtoff(t) / 60)
-
-    def _utc_from_local(self, lt: int) -> int:
-        """The instant of a wall-clock time (seconds): of two (it happens twice) the earlier, of none (it is skipped)
-        the one with the offset from before the change; as ECMAScript's UTC(t)."""
-        before, after = self._gmtoff(lt - 86400), self._gmtoff(lt + 86400)
-        found = [u for u in {lt - before, lt - after} if self._gmtoff(u) == lt - u]
-        return min(found) if found else lt - before
-
-    def _year_minutes(self, year: int) -> tuple[int, int]:
-        """The offsets (minutes east) of `new Date(year, 0, 1)` and `new Date(year, 6, 1)`."""
-        out = []
-        for mon in (0, 6):
-            lt = _js_make(year, mon, 1, 0, 0, 0)
-            out.append(0 if lt is None else self._minutes(self._utc_from_local(lt)))
-        return out[0], out[1]
-
+    # ------------------------------------------------------------------ local time (_timecalc)
     def _t_localtime(self, t: int, tm: int) -> int:
-        tm &= _U32
-        """tm_isdst and tm_gmtoff into the struct; the exact offset (s east) for the fields, or INT_MIN: an error."""
-        if abs(t) > _DATE_LIMIT:
-            return -(1 << 31)
-        off = self._gmtoff(t)
-        winter, summer = self._year_minutes(_civil_from_days((t + off) // 86400)[0])
-        minutes = int(off / 60)
-        if not -(1 << 31) <= minutes * 60 < 1 << 31:  # not an offset: a host C library that failed (Windows)
-            return -(1 << 31)
-        # the offset of the summer (the larger one) is DST when the year has two
-        flag = int(summer != winter and minutes == max(winter, summer))
-        try:
-            self._wr(tm + 32, struct.pack("<ii", flag, minutes * 60))
-        except struct.error as e:
-            raise RuntimeError(f"localtime t={t} off={off} winter={winter} summer={summer}: {e}") from e
-        return off
+        return _timecalc.t_localtime(self._wr, t, tm)
 
     def _t_mktime(self, tm: int) -> int:
-        tm &= _U32
-        sec, mi, hour, mday, mon, year, _wday, _yday, dst = struct.unpack("<9i", self._rd(tm, 36))
-        lt = _js_make(year + 1900, mon, mday, hour, mi, sec)
-        if lt is None:
-            return -1
-        u = self._utc_from_local(lt)
-        if abs(u) > _DATE_LIMIT:
-            return -1
-        guessed = self._minutes(u)
-        winter, summer = self._year_minutes(_civil_from_days((u + self._gmtoff(u)) // 86400)[0])
-        dst_off, std_off = max(winter, summer), min(winter, summer)
-        if dst < 0:
-            dst = int(summer != winter and dst_off == guessed)
-        elif (dst > 0) != (dst_off == guessed):
-            u += (guessed - (dst_off if dst > 0 else std_off)) * 60
-            if abs(u) > _DATE_LIMIT:
-                return -1
-        days, secs = divmod(u + self._gmtoff(u), 86400)
-        y, m, d = _civil_from_days(days)
-        yday = days - _days_from_civil(y, 1, 1)
-        fields = (secs % 60, secs // 60 % 60, secs // 3600, d, m - 1, y - 1900, (days + 4) % 7, yday)
-        try:
-            self._wr(tm, struct.pack("<8i", *fields) + struct.pack("<i", dst))
-        except struct.error as e:
-            raise RuntimeError(f"mktime u={u} fields={fields} dst={dst} guessed={guessed}: {e}") from e
-        return u
+        return _timecalc.t_mktime(self._rd, self._wr, tm)
 
     def _t_tzset(self, timezone: int, daylight: int, std_name: int, dst_name: int) -> None:
-        timezone, daylight, std_name, dst_name = (x & _U32 for x in (timezone, daylight, std_name, dst_name))
-        winter, summer = self._year_minutes(time.localtime().tm_year)
-
-        def zone(east: int) -> bytes:  # UTC-0200 for two hours east: the sign is of the offset as Date gives it (west)
-            return f"UTC{'-' if east <= 0 else '+'}{abs(east) // 60:02d}{abs(east) % 60:02d}".encode()[:16] + b"\0"
-
-        self._wr(timezone, struct.pack("<I", (-min(winter, summer) * 60) & 0xFFFFFFFF))
-        self._wr(daylight, struct.pack("<i", int(winter != summer)))
-        std, dst = (winter, summer) if summer > winter else (summer, winter)  # JS: summerOffset < winterOffset (west)
-        self._wr(std_name, zone(std))
-        self._wr(dst_name, zone(dst))
+        _timecalc.t_tzset(self._wr, timezone, daylight, std_name, dst_name)
 
     # ------------------------------------------------------------------ signals and the runtime's name
     def _set_runtime(self) -> None:
@@ -2399,7 +2066,7 @@ class Pyodide:
                     self.preopen_dev,
                     [isatty(fd) for fd in (0, 1, 2)],  # the guest decides buffering at init
                     # the time module read the host's zone at init (tzname, timezone, daylight, as _tzset_js gives them)
-                    [time.localtime().tm_year, *self._year_minutes(time.localtime().tm_year)],
+                    [time.localtime().tm_year, *_timecalc.year_minutes(time.localtime().tm_year)],
                 ]
             ).encode()
         ).hexdigest()

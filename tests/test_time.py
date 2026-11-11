@@ -81,16 +81,18 @@ def test_structs_above_2_gib_are_read_and_written_where_they_are(guest: Guest) -
     assert out == ["True 1593604800 12 1 3 182", "12 1 120 0"]
 
 
-def test_a_host_offset_that_is_not_one_is_the_error_code_not_a_crash() -> None:
+def test_a_host_offset_that_is_not_one_is_the_error_code_not_a_crash(monkeypatch: pytest.MonkeyPatch) -> None:
     """A C library that returns an absurd tm_gmtoff (seen on Windows) gives the JS error convention (INT_MIN), and a
     struct that can not hold a value says which values it had."""
+    from pyodide_nojs import _timecalc
+
     host = object.__new__(Pyodide)
     written: list[bytes] = []
     host._wr = lambda a, d: written.append(bytes(d))  # type: ignore[method-assign]
-    host._gmtoff = lambda t: 1 << 40  # type: ignore[method-assign]
+    monkeypatch.setattr(_timecalc, "gmtoff", lambda t: 1 << 40)
     assert host._t_localtime(0, 0) == -(1 << 31)
     assert not written
-    host._gmtoff = lambda t: 3600  # type: ignore[method-assign]
+    monkeypatch.setattr(_timecalc, "gmtoff", lambda t: 3600)
     assert host._t_localtime(0, 0) == 3600
     assert written[0][4:] == (3600).to_bytes(4, "little")
 
@@ -98,12 +100,12 @@ def test_a_host_offset_that_is_not_one_is_the_error_code_not_a_crash() -> None:
 def test_an_absurd_tm_gmtoff_is_replaced_by_the_offset_from_the_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """Windows gives an absurd tm_gmtoff from 2**31 on (CI: 2147483648 was OSError 28): the offset is then the local
     fields taken as UTC minus the instant."""
-    from pyodide_nojs import _host
+    from pyodide_nojs import _timecalc
 
     def localtime(t: int) -> time.struct_time:
         lt = time.gmtime(t + 7200)  # a zone two hours east
         return time.struct_time((*tuple(lt)[:9], "XX", 1 << 40))  # type: ignore[arg-type]
 
-    monkeypatch.setattr(_host.time, "localtime", localtime)
-    assert _host.Pyodide._gmtoff(2**31) == 7200
-    assert _host.Pyodide._gmtoff(0) == 7200
+    monkeypatch.setattr(_timecalc.time, "localtime", localtime)
+    assert _timecalc.gmtoff(2**31) == 7200
+    assert _timecalc.gmtoff(0) == 7200
