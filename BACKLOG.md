@@ -18,6 +18,7 @@ Order inside a section is not a priority; the order of work is at the end.
 | D8 | Windows symlink fix needs a Windows run to isolate (hypothesis: wasmtime resolves the target from the root); skipped on win32 | documented in the audit |
 | D9 | Policy for the license/size of Pyodide artifacts in the wheel (carried now; alternative: download at first run); the owner opens the pull request | BRIEF.md |
 | D10 | The official suite stays red until fixed; what cannot be fixed becomes `xfail` with a reason | decided, see S1 |
+| D14 | Decided 2026-11-11: the guest STARTS in `/home/pyodide` (as Pyodide), not in `/`; the tests that assume `/` are fixed with it (snapshots too); `--mount-cwd` mounts at `/work` (one constant `CWD_MOUNT` in `_cli.py`); `inherit_env` protects only `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`; `sys.executable` stays `''` (Pyodide's value is a Node artifact: the `_` variable of its process): a documented difference, no work | decided; the cwd change is in batch B2 |
 | D11 | When Pyodide 315 is released (now 315.0.0-alpha.2): bump the pin (tools/fetch.sh sha, `PYODIDE_VERSION`/`ABI`, `PYVER`) | later |
 
 Decided and written in BRIEF.md (do not reopen without a reason): dynamic is the default, fused stays in the wheel; sockets follow the host's kernel;
@@ -31,6 +32,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 * **W3 errors and paths:** N6 the empty path is "." in about 20 calls (must be ENOENT); N7 `rmdir('d/')`/`rmtree('d/')` EINVAL; N10 read/pread/ftruncate/fsync on a directory fd; N11 write-open of a directory (EISDIR); N23 ftruncate/fsync/utime on stdio; N32 file fd as dirfd (ENOTDIR); N33 `fstatat` bad dirfd + empty path; N34 `dup3` flags, `fadvise` advice, `access` mode unchecked; N14 `truncate` on a 0444 file vs `open` for write; N36 `os.open(f, 3)`.
 * **W4 multiple buffers and sizes:** N15 `readv`/`writev`/`preadv`/`pwritev` handle only the first buffer (wasmtime on files; the pipes loop already); N16 `pread` capped at 64 KiB; fails `test_os.test_posix` test_readv/test_writev.
 * **W5 descriptor numbering:** guest numbers decoupled from WASI's (lowest free like POSIX, first fd 3, preopens hidden: fixes N3, N18, N19, N17, dup2 to any number, `MAXFD` 1024 vs Pyodide's 4096); plain `open` returns the lowest free number.
+* **W7 (new, from the MEMFS study)** `listdir`/`scandir` of a large directory is about 400x slower than Pyodide's (5000 entries: 5-15 s against 0.01-0.04 s): hypothesis: each `getdents64` asks wasmtime's `fd_readdir` from the cookie and wasmtime enumerates the whole host directory every time (quadratic). Fix: read the whole listing once per descriptor and serve from a snapshot (about 40 lines, as Pyodide does); probably also fixes N20 (duplicates); worth doing on any root. Also unexplained: stdlib imports are 2-3x slower than Pyodide's though reading the zip is faster (not file-system-bound); 10,000 small file creates 5x slower.
 * **W6** N20 `scandir` returns duplicates when files are created in the loop (cause in Pyodide's glue not traced); `st_nlink`, `st_blocks` differences (host-dependent).
 * Known partial (platform limits, in the audit): `mknodat` FIFO/char/block/socket (WASI cannot create), `utimensat` outside 1970..2554 (WASI u64 ns), `symlinkat` across preopens (cap-std), epoll (3 `__syscall_epoll_*`: ENOSYS, no decision), `_emscripten_system` (ENOSYS on purpose: a shell would be a sandbox escape).
 * Check later: `open_at` with a pipe or socket as dirfd (resolves against the root; Linux gives ENOTDIR).
@@ -93,9 +95,12 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 ## Order of work now (2026-11-11)
 
-1. Wait for the two audits (runtime, loader/io); triage their tables here (new rows, known, host-dependent).
-2. W2 `/dev`; W4 multiple buffers; the small suite items.
-3. W2, W3, W4, W5 on the host root now (D4 is parked: nothing waits for it); D5 (decoupled fd numbers) with W5.
-4. A `reviewer` on the descriptor layer and the override feature (section 6).
-5. T1 terminal, then S1 (xfail for what is left).
+Done: the three differential audits, the first fix batch (B1: crashes, exit status, CPU clock, environment, preopens), the descriptor layer, the harness.
+Running: independent reviews of the descriptor layer (`vfd.h`) and of B1 (section 6); their findings become fixes before anything else touches those files.
+Next, one batch at a time (they touch the same adapter and host files: no two in parallel), each with a `reviewer` pass on the diff:
+1. B2 (stdio, small): `close(1)` and the other standard descriptors (N5), `fsync` on 0-2 and directories (L4), `FIONBIO`/`set_blocking` on 0-2 and directories (L5), `ftruncate` on std (EINVAL), the guest's cwd `/home/pyodide` and the tests that assume `/` (D14), a trap in a side module's `__wasm_call_ctors` (L6).
+2. B3 (directories and multiple buffers): W4 (`readv`/`writev`/`preadv`/`pwritev` loop, `pread` above 64 KiB), W7 (the `getdents` snapshot), N20.
+3. B4 (`/dev` and paths): W2 virtual `/dev`, `/proc/self/fd`, W3 (empty path, trailing slash on `rmdir`, the errno sweep of N10/N11/N23/N32-N34/N36), `os.devnull`; then the suite items they fix (`test_logging`, `test_shutil`, `test_os.test_posix`).
+4. B5 (numbering, the biggest): W5/D5 decoupled descriptor numbers (first fd 3, lowest free, `dup2` to any number, 4096 descriptors, preopens hidden for good), plain `open` returns the lowest free number, N17-N19.
+5. The remaining suite modules (S1: process time may be fixed by B1: read the next CI), then T1 terminal and T3, then xfail for what is left.
 6. Section 9 last.
