@@ -603,7 +603,7 @@ static void snap_drop(Snap *s) {
 // WASI errno, 0 or ENOMEM
 static i32 snap_load(i32 fd, Snap *s) {
     snap_drop(s);
-    const i32 ch = 1 << 20;  // one call for about 30,000 names: wasmtime lists the directory again for every call
+    const i32 ch = 1 << 20;  // 1 MiB per call, repeated from the cookie of the last complete record (wasmtime lists the directory again at every call)
     u8 *tmp = (u8 *)malloc((u32)ch);
     if (!tmp) return ENOMEM;
     u32 cap = 0;

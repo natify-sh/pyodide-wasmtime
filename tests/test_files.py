@@ -7,7 +7,9 @@ answer; a failed assertion is a traceback and exit status 1.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import threading
 
 import pytest
 from conftest import Guest
@@ -817,22 +819,30 @@ assert os.pread(fd, 100, 5_000_003) == b'' and os.lseek(fd, 0, 1) == 0
 
 
 def test_a_big_directory_lists_every_name_once_and_fast(guest: Guest):
-    # 3000 names took about 4 s when every getdents asked WASI from the cookie again (the listing is a snapshot now)
+    # not a bound in seconds (a runner can be slow): 3000 names must cost about ten times what 300 cost, where a
+    # listing that asked WASI from the cookie again for every few entries cost about a hundred times as much
     check(
         guest,
         """
 import time
-os.mkdir(B + '/big')
-want = ['f%04d' % i for i in range(3000)]
-for n in want:
-    open(B + '/big/' + n, 'w').close()
-t = time.perf_counter()
-assert sorted(os.listdir(B + '/big')) == want
+def best(path):
+    t = 1e9
+    for _ in range(3):
+        s = time.perf_counter()
+        names = os.listdir(path)
+        t = min(t, time.perf_counter() - s)
+    return t, names
+for d, n in (('small', 300), ('big', 3000)):
+    os.mkdir(B + '/' + d)
+    for i in range(n):
+        open(B + '/%s/f%04d' % (d, i), 'w').close()
+ts, small = best(B + '/small')
+tb, big = best(B + '/big')
+assert sorted(big) == ['f%04d' % i for i in range(3000)] and len(small) == 300
 names = [e.name for e in os.scandir(B + '/big')]
-assert sorted(names) == want
+assert sorted(names) == sorted(big)
 assert sum(len(f) for _, _, f in os.walk(B + '/big')) == 3000
-took = time.perf_counter() - t
-assert took < 3, took
+assert tb / ts < 30, (ts, tb)
 """,
     )
 
@@ -882,3 +892,49 @@ os.unlink(B + '/r/added')
 assert sorted(os.listdir(fd)) == ['f1', 'f2', 'f3', 'f4', 'renamed']
 """,
     )
+
+
+def _stdin_pipe_readv(guest: Guest, code: str) -> str:
+    """Run the guest with a pipe as stdin that holds b'abc' and stays open and idle: the first line it prints."""
+    cmd = [sys.executable, "-m", "pyodide_nojs", "--flavor", guest.flavor, "-c", code]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    line: list[str] = []
+    try:
+        assert p.stdin and p.stdout
+        p.stdin.write("abc")
+        p.stdin.flush()
+        t = threading.Thread(target=lambda: line.append(p.stdout.readline()), daemon=True)  # type: ignore[union-attr]
+        t.start()
+        t.join(10)
+        assert line, "readv waited for more input from an open pipe"
+        return line[0].strip()
+    finally:
+        p.kill()
+        p.wait()
+        for f in (p.stdin, p.stdout, p.stderr):
+            if f:
+                f.close()
+
+
+def test_readv_on_stdin_returns_what_is_there_and_does_not_wait_for_the_next_buffer(guest: Guest):
+    code = """
+import os
+a, b = bytearray(3), bytearray(10)
+print(os.readv(0, [a, b]), bytes(a), flush=True)
+"""
+    assert _stdin_pipe_readv(guest, code) == "3 b'abc'"
+
+
+def test_libc_readv_on_stdin_with_two_buffers_does_not_wait(guest: Guest):
+    # musl's stdio reads with two buffers (len - 1, then its own): a line of exactly len - 1 bytes must not hang
+    code = """
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+class Iov(ctypes.Structure):
+    _fields_ = [('b', ctypes.c_void_p), ('n', ctypes.c_size_t)]
+x, y = ctypes.create_string_buffer(3), ctypes.create_string_buffer(10)
+arr = (Iov * 2)(Iov(ctypes.addressof(x), 3), Iov(ctypes.addressof(y), 10))
+libc.readv.restype = ctypes.c_ssize_t
+print(libc.readv(0, arr, 2), x.raw, flush=True)
+"""
+    assert _stdin_pipe_readv(guest, code) == "3 b'abc'"

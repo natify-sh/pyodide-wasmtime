@@ -300,16 +300,18 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     return -28;  // EINVAL
 }
 
-// readv, writev, preadv, pwritev on a file: wasmtime uses only the first buffer of an iovec array, so the buffers are done
-// one by one (op 0 read, 1 write, 2 pread, 3 pwrite). A short count ends the call (the total so far is the result, an error
-// only when nothing was done); the offset kinds go on until the buffer is full or the file ends: wasmtime's pread and pwrite
-// do at most 64 KiB at a time.
+// readv, writev, preadv, pwritev on a regular file: wasmtime uses only the first buffer of an iovec array, so the buffers
+// are done one by one (op 0 read, 1 write, 2 pread, 3 pwrite). A short count ends the call (the total so far is the result,
+// an error only when nothing was done); the offset kinds go on until the buffer is full or the file ends: wasmtime's pread
+// and pwrite do at most 64 KiB at a time. The total stops at 0x7ffff000 (Linux's MAX_RW_COUNT), so it never overflows.
+// Not for a stream (stdin, a terminal, a pipe): a read of the next buffer would wait for more input after the first came
+// back full (musl's stdio always reads with two buffers); those keep the one WASI call.
 static i32 file_iov(i32 op, i32 fd, const u32 *iov, i32 n, u64 off, i32 *done) {
     i32 tot = 0, e = 0;
     u32 none[2] = {0, 0};  // no buffer: one call of length 0, so that a bad descriptor still says so
     if (n == 0) iov = none, n = 1;
     for (i32 k = 0; k < n && !e; k++) {
-        i32 len = (i32)iov[2 * k + 1], got = 0;
+        i32 room = 0x7ffff000 - tot, len = iov[2 * k + 1] > (u32)room ? room : (i32)iov[2 * k + 1], got = 0;
         do {
             u32 one[2] = {iov[2 * k] + (u32)got, (u32)(len - got)};
             i32 r = 0;
@@ -326,6 +328,8 @@ static i32 file_iov(i32 op, i32 fd, const u32 *iov, i32 n, u64 off, i32 *done) {
     return e;
 }
 
+static i32 is_regular(i32 fd) { return fd_type(fd) == 4; }
+
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     if (is_pre(fd)) return FE_BADF;
@@ -333,7 +337,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     for (i32 k = 0; k < n; k++) empty &= !iov[2 * k + 1];
     if (empty && !is_virt(fd) && fd_std(rfd(fd))) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
     if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
-    if (!is_sock(fd)) return n <= 1 ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread);
+    if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread);
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
@@ -353,7 +357,7 @@ WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     if (is_pre(fd)) return FE_BADF;
     if (is_pipe(fd)) return pipe_write(vobj(fd), iov, n, nw);
-    if (!is_sock(fd)) return n <= 1 ? w_fd_write(rfd(fd), iov, n, nw) : file_iov(1, rfd(fd), iov, n, 0, nw);
+    if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_write(rfd(fd), iov, n, nw) : file_iov(1, rfd(fd), iov, n, 0, nw);
     if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
