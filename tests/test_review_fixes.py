@@ -3,6 +3,7 @@ packagings. Each test says which finding it is; the ones that need the new adapt
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -207,9 +208,9 @@ def test_startup_state_is_pyodides(flavor: str, capfd: pytest.CaptureFixture[str
 
 def test_missing_site_and_mount_folders_are_said_plainly(flavor: str, tmp_path: Path) -> None:
     gone = str(tmp_path / "gone")
-    with pytest.raises(FileNotFoundError, match=f"site folder not found: {gone}"):
+    with pytest.raises(FileNotFoundError, match=f"site folder not found: {re.escape(gone)}"):
         Pyodide(flavor, site=gone)
-    with pytest.raises(FileNotFoundError, match=f"mount folder not found: {gone}"):
+    with pytest.raises(FileNotFoundError, match=f"mount folder not found: {re.escape(gone)}"):
         Pyodide(flavor, mounts={"/m": gone})
     for opt in ("--site", "--mount"):
         arg = gone if opt == "--site" else f"/m={gone}"
