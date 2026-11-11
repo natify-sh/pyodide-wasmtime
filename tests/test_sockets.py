@@ -574,6 +574,7 @@ def test_a_second_run_on_one_object_sees_a_fresh_guest(flavor: str, capfd: pytes
 
 
 def test_the_accessors_check_the_memory():
+    from pyodide_nojs._guest import Guest
     from pyodide_nojs._host import GuestFault, Pyodide
 
     class Memory:
@@ -590,27 +591,30 @@ def test_the_accessors_check_the_memory():
             self.data[start : start + len(data)] = data
 
     py = Pyodide.__new__(Pyodide)
-    py.cur, py.memory = [None], Memory()
+    py.guest = Guest()
+    py.guest.cur, py.guest.memory = [None], Memory()
     py._wr(10, b"abc\0")
-    assert py._rd(10, 3) == b"abc" and py._cstr(10) == "abc"
+    assert py._rd(10, 3) == b"abc" and py.guest.cstr(10) == "abc"
     for a, n in [(-1, 4), (98, 3), (0, -1), (1 << 32, 1), (-(1 << 31), 1), (2**31, 0 + 1)]:
         with pytest.raises(GuestFault):
             py._rd(a, n)
     with pytest.raises(GuestFault):
         py._wr(99, b"ab")
-    py.memory.data[96:100] = b"abcd"  # no NUL before the end of the memory
+    py.guest.memory.data[96:100] = b"abcd"  # no NUL before the end of the memory
     with pytest.raises(GuestFault):
-        py._cstr(96)
-    py.memory.data[:] = b"x" * 100
+        py.guest.cstr(96)
+    py.guest.memory.data[:] = b"x" * 100
     with pytest.raises(GuestFault):
-        py._cstr(1)  # no NUL at all
+        py.guest.cstr(1)  # no NUL at all
 
 
 def test_the_net_wrapper_turns_every_exception_into_an_errno():
+    from pyodide_nojs._guest import Guest
     from pyodide_nojs._host import GuestFault, Pyodide
 
     py = Pyodide.__new__(Pyodide)
-    py.cur = []
+    py.guest = Guest()
+    py.guest.cur = []
 
     def boom(kind: type[BaseException]):
         def f(*_a: object) -> int:
@@ -618,14 +622,14 @@ def test_the_net_wrapper_turns_every_exception_into_an_errno():
 
         return f
 
-    call = lambda name, kind: py._wrap_net(name, boom(kind))(None)  # noqa: E731
+    call = lambda name, kind: py.guest.wrap_net(name, boom(kind))(None)  # noqa: E731
     assert call("bind", GuestFault) == -21
     assert call("bind", ValueError) == -29
     assert call("bind", OverflowError) == -29
     assert call("bind", IndexError) == -29
     assert call("bind", OSError) == -29  # an OSError without an errno is EIO
     assert call("getaddrinfo", GuestFault) == -11 and call("getaddrinfo", KeyError) == -4
-    assert py.cur == []
+    assert py.guest.cur == []
 
 
 def test_host_errors_are_translated_by_name_on_every_os():

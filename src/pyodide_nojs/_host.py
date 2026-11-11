@@ -67,6 +67,7 @@ from ._consts import (
     guest_errno,
     override_warnings,
 )
+from ._guest import Guest
 from ._sockaddr import (
     BOOL_OPTIONS,
     ca_bundle,
@@ -180,7 +181,6 @@ class Pyodide:
         self.wasm_opt = str(opt) if (os.environ.get("WASM_OPT") or wasm_opt or Path(opt).exists()) else None
         # state of the running guest
         self.root: Path | None = None
-        self.cur: list = []  # the Caller (or the Store) of the running host function
         self.instances: list = [None]  # id -> {exports (name -> extern, in export order), got (GOT globals)}
         self.slots: dict = {}  # (instance, export name) -> table slot
         self.scopes: dict[int, list[int]] = {}  # a dlopen call's scope -> the instances loaded in it
@@ -201,8 +201,7 @@ class Pyodide:
         self._started = False
         self._runs = 0
         self._exited: int | None = None
-        self.ex: Any = None
-        self.table: Any = None
+        self.guest = Guest()  # the store, the main module's exports, memory, table and the call contexts
         # table slots of freed closures (ffi_closure_free_js), reused last in, first out
         self.free_slots: list[int] = []
         # table index -> (Func, parameter types, result types) of the functions called by ffi_call_js and the trampoline
@@ -217,8 +216,6 @@ class Pyodide:
         self._svc_ex: Any = (
             None  # where the host's own exports of the adapter are: the main module (fused), the adapter
         )
-        self.memory: Any = None
-        self.store: Any = None
 
     # ------------------------------------------------------------------ the guest's root
     def _setup_root(self) -> None:
@@ -280,22 +277,11 @@ class Pyodide:
     # adapter's exports), then the libraries loaded RTLD_GLOBAL, and, when the function is first called (the glue's
     # lazy stubs), the libraries of the dlopen call's own scope (its NEEDED libraries; the last one wins) and last
     # the module's own exports.
-    def _span(self, a: int, n: int) -> int:
-        """The guest address a (wasmtime passes i32 as SIGNED: -1 is 0xFFFFFFFF) after checking that [a, a+n) lies in
-        the memory; n is a size_t, so a negative one is a huge one. GuestFault (EFAULT) otherwise."""
-        a = a + (1 << 32) if a < 0 else a
-        n = n + (1 << 32) if n < 0 else n
-        if a >> 32 or n >> 32 or a + n > self.memory.data_len(self.cur[-1]):
-            raise GuestFault(f"{a:#x}+{n:#x} is outside the memory")
-        return a
-
     def _rd(self, a: int, n: int) -> bytes:
-        a = self._span(a, n)
-        return bytes(self.memory.read(self.cur[-1], a, a + (n + (1 << 32) if n < 0 else n)))
+        return self.guest.rd(a, n)
 
     def _wr(self, a: int, data: bytes) -> None:
-        data = bytes(data)
-        self.memory.write(self.cur[-1], data, self._span(a, len(data)))
+        self.guest.wr(a, data)
 
     def _env_func(self, name: str, scope: int = 0, own: dict | None = None) -> Any:
         wt = self._wt
@@ -329,7 +315,7 @@ class Pyodide:
     def _link_error(self, i: int, imp: Any, item: Any, number: bool) -> str | None:
         """What V8 says when the glue's import object gives `item` for import `imp` (#i) and it does not fit, else
         None. `number`: the glue gives a plain number (__memory_base, __table_base); item None: a JS function."""
-        wt, c = self._wt, self.cur[-1]
+        wt, c = self._wt, self.guest.cur[-1]
         ty = imp.type
         pre = f'LinkError: WebAssembly.Instance(): Import #{i} module="{imp.module}" function="{imp.name}": '
         if isinstance(ty, wt.FuncType):
@@ -414,7 +400,7 @@ class Pyodide:
         else:
             why = self._dlreason if code & 255 == 11 else self._DL_WHY.get(code & 255, "Error").format(arg=arg)
             text = ("'Could not" if code & 256 else "could not") + f" load dynamic lib: {name}\n{why}"
-        c = self.cur[-1]
+        c = self.guest.cur[-1]
         ex = self.instances[0]["exports"]
         msg = text.encode("utf-8", "replace")
         blk = ex["malloc"](c, 8 + len(msg) + 1) & 0xFFFFFFFF  # [the %s argument][the format "%s"][the text]
@@ -426,7 +412,7 @@ class Pyodide:
 
     def _dl_instantiate(self, p: int, n: int, mb: int, tb: int, scope: int) -> int:
         wt = self._wt
-        c = self.cur[-1]
+        c = self.guest.cur[-1]
         data = self._rd(p, n)
         if data[:4] != b"\0asm":  # wasmtime.Module would also take WAT text
             return self._dl_fail("Error", ValueError("need to see wasm magic number"))
@@ -473,9 +459,9 @@ class Pyodide:
                     )
                 item: Any = None  # None: what the glue's import object gives is a JavaScript function
                 if m == "env" and nm == "memory":
-                    item = self.memory
+                    item = self.guest.memory
                 elif m == "env" and nm == "__indirect_function_table":
-                    item = self.table
+                    item = self.guest.table
                 elif number:
                     item = wt.Global(c, wt.GlobalType(i32, False), wt.Val.i32(mb if nm == "__memory_base" else tb))
                 elif m == "env" and nm == "__stack_pointer":
@@ -504,7 +490,7 @@ class Pyodide:
                                 _hit.append(f)
                             return _hit[0](caller, *args)
 
-                        item = wt.Func(self.store, ty, lazy, access_caller=True)
+                        item = wt.Func(self.guest.store, ty, lazy, access_caller=True)
                         self.lazy.append(nm)
                 why = self._link_error(i, imp, item, number)
                 if why:
@@ -541,7 +527,7 @@ class Pyodide:
             self._wasi_linker = wt.Linker(_engine.engine())
             self._wasi_linker.define_wasi()
             self._define_exit(self._wasi_linker)
-        return self._wasi_linker.get(self.cur[-1], "wasi_snapshot_preview1", name)
+        return self._wasi_linker.get(self.guest.cur[-1], "wasi_snapshot_preview1", name)
 
     def _dl_scope(self, id_: int, scope: int) -> None:
         """The module is loaded: its exports join the global namespace (scope 0) or the dlopen call's scope."""
@@ -552,33 +538,33 @@ class Pyodide:
             self.instances[id_]["global"] = self._gseq
 
     def _dl_got_set(self, id_: int, i: int, v: int) -> None:
-        self.instances[id_]["got"][i].set_value(self.cur[-1], v)
+        self.instances[id_]["got"][i].set_value(self.guest.cur[-1], v)
 
     def _table_slot(self, f: Any) -> tuple[int, bool]:
         """The table slot that holds function `f` (the glue's getFunctionAddress: the pointer C takes of a function
         and the one dlsym gives are the same number), else a new slot. -> (slot, made now)."""
         wt = self._wt
-        c = self.cur[-1]
+        c = self.guest.cur[-1]
         key = bytes(f._func)
-        size = self.table.size(c)
+        size = self.guest.table.size(c)
         for i in range(self._tscanned, size):  # the table is scanned once, then only what was added
-            g = self.table.get(c, i)
+            g = self.guest.table.get(c, i)
             if isinstance(g, wt.Func):
                 self._tfuncs.setdefault(bytes(g._func), i)
         self._tscanned = size
         slot = self._tfuncs.get(key)
         if slot is not None:
-            g = self.table.get(c, slot)  # a slot that was set again since is not the function any more
+            g = self.guest.table.get(c, slot)  # a slot that was set again since is not the function any more
             if isinstance(g, wt.Func) and bytes(g._func) == key:
                 return slot, False
-        slot = self.table.grow(c, 1, wt.Val.funcref(f))
+        slot = self.guest.table.grow(c, 1, wt.Val.funcref(f))
         self._tfuncs[key] = slot
         self._tscanned = slot + 1
         return slot, True
 
     def _dl_sym(self, id_: int, p: int, n: int, out: int) -> int:
         wt = self._wt
-        c = self.cur[-1]
+        c = self.guest.cur[-1]
         name = self._rd(p, n).decode("utf-8", "replace")
         exports = self.instances[id_]["exports"]
         e = exports.get(name)
@@ -620,7 +606,7 @@ class Pyodide:
         e = self.instances[id_]["exports"].get(self._rd(p, n).decode())
         if isinstance(e, self._wt.Func):
             try:
-                e(self.cur[-1])
+                e(self.guest.cur[-1])
             except GuestExit:  # exit() in a constructor: the glue's catch makes it a failed load (text: JS's `${e}`)
                 return self._dl_reason("[object Object]")
             except (
@@ -634,7 +620,7 @@ class Pyodide:
     def _net_fetch(self, req_p: int, req_n: int, body_p: int, body_n: int, out_p: int) -> int:
         """As a browser's fetch or wasi:http: request as JSON + body; the answer is two blocks from the main module's
         malloc: JSON meta (status, reason, headers, url) and the body."""
-        c = self.cur[-1]
+        c = self.guest.cur[-1]
         try:
             req = json.loads(self._rd(req_p, req_n))
             body = self._rd(body_p, body_n) if body_n else None
@@ -659,23 +645,11 @@ class Pyodide:
             self.netlog.append(f"{req_n} -> {meta['error']}")
         blocks: list[int] = []
         for b in (json.dumps(meta).encode(), data):
-            p = self.ex["malloc"](c, max(1, len(b)))
+            p = self.guest.ex["malloc"](c, max(1, len(b)))
             self._wr(p, b)
             blocks += [p, len(b)]
         self._wr(out_p, struct.pack("<IIII", *blocks))
         return 0
-
-    def _cstr(self, p: int) -> str | None:
-        """The NUL-terminated string at p (at most 4096 bytes: GuestFault if there is no end inside the memory)."""
-        if not p:
-            return None
-        out = bytearray()
-        for i in range(4096):
-            b = self._rd(p + i, 1)  # GuestFault past the end of memory
-            if b == b"\0":
-                return out.decode("utf-8", "replace")
-            out += b
-        raise GuestFault("string too long")
 
     def _new_handle(self, s: socket.socket) -> int:
         h = max(self.socks, default=0) + 1
@@ -981,7 +955,7 @@ class Pyodide:
         return 0
 
     def _table_func(self, idx: int) -> Any:
-        f = self.table.get(self.cur[-1], idx)
+        f = self.guest.table.get(self.guest.cur[-1], idx)
         if not isinstance(f, self._wt.Func):
             raise TypeError(f"table entry {idx} is null")
         return f
@@ -989,7 +963,7 @@ class Pyodide:
     def _js_call(self, idx: int, args: list) -> Any:
         """`wasmTable.get(idx)(...args)`: args are Numbers (int, float) or BigInts (_Big); the JavaScript result. What a
         table entry is does not change (only a closure's slot does: `_ffi_prep`, `_ffi_free`), so its type is kept."""
-        ctx = self.cur[-1]
+        ctx = self.guest.cur[-1]
         known = self.functions.get(idx)
         if known is None:
             f = self._table_func(idx)
@@ -1006,8 +980,8 @@ class Pyodide:
 
     def _ffi_call(self, cif: int, fn: int, rvalue: int, avalue: int) -> None:
         cif, fn, rvalue, avalue = cif & _U32, fn & _U32, rvalue & _U32, avalue & _U32
-        ctx = self.cur[-1]
-        sp = self.ex["__stack_pointer"]
+        ctx = self.guest.cur[-1]
+        sp = self.guest.ex["__stack_pointer"]
         orig = sp.value(ctx)
         args, cur, rid = _cif.call_args(self._rd, self._wr, cif, rvalue, avalue, orig)
         cur &= ~15  # the stack pointer stays 16-aligned (WASI wants out structures aligned to 8)
@@ -1026,14 +1000,14 @@ class Pyodide:
         self.closures_out += 1
         if self.free_slots:
             return self.free_slots.pop()
-        return self.table.grow(self.cur[-1], 1, self._wt.Val.funcref(None))
+        return self.guest.table.grow(self.guest.cur[-1], 1, self._wt.Val.funcref(None))
 
     def _ffi_free(self, index: int) -> None:
         index &= _U32
         self.closures_out -= 1
         self.functions.pop(index, None)
         self._ffi_release(index)
-        self.table.set(self.cur[-1], index, self._wt.Val.funcref(None))
+        self.guest.table.set(self.guest.cur[-1], index, self._wt.Val.funcref(None))
         self.free_slots.append(index)
 
     def _ffi_prep(self, closure: int, cif: int, fun: int, user_data: int, codeloc: int) -> int:
@@ -1054,19 +1028,16 @@ class Pyodide:
             state = []
 
             def trampoline(caller: Any, *a: Any) -> Any:
-                self.cur.append(caller)
-                try:
+                with self.guest.entered(caller):
                     return self._ffi_closure(state, a)
-                finally:
-                    self.cur.pop()
 
             try:
-                func = wt.Func(self.store, wt.FuncType(params, results), trampoline, access_caller=True)
+                func = wt.Func(self.guest.store, wt.FuncType(params, results), trampoline, access_caller=True)
             except Exception:  # JavaScript: convertJsFunctionToWasm failed
                 return 1
         state[:] = [closure, nargs, nfixed, info, ret_by_arg, rk]
         self.functions.pop(codeloc, None)
-        self.table.set(self.cur[-1], codeloc, func)
+        self.guest.table.set(self.guest.cur[-1], codeloc, func)
         self.live_funcs[codeloc] = (key, func, state)
         self._wr(closure + 4, struct.pack("<III", cif, fun, user_data))
         return 0
@@ -1081,8 +1052,8 @@ class Pyodide:
 
     def _ffi_closure(self, state: list, a: tuple) -> Any:
         rk = state[5]  # the closure's own entry may be released while it runs (`state` is then cleared)
-        ctx = self.cur[-1]
-        sp = self.ex["__stack_pointer"]
+        ctx = self.guest.cur[-1]
+        sp = self.guest.ex["__stack_pointer"]
         orig = sp.value(ctx)
         cif, fun, user_data, ret_ptr, args_ptr, cur = _cif.closure_frame(self._rd, self._wr, state, a, orig)
         sp.set_value(ctx, cur & ~15)  # 16-aligned, as the compiled code expects
@@ -1109,7 +1080,7 @@ class Pyodide:
         from . import __version__
 
         b = f"pyodide-nojs {__version__}".encode() + b"\0"
-        p = self._svc_ex["__nojs_set_runtime"](self.store, len(b)) & 0xFFFFFFFF
+        p = self._svc_ex["__nojs_set_runtime"](self.guest.store, len(b)) & 0xFFFFFFFF
         if p:  # out of memory: no name is set, and the adapter's _Py_emscripten_runtime answers NULL
             self._wr(p, b)
 
@@ -1130,8 +1101,8 @@ class Pyodide:
         flag = self.instances[0]["exports"][
             "Py_EMSCRIPTEN_SIGNAL_HANDLING"
         ]  # a byte: Python looks for signals if it is 1
-        self._wr(flag.value(self.cur[-1]), b"\x01")
-        cell = self._svc_ex["__nojs_sigcell_addr"](self.cur[-1]) & 0xFFFFFFFF  # the adapter's, made on first call
+        self._wr(flag.value(self.guest.cur[-1]), b"\x01")
+        cell = self._svc_ex["__nojs_sigcell_addr"](self.guest.cur[-1]) & 0xFFFFFFFF  # the adapter's, made on first call
         if not cell:
             raise RuntimeError("the guest is out of memory: no word for the signal")
         self._wr(cell, struct.pack("<I", signum))
@@ -1175,15 +1146,11 @@ class Pyodide:
         except Exception:  # never a trap in the guest
             return -WASI_ERRNO["IO"]
 
-    def _malloc(self, n: int) -> int:
-        """The guest's malloc: its address as an unsigned number (0: no memory)."""
-        return self.ex["malloc"](self.cur[-1], n) & 0xFFFFFFFF
-
     def _n_getaddrinfo(self, node_p: int, service_p: int, hint_p: int, out_p: int) -> int:
         """getaddrinfo: Pyodide's JavaScript validates the input (EAI codes; the defaults stream/6, dgram/17), the
         host's resolver answers, and ALL its addresses are returned as one malloc'd block that freeaddrinfo (it frees
         the first node and its ai_addr only) releases whole."""
-        node, service = self._cstr(node_p), self._cstr(service_p)
+        node, service = self.guest.cstr(node_p), self.guest.cstr(service_p)
         flags = family = type_ = proto = 0
         if hint_p:
             flags, family, type_, proto = struct.unpack("<4i", self._rd(hint_p, 16))
@@ -1191,13 +1158,13 @@ class Pyodide:
         if isinstance(found, int):
             return found
         entries, canon, type_, proto = found
-        c = self.cur[-1]
-        block = self._malloc(32 * len(entries) + len(canon) + sum(len(sa) for _f, _c, sa in entries[1:]))
-        head_sa = self._malloc(len(entries[0][2]))
+        c = self.guest.cur[-1]
+        block = self.guest.malloc(32 * len(entries) + len(canon) + sum(len(sa) for _f, _c, sa in entries[1:]))
+        head_sa = self.guest.malloc(len(entries[0][2]))
         if not block or not head_sa:
             for q in (block, head_sa):
                 if q:
-                    self.ex["free"](c, q)
+                    self.guest.ex["free"](c, q)
             return -10  # EAI_MEMORY
         at = block + 32 * len(entries)
         self._wr(at, canon)
@@ -1226,31 +1193,6 @@ class Pyodide:
                 self._wr(ptr, b + b"\0")
         return 0
 
-    # what a net operation answers when the guest gave it a pointer outside its memory, or the host failed in a way
-    # nobody foresaw: -EFAULT and -EIO, but the name functions answer in EAI_* (or a NULL pointer)
-    NET_FAILS = {"getaddrinfo": (-11, -4), "getnameinfo": (-11, -4)}
-
-    def _wrap_net(self, name: str, fn):
-        """No exception of a net operation reaches the wasm (it would be a trap that ends the interpreter): a pointer
-        outside the memory is EFAULT, a host error is its errno, anything else is logged and EIO."""
-        fault, other = self.NET_FAILS.get(name, (-GUEST_ERRNO["FAULT"], -GUEST_ERRNO["IO"]))
-
-        def f(caller, *args):
-            self.cur.append(caller)
-            try:
-                return fn(*args)
-            except GuestFault:
-                return fault
-            except OSError as e:
-                return other if name in self.NET_FAILS else werr(e)
-            except Exception:
-                log.exception("[net] %s failed", name)
-                return other
-            finally:
-                self.cur.pop()
-
-        return f
-
     # The operations that call into the guest (a ctypes call, a callback, the trampoline) or fail on purpose as
     # JavaScript throws: their exceptions (a callee's trap, exit(), a TypeError) reach run(), which ends the guest.
     RAISING = frozenset(
@@ -1273,16 +1215,14 @@ class Pyodide:
         `fail=None`: the exception goes on."""
 
         def f(caller, *args):
-            self.cur.append(caller)
-            try:
-                r = fn(*args)
-            except Exception:
-                if fail is None:
-                    raise
-                log.exception("[loader] %s failed", fn.__name__)
-                r = fail
-            finally:
-                self.cur.pop()
+            with self.guest.entered(caller):
+                try:
+                    r = fn(*args)
+                except Exception:
+                    if fail is None:
+                        raise
+                    log.exception("[loader] %s failed", fn.__name__)
+                    r = fail
             return r if nres else None
 
         return f
@@ -1350,7 +1290,7 @@ class Pyodide:
                 log.info("pyodide-nojs: %s", d)
         self._setup_root()
         assert self.root is not None
-        self.store = store = wt.Store(engine)
+        store = wt.Store(engine)
         # growth that Pyodide's glue gets as a RangeError (a dylink table of 2^31 slots, memory beyond 4 GiB) fails
         # here as -1 from memory.grow / table.grow, which the loader turns into a dlerror (not an error of the host)
         store.set_limits(memory_size=MAX_MEMORY, table_elements=MAX_TABLE)
@@ -1382,9 +1322,9 @@ class Pyodide:
                     access_caller=True,
                 )
             for name, (fn, ty) in net_ops.items():
-                linker.define_func("net", name, ty, self._wrap_net(name, fn), access_caller=True)
+                linker.define_func("net", name, ty, self.guest.wrap_net(name, fn), access_caller=True)
             for name, (fn, ty) in fs_ops.items():
-                linker.define_func("fs", name, ty, self._wrap_net(name, fn), access_caller=True)
+                linker.define_func("fs", name, ty, self.guest.wrap_net(name, fn), access_caller=True)
 
         if self.flavor == "fused":
             main_mod = _engine.load_module(self.data / "pyodide_fused.wasm")
@@ -1392,10 +1332,10 @@ class Pyodide:
             linker.define_wasi()
             self._define_exit(linker)
             define_ops(linker)
-            self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
-            self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
-            self.instances[0] = {"exports": MainExports(self.ex), "got": []}
-            self._svc_ex = self.ex
+            ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
+            self.guest.bind(store, ex)
+            self.instances[0] = {"exports": MainExports(self.guest.ex), "got": []}
+            self._svc_ex = self.guest.ex
             self.instances[0]["exports"].hidden.update(SERVICE_EXPORTS)
             self._drop_stubs()
             mods: dict[str, int] = {}
@@ -1451,25 +1391,25 @@ class Pyodide:
                     n_env["adapter" if n in fwd else "stub"] += 1
             for g in got:
                 linker.define(store, "GOT.func", g, shim["got:" + g])
-            self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
-            self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
-            self.instances[0] = {"exports": MainExports(self.ex), "got": []}
+            ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
+            self.guest.bind(store, ex)
+            self.instances[0] = {"exports": MainExports(self.guest.ex), "got": []}
 
             tl = wt.Linker(engine)
-            tl.define(store, "env", "__indirect_function_table", self.table)
+            tl.define(store, "env", "__indirect_function_table", self.guest.table)
             define_ops(tl)  # the trampoline's fallback for a type it does not know is a host operation
             tramp = tl.instantiate(store, wt.Module(engine, wt.wat2wasm(_wasm.TRAMP_WAT))).exports(store)
 
             al = wt.Linker(engine)
             al.define_wasi()
             self._define_exit(al)
-            al.define(store, "env", "memory", self.memory)
-            al.define(store, "env", "__indirect_function_table", self.table)
-            al.define(store, "env", "__stack_pointer", self.ex["__stack_pointer"])
+            al.define(store, "env", "memory", self.guest.memory)
+            al.define(store, "env", "__indirect_function_table", self.guest.table)
+            al.define(store, "env", "__stack_pointer", self.guest.ex["__stack_pointer"])
             al.define(store, "env", "__memory_base", wt.Global(store, wt.GlobalType(I32, False), wt.Val.i32(0)))
             al.define(store, "env", "__table_base", wt.Global(store, wt.GlobalType(I32, False), wt.Val.i32(0)))
             for f in ("malloc", "calloc", "free", "emscripten_builtin_memalign", "_emscripten_find_dylib"):
-                al.define(store, "env", f, self.ex[f])
+                al.define(store, "env", f, self.guest.ex[f])
             al.define(store, "aux", "table_grow", tramp["table_grow"])
             define_ops(al)
             adapter = al.instantiate(store, adapter_mod).exports(store)
@@ -1489,13 +1429,12 @@ class Pyodide:
         # networking: the host's fetch and the main module's free in table slots, named to the guest in a file
         f_fetch = wt.Func(store, wt.FuncType([I32] * 5, [I32]), self._wrap(self._net_fetch, 1), access_caller=True)
         slots = (
-            self.table.grow(store, 1, wt.Val.funcref(f_fetch)),
-            self.table.grow(store, 1, wt.Val.funcref(self.ex["free"])),
+            self.guest.table.grow(store, 1, wt.Val.funcref(f_fetch)),
+            self.guest.table.grow(store, 1, wt.Val.funcref(self.guest.ex["free"])),
         )
         sp = self.root / "lib" / f"python{PYVER}" / "site-packages"
         (sp / "_hostnet_slots.py").write_text(f"FETCH = {slots[0]}\nFREE = {slots[1]}\n")
         log.info("[host] %s; WASI: wasmtime's own; the host's loader ops: %s", self.summary, ", ".join(loader_ops))
-        self.cur.append(store)
         self._boot(slots)
 
     def _wasi_env(self) -> list[tuple[str, str]]:
@@ -1518,17 +1457,11 @@ class Pyodide:
     def _at_start(self) -> str:
         return f"__import__('pyodide_nojs_run').start({bool(self.site)!r})\n"
 
-    def _guest_cstr(self, b: bytes) -> int:
-        store = self.store
-        p = self.ex["malloc"](store, len(b) + 1) & 0xFFFFFFFF
-        self.memory.write(store, b + b"\0", p)
-        return p
-
     def _chdir_home(self) -> None:
         """Pyodide's JavaScript starts the guest in HOME (the cwd is not in a snapshot: this is run after a restore)."""
-        p = self._guest_cstr(b"/home/pyodide")
-        rc = self.ex["chdir"](self.store, p)
-        self.ex["free"](self.store, p)
+        p = self.guest.guest_cstr(b"/home/pyodide")
+        rc = self.guest.ex["chdir"](self.guest.store, p)
+        self.guest.ex["free"](self.guest.store, p)
         if rc != 0:  # not an assert: it must hold under python -O too
             raise RuntimeError("chdir to /home/pyodide failed (does a mount= replace /home?)")
 
@@ -1580,7 +1513,7 @@ class Pyodide:
 
     def _boot(self, slots: tuple[int, int]) -> None:
         """Start CPython (or restore a snapshot of it after the preload) and run the preload."""
-        store = self.store
+        store = self.guest.store
         self._net_slots = slots
         self.restored = False
         path = None
@@ -1600,16 +1533,16 @@ class Pyodide:
                 # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
                 self.run(self._at_start() + 'import sys; "random" in sys.modules and __import__("random").seed()')
                 return
-        self.ex["emscripten_stack_init"](store)
-        self.ex["__wasm_call_ctors"](store)
+        self.guest.ex["emscripten_stack_init"](store)
+        self.guest.ex["__wasm_call_ctors"](store)
         self._set_runtime()
         self._chdir_home()
         # Pyodide's own main(): PyConfig (home "/", stdlib_dir the zip, no bytecode, argv), Py_InitializeFromConfig; its
         # argv[0] is Emscripten's thisProgram, "./this.program", which CPython resolves against the cwd
         # (argv and its string stay allocated: 23 bytes, as the stack copies of Emscripten's callMain would be)
-        argv = self.ex["malloc"](store, 8) & 0xFFFFFFFF
-        self.memory.write(store, self._guest_cstr(b"./this.program").to_bytes(4, "little") + bytes(4), argv)
-        rc = self.ex["__main_argc_argv"](store, 1, argv)
+        argv = self.guest.ex["malloc"](store, 8) & 0xFFFFFFFF
+        self.guest.memory.write(store, self.guest.guest_cstr(b"./this.program").to_bytes(4, "little") + bytes(4), argv)
+        rc = self.guest.ex["__main_argc_argv"](store, 1, argv)
         if rc:
             raise RuntimeError(f"Pyodide's main() returned {rc}: CPython did not start")
         self._started = True
@@ -1618,13 +1551,13 @@ class Pyodide:
             self._save(path)
 
     def _restore(self, path: Path, slots: tuple[int, int]) -> bool:
-        store = self.store
+        store = self.guest.store
         try:
             data = path.read_bytes()
             nl = data.index(b"\n")
             hdr = json.loads(data[:nl])
             pages = hdr["pages"]
-            have = self.memory.size(store)
+            have = self.guest.memory.size(store)
             if (
                 hdr["version"] != SNAPSHOT_VERSION
                 or hdr["slots"] != list(slots)
@@ -1635,14 +1568,14 @@ class Pyodide:
         except (OSError, ValueError, KeyError, TypeError):
             return False
         # all of the file is checked: from here on the memory is written once
-        self.ex["emscripten_stack_init"](store)
+        self.guest.ex["emscripten_stack_init"](store)
         if pages > have:
-            self.memory.grow(store, pages - have)
+            self.guest.memory.grow(store, pages - have)
         src = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p).value
         assert src is not None
-        ctypes.memmove(ctypes.addressof(self.memory.data_ptr(store).contents), src + nl + 1, pages * 65536)
-        if hdr["table"] > self.table.size(store):
-            self.table.grow(store, hdr["table"] - self.table.size(store), self._wt.Val.funcref(None))
+        ctypes.memmove(ctypes.addressof(self.guest.memory.data_ptr(store).contents), src + nl + 1, pages * 65536)
+        if hdr["table"] > self.guest.table.size(store):
+            self.guest.table.grow(store, hdr["table"] - self.guest.table.size(store), self._wt.Val.funcref(None))
         return True
 
     _PROBE = (
@@ -1687,15 +1620,17 @@ class Pyodide:
                 or fresh._probe() != before
             ):
                 return
-            st = fresh.store
-            pages = fresh.memory.size(st)
+            st = fresh.guest.store
+            pages = fresh.guest.memory.size(st)
             hdr = {
                 "version": SNAPSHOT_VERSION,
                 "pages": pages,
-                "table": fresh.table.size(st),
+                "table": fresh.guest.table.size(st),
                 "slots": list(fresh._net_slots),
             }
-            buf = (ctypes.c_char * (pages * 65536)).from_address(ctypes.addressof(fresh.memory.data_ptr(st).contents))
+            buf = (ctypes.c_char * (pages * 65536)).from_address(
+                ctypes.addressof(fresh.guest.memory.data_ptr(st).contents)
+            )
             tmp = path.with_suffix(f".tmp{os.getpid()}")
             try:
                 _engine.private_dir(path.parent)
@@ -1727,11 +1662,11 @@ class Pyodide:
         rc_file = f"/_pw_{self._runs}.rc"
         wrapper = f"__import__('pyodide_nojs_run').run({f'/_pw_{self._runs}.py'!r}, {rc_file!r})\n"
         src = wrapper.encode() + b"\0"
-        store = self.store
-        p = self.ex["PyMem_Malloc"](store, len(src))
+        store = self.guest.store
+        p = self.guest.ex["PyMem_Malloc"](store, len(src))
         self._wr(p, src)
         try:
-            rc = self.ex["PyRun_SimpleString"](store, p)
+            rc = self.guest.ex["PyRun_SimpleString"](store, p)
         except (
             GuestExit
         ) as e:  # the process ended (exit(), os._exit(), a signal's default action): this interpreter is gone

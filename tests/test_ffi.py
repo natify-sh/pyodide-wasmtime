@@ -107,17 +107,19 @@ class FakeMemory:
 
 
 def fake_host() -> Any:
+    from pyodide_nojs._guest import Guest
     from pyodide_nojs._host import Pyodide
 
     py = Pyodide.__new__(Pyodide)
-    py.cur, py.memory = [None], FakeMemory()
+    py.guest = Guest()
+    py.guest.cur, py.guest.memory = [None], FakeMemory()
     py._wt = object()
 
     class Stack:
         def value(self, _ctx: object) -> int:
             return 4000
 
-    py.ex = {"__stack_pointer": Stack()}
+    py.guest.ex = {"__stack_pointer": Stack()}
     return py
 
 
@@ -143,7 +145,7 @@ def test_a_cif_from_the_guest_cannot_make_the_host_loop_or_copy_without_end() ->
     from pyodide_nojs._host import GuestFault
 
     py = fake_host()
-    mem = py.memory.data
+    mem = py.guest.memory.data
     mem[16 + 6 : 16 + 8] = (13).to_bytes(2, "little")  # an ffi_type (at 16) that is a struct ...
     mem[16 + 8 : 16 + 12] = (32).to_bytes(4, "little")  # ... whose elements (at 32) are [itself, NULL]
     mem[32:36] = (16).to_bytes(4, "little")
