@@ -4,6 +4,9 @@ the same script (its PIPEFS and FS.dupStream), except where a test says it diffe
 
 from __future__ import annotations
 
+import sys
+
+import pytest
 from conftest import Guest
 
 HEAD = """
@@ -23,6 +26,7 @@ def poll(fd, ev):
     p = select.poll(); p.register(fd, ev)
     return [e[1] for e in p.poll(0)]
 
+WIN = {WIN}  # the HOST is Windows: it cannot rename or delete a file that is open
 base = "/tmp/t_desc"
 shutil.rmtree(base, ignore_errors=True)
 os.makedirs(base + "/d/sub")
@@ -33,7 +37,7 @@ open(base + "/d/b", "wb").write(b"b")
 
 
 def run(guest: Guest, body: str) -> list[str]:
-    r = guest.run(HEAD + body)
+    r = guest.run(HEAD.replace("{WIN}", str(sys.platform == "win32")) + body)
     assert r.returncode == 0, r.stderr
     return r.stdout.splitlines()
 
@@ -210,10 +214,11 @@ t("read", lambda: (os.read(F, 2), os.read(D, 2), os.lseek(F, 0, 1), os.lseek(D, 
 t("write", lambda: (os.write(D, b"XY"), os.lseek(F, 0, 1), os.pread(F, 10, 0)))
 t("close orig", lambda: (os.close(F), os.read(D, 3), os.lseek(D, 0, 1)))
 t("orig closed", lambda: os.read(F, 1))
-os.rename(base + "/f", base + "/g")
-t("renamed", lambda: (os.lseek(D, 0, 0), os.read(os.dup(D), 4)))
-os.unlink(base + "/g")
-t("unlinked", lambda: (os.read(os.dup(D), 4), os.fstat(D).st_size))
+if not WIN:
+    os.rename(base + "/f", base + "/g")
+    t("renamed", lambda: (os.lseek(D, 0, 0), os.read(os.dup(D), 4)))
+    os.unlink(base + "/g")
+    t("unlinked", lambda: (os.read(os.dup(D), 4), os.fstat(D).st_size))
 os.close(D)
 A = os.open(base + "/d/a", os.O_RDONLY); B = os.open(base + "/d/b", os.O_RDONLY)
 t("dup2 onto an open one", lambda: (os.dup2(A, B) == B, os.read(B, 5), os.read(A, 5)))
@@ -243,8 +248,7 @@ print(os.dup(0) < 20)  # the lowest free number: nothing is left open
         "write (2, 6, b'0123XY6789')",
         "close orig (None, b'678', 9)",
         "orig closed 'OSError EBADF'",
-        "renamed (0, b'0123')",
-        "unlinked (b'XY67', 10)",
+        *([] if sys.platform == "win32" else ["renamed (0, b'0123')", "unlinked (b'XY67', 10)"]),
         "dup2 onto an open one (True, b'a', b'')",
         "dup2 same True",
         "dup2 non-inheritable (True, False)",
@@ -298,7 +302,9 @@ os.close(dfd)
 f2 = os.open("a", os.O_RDONLY, dir_fd=e)
 print(sorted(os.listdir(e)), oct(os.stat("sub", dir_fd=e).st_mode & 0o170000), os.read(f2, 1))
 os.close(f2); os.close(e)
-print(sorted(x.name for x in os.scandir(os.open(base + "/d", os.O_RDONLY))))
+sfd = os.open(base + "/d", os.O_RDONLY)
+print(sorted(x.name for x in os.scandir(sfd)))
+os.close(sfd)  # an open directory cannot be removed on Windows
 print([(r, sorted(d), sorted(f)) for r, d, f, fd in os.fwalk(base)])
 shutil.rmtree(base + "/d")
 print(os.path.exists(base + "/d"))
@@ -423,6 +429,7 @@ print("closed")
     assert out == ["True True", "True", "b'ping' True False 127.0.0.1 closed"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot rename a file that a mapping keeps open")
 def test_mmap_keeps_working_after_the_descriptor_is_closed(guest: Guest) -> None:
     """mmap holds a duplicate of the descriptor: the same file, not a re-opening by name (Pyodide: EBADF at flush)."""
     out = run(
