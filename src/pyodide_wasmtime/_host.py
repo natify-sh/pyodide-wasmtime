@@ -238,12 +238,17 @@ _AT_START = (
     "    old = sys._stdlib_dir\n"
     f"    new = sys._stdlib_dir = '/lib/python{PYVER.replace('.', '')}.zip'\n"
     # the frozen modules were laid out under the old stdlib dir at init: they follow it (importlib asserts it)
-    "    for m in list(sys.modules.values()):\n"
-    "        st = getattr(getattr(m, '__spec__', None), 'loader_state', None)\n"
+    "    for m in (list(sys.modules.values()) if isinstance(old, str) else ()):\n"
+    "        spec = getattr(m, '__spec__', None)\n"
+    "        st = getattr(spec, 'loader_state', None)\n"
     "        fn = getattr(st, 'filename', None)\n"
     "        if isinstance(fn, str) and fn.startswith(old + '/'):\n"
     "            st.filename = new + fn[len(old):]\n"
     "            if getattr(m, '__file__', None) == fn: m.__file__ = st.filename\n"
+    "            for lst in (getattr(m, '__path__', None), getattr(spec, 'submodule_search_locations', None)):\n"
+    "                if isinstance(lst, list):\n"
+    "                    mv = [new + q[len(old):] if q.startswith(old + '/') else q for q in lst]\n"
+    "                    lst[:] = list(dict.fromkeys(mv))\n"
     "    for k in gone: os.environ.pop(k, None)\n"
 )
 
@@ -634,7 +639,7 @@ class Pyodide:
             answered.add(_wasm.TRAMP)
             names = [n for mod, n, kind in _wasm.import_names(wasm) if mod == "env" and kind == 0 and n not in answered]
             try:
-                cached.parent.mkdir(parents=True, exist_ok=True)
+                _engine.private_dir(cached.parent)
                 cached.write_text(json.dumps(names))
             except OSError:
                 pass
@@ -992,7 +997,9 @@ class Pyodide:
                 e(self.cur[-1])
             except GuestExit:  # exit() in a constructor: the glue's catch makes it a failed load (text: JS's `${e}`)
                 return self._dl_reason("[object Object]")
-            except self._wt.Trap as exc:
+            except (
+                Exception
+            ) as exc:  # a trap, an uncaught wasm exception: the glue's catch(e) makes any of them a failed load
                 return self._dl_fail("RuntimeError", exc)
             return 1
         return 0
@@ -2566,7 +2573,7 @@ class Pyodide:
             tmp = path.with_suffix(f".tmp{os.getpid()}")
             try:
                 _engine.private_dir(path.parent)
-                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                with _engine.open_private(tmp) as f:
                     f.write(json.dumps(hdr).encode() + b"\n")
                     f.write(buf)
                 os.replace(tmp, path)

@@ -68,7 +68,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 ## 6. Work: reviews not done yet (CLAUDE.md: a `reviewer` reads high-stakes diffs)
 
-* the virtual descriptor layer (`wasm/adapter/vfd.h`): two independent reviews are done and their fixes are in (the batch after cb1f608); what is left of them is the numbering (W5): a `fd_alloc`/`sock_fd` that opens placeholders until the wanted number comes (about 1000 opens per `dup` after a `dup2` to 1000), a mmap's hidden dup that the guest can name, `os.set_inheritable(fd, True)` and `os.pipe()` (the libc answers FIOCLEX/FIONCLEX itself, CPython has no pipe2 here);
+* the virtual descriptor layer (`wasm/adapter/vfd.h`): two independent reviews are done and their fixes are in (the batch after cb1f608); what is left of them is the numbering (W5): a `fd_alloc` that opens placeholders until the wanted number comes (about 1000-1200 opens, 15-20 ms per `dup`, after a `dup2` to 1000 or after 1200 files were opened and closed), a mmap's hidden dup that the guest can name, `os.set_inheritable(fd, True)` and `os.pipe()` (the libc answers FIOCLEX/FIONCLEX itself, CPython has no pipe2 here);
 * the override feature (`asm_wasm`/`stdlib`, conversion of a legacy-exception main module, snapshot key);
 * the Windows/macOS host changes (`_poll`, pending errors, `SO_ACCEPTCONN`, localtime guards);
 * the new tests were not all run against the old build to show "fails before" (say which in each report).

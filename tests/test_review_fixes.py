@@ -38,6 +38,35 @@ def test_inherit_env_makes_no_snapshot_and_no_file_holds_the_secret(
     assert not list(tmp_path.glob("snapshot-*.mem"))
 
 
+def test_snapshot_restores_on_the_second_start(
+    flavor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The bytes of the snapshot and of the compiled-module cache are intact (a Windows file in text mode would turn
+    every newline byte into two): the second start restores the first one's memory and runs."""
+    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path))
+    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    for restored in (False, True):
+        with Pyodide(flavor, preload="import json\nvalue = 41") as py:
+            assert py.run("print(value + 1)") == 0
+            assert py.restored is restored
+        assert capfd.readouterr().out == "42\n"
+
+
+@pytest.mark.skipif(not POSIX, reason="file modes")
+def test_an_existing_cache_folder_keeps_its_mode(flavor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A folder the user named (or that exists) is not chmod'ed; the files in it are 0600 anyway."""
+    cache = tmp_path / "shared"
+    cache.mkdir(mode=0o755)
+    cache.chmod(0o755)
+    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(cache))
+    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    with Pyodide(flavor, preload="import json") as py:
+        py.run("pass")
+    assert cache.stat().st_mode & 0o777 == 0o755
+    files = list(cache.glob("snapshot-*.mem"))
+    assert files and all(f.stat().st_mode & 0o777 == 0o600 for f in files)
+
+
 @pytest.mark.skipif(not POSIX, reason="file modes")
 def test_snapshot_and_cache_are_private(flavor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cache = tmp_path / "cache"
@@ -55,12 +84,12 @@ def test_snapshot_and_cache_are_private(flavor: str, tmp_path: Path, monkeypatch
 
 
 def ctor_module(body: str) -> bytes:
-    wat = f"""(module (import "env" "memory" (memory 0)) (import "env" "exit" (func $exit (param i32)))
+    wat = f"""(module (import "env" "memory" (memory 0)) (import "env" "exit" (func $exit (param i32))) (tag $t)
       (func (export "__wasm_call_ctors") {body}) (func (export "f") (result i32) i32.const 1))"""
     return sidemod.with_dylink(bytes(wat2wasm(wat)))
 
 
-@pytest.mark.parametrize("body", ["(call $exit (i32.const 205))", "unreachable"])
+@pytest.mark.parametrize("body", ["(call $exit (i32.const 205))", "unreachable", "(throw $t)"])
 def test_exit_or_trap_in_a_constructor_is_a_failed_load(guest: Guest, tmp_path: Path, body: str) -> None:
     """Batch 1 M2: the glue's try/catch turns it into `OSError: could not load dynamic lib`; here dlopen succeeded and
     the exit was swallowed with a traceback."""
@@ -185,14 +214,19 @@ s = socket.socket(); print(s.get_inheritable())
 fcntl.fcntl(s, fcntl.F_SETFD, 0); print(s.get_inheritable(), fd_flag(s.fileno()))
 print(fd_flag(os.dup(f)), fd_flag(ctypes.CDLL(None).dup(f)))  # Python's dup is O_CLOEXEC, libc's dup clears it
 print(fd_flag(fcntl.fcntl(f, fcntl.F_DUPFD_CLOEXEC, 0)))
-os.close(f); g = os.open('/tmp', os.O_RDONLY); print(g == f or True, fd_flag(g))   # a closed number starts again
-fcntl.fcntl(g, fcntl.F_SETFD, 0); os.close(g)
-h = os.open('/tmp', os.O_RDONLY, dir_fd=None); print(fd_flag(h))
+libc = ctypes.CDLL(None)
+g = libc.open(b'/tmp', os.O_RDONLY); print(fd_flag(g))   # libc's open without O_CLOEXEC: 0
+fcntl.fcntl(g, fcntl.F_SETFD, 1); os.close(g)             # closed with the bit set ...
+seen = []
+for _ in range(3000):                                     # ... until the number comes again: it starts clear
+    h = libc.open(b'/tmp', os.O_RDONLY); seen.append(fd_flag(h))
+    if h == g: break
+print(h == g, set(seen))
 """
     r = guest.run(code)
     assert r.returncode == 0, r.stderr
     assert r.stdout.splitlines() == [
-        "1 False", "0 True", "1 False", "1 1", "False", "True 0", "1 0", "1", "True 1", "1",
+        "1 False", "0 True", "1 False", "1 1", "False", "True 0", "1 0", "1", "0", "True {0}",
     ]  # fmt: skip
 
 
@@ -200,14 +234,17 @@ def test_descriptors_work_after_many_files_were_opened_and_closed(guest: Guest) 
     """Descriptor review 1: after 1200 files were opened and closed WASI hands out numbers above 1024, and every dup,
     pipe and socket failed with EMFILE."""
     code = """
-import os, socket
+import os, socket, time
 open('/tmp/g.txt', 'w').close()
 L = [os.open('/tmp/g.txt', os.O_RDONLY) for _ in range(1200)]
 for x in L: os.close(x)
+t = time.perf_counter()
+for _ in range(5): os.close(os.dup(2))
+print(time.perf_counter() - t < 3)  # 0.04-0.09 s; it was 18 s when every placeholder held the high numbers again
 print(os.dup(2) > 2, len(os.pipe()), socket.socket().fileno() > 2)
 """
     r = guest.run(code)
-    assert (r.returncode, r.stdout.strip()) == (0, "True 2 True"), r.stderr
+    assert (r.returncode, r.stdout.strip()) == (0, "True\nTrue 2 True"), r.stderr
 
 
 def test_moving_the_holder_of_a_directory_keeps_its_listing(guest: Guest) -> None:
@@ -236,13 +273,15 @@ import os, stat, sys
 open('/tmp/g.txt', 'w').write('abc')
 s = os.dup(1); os.close(1)
 fd = os.open('/tmp/g.txt', os.O_RDONLY)
+d = os.dup(fd)  # a dup of the reopened number is a file too
 res = (fd == 1, stat.S_ISREG(os.fstat(fd).st_mode), os.lseek(fd, 0, 2))
-os.close(fd); os.dup2(s, 1); os.close(s)
+res += (stat.S_ISREG(os.fstat(d).st_mode), os.lseek(d, 0, 0))
+os.close(d); os.close(fd); os.dup2(s, 1); os.close(s)
 print(*res)
 print(stat.S_ISCHR(os.fstat(1).st_mode))
 """
     r = guest.run(code)
-    assert (r.returncode, r.stdout.splitlines()) == (0, ["True True 3", "True"]), r.stderr
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["True True 3 True 0", "True"]), r.stderr
 
 
 # ------------------------------------------------------------------------------------------ sys.path and the stdlib dir
@@ -267,6 +306,10 @@ def test_frozen_modules_follow_the_stdlib_dir(guest: Guest) -> None:
 import sys, zipimport
 st = zipimport.__spec__.loader_state.filename
 print(sys._stdlib_dir, zipimport.__file__ == st == sys._stdlib_dir + '/zipimport.py')
+import encodings
+print(encodings.__path__, encodings.__spec__.submodule_search_locations)
 """
     r = guest.run(code)
-    assert (r.returncode, r.stdout.strip()) == (0, "/lib/python315.zip True"), r.stderr
+    zipdir = "/lib/python315.zip/encodings"
+    want = f"/lib/python315.zip True\n['{zipdir}'] ['{zipdir}']"
+    assert (r.returncode, r.stdout.strip()) == (0, want), r.stderr

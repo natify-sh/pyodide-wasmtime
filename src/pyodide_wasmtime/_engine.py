@@ -51,12 +51,18 @@ def cache_dir() -> Path:
 
 
 def private_dir(path: Path) -> None:
-    """Make the cache folder (mode 0700 where the OS has modes): what is cached may hold a guest's memory."""
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+    """Make the cache folder if it is not there (mode 0700 where the OS has modes: what is cached may hold a guest's
+    memory). A folder that exists, or that the user named, is never changed."""
+    if not path.is_dir():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=0o700, exist_ok=True)
+
+
+def open_private(path: Path):
+    """A new binary file for writing, mode 0600 (it must not exist: the names carry the process id); O_BINARY keeps
+    Windows' CRT from changing the line ends of the bytes."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    return os.fdopen(os.open(path, flags, 0o600), "wb")
 
 
 class LazyExports(Mapping):
@@ -195,7 +201,7 @@ def load_module(
             try:
                 private_dir(cached.parent)
                 tmp = cached.with_suffix(f".tmp{os.getpid()}")
-                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                with open_private(tmp) as f:
                     f.write(stamp + b"\n" + module.serialize())
                 os.replace(tmp, cached)
             except OSError:

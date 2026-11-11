@@ -59,8 +59,8 @@ def burn(clock):  # until the clock itself has advanced 0.1 s (a clock that does
 TH, PR, ck = time.CLOCK_THREAD_CPUTIME_ID, time.CLOCK_PROCESS_CPUTIME_ID, time.clock_gettime
 print(burn(time.process_time), burn(lambda: ck(TH)), burn(lambda: ck(PR)))
 p, t = time.process_time(), ck(TH)
-time.sleep(0.5)  # the guest's sleep spends about half of it as CPU time; Pyodide's monotonic clock would say 0.5
-print(time.process_time() - p < 0.4, ck(TH) - t < 0.4)
+time.sleep(1.0)  # spins: 0.25 of 0.5 s idle, 0.5-0.6 of 1 s loaded; Pyodide's clock is the wall clock: all of it
+print(time.process_time() - p < 0.9, ck(TH) - t < 0.9)
 print(time.clock_getres(time.CLOCK_PROCESS_CPUTIME_ID) > 0, time.clock_getres(time.CLOCK_THREAD_CPUTIME_ID) > 0)
 print(ctypes.CDLL(None).clock() > 0)
 for cid in (4, 99, -1):

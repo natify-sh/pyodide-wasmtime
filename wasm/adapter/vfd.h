@@ -102,58 +102,71 @@ static i32 cloexec_set(i32 fd, i32 on) {
     return 0;
 }
 
-// a placeholder descriptor for a new number: a directory opened, so the number is a real WASI one. -errno
-// WASI may hand out a number of MAXFD or more (after many files were opened and closed): those are held while more are
-// opened, up to HOLD of them, until a smaller one comes; then all the held are closed again.
-#define HOLD 2048
-static i32 sock_fd(void) {
+// a placeholder descriptor: a directory opened, so the number is a real WASI one. WASI's number, or -errno
+static i32 ph_open(void) {
     u64 all = (1ull << 30) - 1, writes = (1ull << 6) | (1ull << 0) | (1ull << 8) | (1ull << 22);
-    i32 fd = -1, r, held = 0, *hv = 0;
+    i32 fd = -1;
     char dot[2];  // "." built on the stack: a string literal would be a data section
     dot[0] = '.', dot[1] = 0;
+    i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);
+    if (e || fd < 0) return -33;  // EMFILE
+    return fd;
+}
+// WASI may hand out a number of MAXFD or more (after many files were opened and closed): those are held (up to HOLD, once
+// per allocation) while more are opened, until a number below MAXFD comes; then the held are closed again.
+#define HOLD 8192
+// a placeholder for a new number, any one below MAXFD. -errno
+static i32 sock_fd(void) {
+    i32 r, held = 0, *hv = 0;
     for (;;) {
-        fd = -1;
-        i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);
-        if (e) {
-            r = -33;  // EMFILE
-            break;
-        }
-        if (fd >= 0 && fd < MAXFD) {
-            r = fd;
-            break;
-        }
+        r = ph_open();
+        if (r < 0 || r < MAXFD) break;
         if (!hv) hv = (i32 *)calloc(HOLD, 4);
-        if (fd < 0 || !hv || held == HOLD) {
-            w_fd_close(fd);
+        if (!hv || held == HOLD) {
+            w_fd_close(r);
             r = -33;
             break;
         }
-        hv[held++] = fd;
+        hv[held++] = r;
     }
     while (held > 0) w_fd_close(hv[--held]);
     free(hv);
     return r;
 }
 // the lowest free number from `min` on (exactly `min` if `exact`: a dup2 target, free by now), as a placeholder. WASI
-// hands out neither the lowest number nor the last freed (see the top): so placeholders are opened until the wanted number comes, and the
-// others closed again, the highest first (the lowest is then the next to be given out).
+// hands out neither the lowest number nor the last freed (see the top): so placeholders are opened until the wanted number
+// comes, and the others closed again, the highest first (the lowest is then the next to be given out). The numbers of
+// MAXFD and above are held in one list for the whole allocation (opening them again for every placeholder made a dup
+// after many opens and closes take seconds).
 static i32 fd_alloc(i32 min, i32 exact) {
     u8 st[24] __attribute__((aligned(8)));
-    i32 k = min, fd;
+    i32 k = min, fd, nhi = 0, *hi = 0;
     while (k < MAXFD && !w_fd_fdstat_get(k, st)) k++;
     if (k >= MAXFD || (exact && k != min)) return exact ? -EBADF : -33;  // EMFILE
     u8 *held = 0;
     for (;;) {
-        fd = sock_fd();
+        fd = ph_open();
         if (fd < 0 || fd == k) break;
-        if (!held) held = (u8 *)calloc(MAXFD, 1);
-        if (!held) {
-            w_fd_close(fd);
-            fd = -ENOMEM;
-            break;
+        if (fd < MAXFD) {
+            if (!held) held = (u8 *)calloc(MAXFD, 1);
+            if (!held) {
+                w_fd_close(fd);
+                fd = -ENOMEM;
+                break;
+            }
+            held[fd] = 1;
+        } else {
+            if (!hi) hi = (i32 *)calloc(HOLD, 4);
+            if (!hi || nhi == HOLD) {
+                w_fd_close(fd);
+                fd = -33;
+                break;
+            }
+            hi[nhi++] = fd;
         }
-        held[fd] = 1;
     }
+    while (nhi > 0) w_fd_close(hi[--nhi]);
+    free(hi);
     if (held) {
         for (i32 j = MAXFD - 1; j >= 0; j--)
             if (held[j]) w_fd_close(j);
@@ -225,7 +238,7 @@ static i32 fd_dup(i32 old, i32 min, i32 exact, i32 cloexec) {
     if (!o) {  // from now on the plain descriptor has an object
         fresh = o = (Obj *)calloc(1, sizeof(Obj));
         if (!o) return -ENOMEM;
-        o->kind = K_FILE, o->ref = 1, o->w = old, o->std = old <= 2;
+        o->kind = K_FILE, o->ref = 1, o->w = old, o->std = (u8)fd_std(old);
     }
     i32 p = fd_alloc(min, exact);
     if (p < 0) {
