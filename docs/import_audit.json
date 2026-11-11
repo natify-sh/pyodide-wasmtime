@@ -1352,7 +1352,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c getaddrinfo_ -> _host.py _n_getaddrinfo: Pyodide's input checks in its order (EAI_NONAME for no node and no service, EAI_BADFLAGS, EAI_SOCKTYPE, EAI_FAMILY, parseInt of the service, EAI_SERVICE) and defaults (ai_socktype 1, ai_protocol 6 / 17); the answers come from the host's getaddrinfo, ALL addresses (IPv4 and IPv6), ai_canonname with AI_CANONNAME, AI_PASSIVE/NUMERICHOST/NUMERICSERV/ADDRCONFIG by the host, services by name from the host's table (and the same small table that is the guest's /etc/services). The list is one malloc'd block plus the first sockaddr, which is all freeaddrinfo frees (it does not follow ai_next). Differences from Pyodide on purpose: real addresses where its JS invents 172.29.x.x; IPv6 results (Pyodide's CPython has no IPv6, socket.has_ipv6 is False, so Python shows them as (10, raw bytes)); with socktype 0 one STREAM entry, as the JS (not glibc's three).",
+  "evidence": "adapter.c getaddrinfo_ -> _host.py _n_getaddrinfo (the checks and the resolver: _sockaddr.py resolve_addrinfo): Pyodide's input checks in its order (EAI_NONAME for no node and no service, EAI_BADFLAGS, EAI_SOCKTYPE, EAI_FAMILY, parseInt of the service, EAI_SERVICE) and defaults (ai_socktype 1, ai_protocol 6 / 17); the answers come from the host's getaddrinfo, ALL addresses (IPv4 and IPv6), ai_canonname with AI_CANONNAME, AI_PASSIVE/NUMERICHOST/NUMERICSERV/ADDRCONFIG by the host, services by name from the host's table (and the same small table that is the guest's /etc/services). The list is one malloc'd block plus the first sockaddr, which is all freeaddrinfo frees (it does not follow ai_next). Differences from Pyodide on purpose: real addresses where its JS invents 172.29.x.x; IPv6 results (Pyodide's CPython has no IPv6, socket.has_ipv6 is False, so Python shows them as (10, raw bytes)); with socktype 0 one STREAM entry, as the JS (not glibc's three).",
   "tested": "tests/test_sockets.py::test_getaddrinfo_lists_the_hosts_addresses, tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups, tests/test_sockets.py::test_ipv6_structures_are_written_and_read_right"
  },
  {
@@ -1360,7 +1360,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c getnameinfo_ -> _host.py _n_getnameinfo: the host's getnameinfo on the sockaddr_in/in6 (scope id), NI_NUMERICHOST/NUMERICSERV/NAMEREQD/DGRAM by name, EAI_NONAME, EAI_FAMILY for a bad family or length, EAI_OVERFLOW when the buffer is too small. Pyodide: numeric only ('127.0.0.1', '80'); socket.gethostbyaddr('127.0.0.1') works through it in both.",
+  "evidence": "adapter.c getnameinfo_ -> _host.py _n_getnameinfo (the host's call: _sockaddr.py nameinfo): the host's getnameinfo on the sockaddr_in/in6 (scope id), NI_NUMERICHOST/NUMERICSERV/NAMEREQD/DGRAM by name, EAI_NONAME, EAI_FAMILY for a bad family or length, EAI_OVERFLOW when the buffer is too small. Pyodide: numeric only ('127.0.0.1', '80'); socket.gethostbyaddr('127.0.0.1') works through it in both.",
   "tested": "tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups, tests/test_sockets.py::test_ipv6_structures_are_written_and_read_right"
  },
  {
@@ -1394,7 +1394,7 @@
   "gaps": [
    "A wasm exception (a C++ throw, a wasm setjmp/longjmp) can not cross the Python host frame of this operation: the guest traps (JS lets it pass through its frames)."
   ],
-  "evidence": "adapter.c ffi_call_js -> loader.ffi_call -> _host.py _ffi_call/_js_call (libffi's JS rules: unbox_small_structs, struct copies on the stack, the variadic block, nfixedargs; the callee's own wasm type; extra arguments dropped, missing ones undefined; a BigInt/Number mismatch is an error, as JS throws); probes (both packagings, equal to Pyodide on Node): div, PyOS_double_to_string, sqrtl, inet_ntoa, free(p) with the default restype, srand, snprintf (plain and variadic, long double), PyLong_FromLong(5,6) and (), >8 arguments, labs/llabs/fabs/fabsf/ldexp/memset; A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-nojs: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case).",
+  "evidence": "adapter.c ffi_call_js -> loader.ffi_call -> _host.py _ffi_call/_js_call (the cif's arguments and result: _cif.py call_args/store_result; libffi's JS rules: unbox_small_structs, struct copies on the stack, the variadic block, nfixedargs; the callee's own wasm type; extra arguments dropped, missing ones undefined; a BigInt/Number mismatch is an error, as JS throws); probes (both packagings, equal to Pyodide on Node): div, PyOS_double_to_string, sqrtl, inet_ntoa, free(p) with the default restype, srand, snprintf (plain and variadic, long double), PyLong_FromLong(5,6) and (), >8 arguments, labs/llabs/fabs/fabsf/ldexp/memset; A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-nojs: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case).",
   "tested": "tests/test_ffi.py::test_ctypes_calls_take_any_signature; tests/test_basic.py::test_ctypes_calls_with_floats_and_64_bit_values; tests/test_checks.py::test_openssl_through_ctypes"
  },
  {
@@ -1420,7 +1420,7 @@
   "gaps": [
    "A wasm exception (a C++ throw, a wasm setjmp/longjmp) can not cross the Python host frame of this operation: the guest traps (JS lets it pass through its frames)."
   ],
-  "evidence": "adapter.c ffi_prep_closure_loc_js -> loader.ffi_prep -> _host.py _ffi_prep/_ffi_closure: a host function of the closure's wasm signature (derived from the cif as the JS does) is put in the table slot codeloc; on a call it writes the arguments to the guest stack as avalue (struct copies, the variadic pointer), calls fun(cif, ret, args, user_data) and returns ret per the signature. Probes (both packagings, equal to Pyodide): CFUNCTYPE int/double/float/int64/uint64/pointer/no-arg/void/char/short/ubyte/struct-by-value argument/long double/10 arguments, qsort and bsearch comparators called by libc, a callback that raises, a callback inside a callback; cffi callback() from the wheel. Suite: test_ctypes.test_callbacks and test_ctypes.test_libc pass on fused and dynamic; A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-nojs: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case).; the wasmtime Funcs of closures are pooled per signature and reused (a Func is never freed before its store): 20000 create/free cycles keep the memory flat",
+  "evidence": "adapter.c ffi_prep_closure_loc_js -> loader.ffi_prep -> _host.py _ffi_prep/_ffi_closure (the cif's signature and the closure's frame: _cif.py closure_signature/closure_frame/closure_result): a host function of the closure's wasm signature (derived from the cif as the JS does) is put in the table slot codeloc; on a call it writes the arguments to the guest stack as avalue (struct copies, the variadic pointer), calls fun(cif, ret, args, user_data) and returns ret per the signature. Probes (both packagings, equal to Pyodide): CFUNCTYPE int/double/float/int64/uint64/pointer/no-arg/void/char/short/ubyte/struct-by-value argument/long double/10 arguments, qsort and bsearch comparators called by libc, a callback that raises, a callback inside a callback; cffi callback() from the wheel. Suite: test_ctypes.test_callbacks and test_ctypes.test_libc pass on fused and dynamic; A host function that fails on purpose (JavaScript's TypeError for a BigInt/Number mismatch, a pointer or a size outside the memory, an ffi_type nested more than 64 deep, a cif of more than 1000 arguments) ends the interpreter: run() prints 'pyodide-nojs: a host function failed, the guest is dead: <error>' and returns 134, as for a trap; the next run() starts a new one (Pyodide: 'Pyodide has suffered a fatal error', same message text for the BigInt case).; the wasmtime Funcs of closures are pooled per signature and reused (a Func is never freed before its store): 20000 create/free cycles keep the memory flat",
   "tested": "tests/test_ffi.py::test_ctypes_callbacks_of_every_kind; tests/test_ffi.py::test_cffi_callbacks; suite test_ctypes.test_callbacks, test_ctypes.test_libc"
  },
  {
@@ -1482,7 +1482,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c tzset_js -> loader.tzset -> _host.py _t_tzset: timezone, daylight and the names 'UTC+0200'/'UTC-0000' from the Jan 1/Jul 1 offsets of the current year, exactly as the JS (std/dst by the smaller west offset). Probe: time.tzname/timezone/daylight/altzone and strftime %Z in 5 zones equal Pyodide (e.g. Kyiv ('UTC+0200','UTC+0300') -7200 1 -10800; UTC ('UTC-0000','UTC-0000') 0 0)",
+  "evidence": "adapter.c tzset_js -> loader.tzset -> _host.py _t_tzset (body in _timecalc.py t_tzset): timezone, daylight and the names 'UTC+0200'/'UTC-0000' from the Jan 1/Jul 1 offsets of the current year, exactly as the JS (std/dst by the smaller west offset). Probe: time.tzname/timezone/daylight/altzone and strftime %Z in 5 zones equal Pyodide (e.g. Kyiv ('UTC+0200','UTC+0300') -7200 1 -10800; UTC ('UTC-0000','UTC-0000') 0 0)",
   "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {
@@ -1864,7 +1864,7 @@
   "gaps": [
    "On a Windows host (a C library with a narrow time_t) an instant outside 0..32535215999 is answered with the zone offset of the nearest instant inside it; not tested there."
   ],
-  "evidence": "adapter.c mktime_js -> loader.mktime -> _host.py _t_mktime: Date(y, m, d, h, mi, s) with V8's limits and the 19xx rule, a time that does not exist or happens twice as ECMAScript's UTC(), the JS tm_isdst logic (dst < 0 guessed, a wrong flag shifts the time by the offsets' difference), -1 beyond the range. Probe: 23 tuples in 5 zones equal Pyodide",
+  "evidence": "adapter.c mktime_js -> loader.mktime -> _host.py _t_mktime (body in _timecalc.py t_mktime): Date(y, m, d, h, mi, s) with V8's limits and the 19xx rule, a time that does not exist or happens twice as ECMAScript's UTC(), the JS tm_isdst logic (dst < 0 guessed, a wrong flag shifts the time by the offsets' difference), -1 beyond the range. Probe: 23 tuples in 5 zones equal Pyodide",
   "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {
@@ -1874,7 +1874,7 @@
   "gaps": [
    "On a Windows host (a C library with a narrow time_t) an instant outside 0..32535215999 is answered with the zone offset of the nearest instant inside it; not tested there."
   ],
-  "evidence": "adapter.c localtime_js -> loader.localtime -> _host.py _t_localtime: the offset of the host's zone (time.localtime), tm_gmtoff and tm_isdst as the JS computes them (offsets in whole minutes, DST = the larger of the Jan 1/Jul 1 offsets), fields from the exact offset, error beyond +-8.64e12 s. The zone is the host process's (TZ, zoneinfo), as Date is Node's. Probe: tests/checks/time_local.py in UTC, Europe/Kyiv, America/New_York, Australia/Lord_Howe, Asia/Kolkata equals Pyodide",
+  "evidence": "adapter.c localtime_js -> loader.localtime -> _host.py _t_localtime (body in _timecalc.py t_localtime): the offset of the host's zone (time.localtime), tm_gmtoff and tm_isdst as the JS computes them (offsets in whole minutes, DST = the larger of the Jan 1/Jul 1 offsets), fields from the exact offset, error beyond +-8.64e12 s. The zone is the host process's (TZ, zoneinfo), as Date is Node's. Probe: tests/checks/time_local.py in UTC, Europe/Kyiv, America/New_York, Australia/Lord_Howe, Asia/Kolkata equals Pyodide",
   "tested": "tests/test_time.py::test_local_time_in_the_hosts_zone"
  },
  {

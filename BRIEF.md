@@ -73,7 +73,7 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 | how the adapter works, what it answers, what was found | `docs/EXPERIMENT.md` |
 | WASI 0.2 over fusedwasi, the official test suite plan | `docs/NOTES-FUSEDWASI-AND-TESTSUITE.md` |
 | the adapter | `wasm/adapter.c` (includes the sections in `wasm/adapter/*.h`) |
-| the host | `src/pyodide_nojs/_host.py`, `_engine.py`, `_wasm.py`, `guest/hostnet.py` |
+| the host | `src/pyodide_nojs/_host.py` (class `Pyodide`), `_consts.py`, `_timecalc.py`, `_sockaddr.py`, `_cif.py` (functions without state), `_engine.py`, `_wasm.py`, `guest/hostnet.py` |
 | the build | `tools/` (`fetch.sh`, `build_data.sh`, `build_adapter.sh`, `build_binaryen.sh`, `build_ssl.sh`, `prepare_testenv.sh`, `fuse.py`), `package.json` (the pinned versions) |
 | licenses of the bundled binaries | `licenses/NOTICE` |
 

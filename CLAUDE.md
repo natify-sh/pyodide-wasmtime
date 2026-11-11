@@ -79,6 +79,12 @@ Report:      files changed, commands run with output, docs updated, open questio
 * `src/pyodide_nojs/_host.py` (`Pyodide`): `_start` builds either flavor; `run()` executes code in the guest's `__main__` through a wrapper that turns `SystemExit` into a status (Emscripten's `exit()` ends in `unreachable`).
   `_engine.py` is the one engine (exceptions, function references, GC), the machine-code cache in the user's cache dir, and `wasm-opt.wasm` run in-process. `_wasm.py` is the WAT of the dynamic build; import types come from `Module.imports`
   (wasmtime-py prints every reference type as `anyref`; here they are all `externref`). `guest/hostnet.py` runs inside the guest.
+* What needs no object state is in plain modules of functions with explicit arguments (the guest's memory is passed as `rd`/`wr` callables), not in mixins of `Pyodide`; they import only the standard library, `_engine`, `_wasm`
+  and `_consts`, and nothing imports `_host.py` back but `__init__.py`, `_cli.py` and the tests:
+  * `_consts.py`: the constants, `GuestFault`/`GuestExit`, `guest_errno`, the number helpers (`_to_wasm`...), `data_dir`, `override_warnings`, `MainExports`, `code_hash` (the host's part of the snapshot key: every module of the package).
+  * `_timecalc.py`: the calendar and JS date helpers, the local-time operations (`t_localtime`, `t_mktime`, `t_tzset`) and the CPU clocks.
+  * `_sockaddr.py`: the option/flag/error tables, sockaddr/msghdr/send/recv helpers, the resolver half of `getaddrinfo`/`getnameinfo`, `ca_bundle`.
+  * `_cif.py`: libffi's `ffi_cif`/`ffi_type` records read from the guest's memory (a call's arguments, a closure's signature and frame, results).
 * Wheels with legacy exceptions are converted at `dlopen` by `wasm-opt.wasm` (`Pyodide.converted` counts them); the modules the build ships are converted at build time.
 * The tests need the build: `sh tools/build_data.sh pyo-build` and `sh tools/prepare_testenv.sh work` (`WASM_OPT_WASM=path` skips the 12-minute build of `wasm-opt.wasm`). A missing build is a skip locally and a failure with `CI` set.
 * A host function must not hold the engine across a wait for another thread; there are no threads here (as in Pyodide).

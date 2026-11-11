@@ -52,7 +52,7 @@ The lock and the guest files `pyodide_lock.py`, `hostnet.py`, `pyodide_nojs.pth`
 Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**, after the
 shape of Wasmtime's `wasi_snapshot_preview1` adapter (`wasm/adapter.c`, which includes the sections in `wasm/adapter/*.h`; about 3 500 lines of C, no data section, no stack of its own):
 system calls over WASI, the dynamic loader (`dlopen` of a wheel's `.so`), libffi's calls, sockets, time, the trampoline.
-The host (`_host.py`) gives what a wasm module cannot do: wasmtime's WASI, the loader operations (it holds the instances by name),
+The host (`_host.py`; what needs no object state is in `_consts.py`, `_timecalc.py`, `_sockaddr.py` and `_cif.py`) gives what a wasm module cannot do: wasmtime's WASI, the loader operations (it holds the instances by name),
 libffi's calls and callbacks (a call is made with the callee's real wasm type, as the JavaScript glue does), the host's time zone, the host's sockets and `statvfs`
 (the numbers of the folder behind a guest path). `Pyodide.interrupt(signum=2)` posts a signal to Python from a host function the guest is calling (or between runs), not from another thread. A C++ exception or a `longjmp` can not cross a ctypes call or a callback (the guest traps). Permission bits, owners and the umask are kept by the adapter for the interpreter's lifetime (WASI has none). **Pyodide is not rebuilt**: its wasm is the npm package's, with the legacy wasm exceptions converted once to
 `exnref` (wasmtime does not run the legacy ones).
