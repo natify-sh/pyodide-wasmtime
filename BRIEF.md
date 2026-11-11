@@ -66,6 +66,8 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 |---|---|
 | what it is, how to use and build it | `README.md` |
 | the rules of work, the roles of agents | `CLAUDE.md`, `.claude/agents/` |
+| what is open and in which order (decisions waiting for the owner, work, reviews, later) | `BACKLOG.md` |
+| the import-by-import audit and the differences against Pyodide | `docs/IMPORT_AUDIT.md`, `docs/DIFF_AUDIT_files.md` |
 | how the adapter works, what it answers, what was found | `docs/EXPERIMENT.md` |
 | WASI 0.2 over fusedwasi, the official test suite plan | `docs/NOTES-FUSEDWASI-AND-TESTSUITE.md` |
 | the adapter | `wasm/adapter.c` (includes the sections in `wasm/adapter/*.h`) |
