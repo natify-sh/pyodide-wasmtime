@@ -66,13 +66,13 @@ def test_interrupt_from_a_host_function(flavor: str, signum: int, expected: str,
     """`Pyodide.interrupt(signum)` posts a signal that Python takes between bytecodes (JavaScript's
     Py_EmscriptenSignalBuffer): SIGINT is a KeyboardInterrupt in a running loop, another signal runs its handler."""
     with Pyodide(flavor) as py:
-        original = py._n_pollv  # the host function the guest calls (poll with no descriptors is a sleep)
+        original = py.net._n_pollv  # the host function the guest calls (poll with no descriptors is a sleep)
 
         def pollv(*args: int) -> int:
             py.interrupt(signum)
             return original(*args)
 
-        py._n_pollv = pollv  # type: ignore[method-assign]
+        py.net._n_pollv = pollv  # type: ignore[method-assign]
         assert py.run(LOOP) == 0
     assert capfd.readouterr().out.strip() == expected
 
