@@ -29,14 +29,13 @@ from typing import Any
 
 from . import _cif, _engine, _timecalc, _wasm
 from ._consts import (
-    _GLOBAL_WHY,
-    _JS_MODULES,
-    _U32,
     BASE_ENV,
     FLAVORS,
+    GLOBAL_WHY,
     GUEST,
     GUEST_OWN_ENV,
     GUEST_SUFFIXES,
+    JS_MODULES,
     MAX_MEMORY,
     MAX_TABLE,
     PYVER,
@@ -44,19 +43,20 @@ from ._consts import (
     SERVICES,
     SNAPSHOT_VERSION,
     TESTENV_HINT,
+    U32,
     WASI_ERRNO,
     GuestExit,
     GuestFault,
     MainExports,
-    _from_wasm,
-    _override,
-    _s32,
-    _to_wasm,
     available_flavors,
     code_hash,
     data_dir,
+    from_wasm,
     guest_errno,
+    override_path,
     override_warnings,
+    s32,
+    to_wasm,
 )
 from ._guest import Guest
 from ._net import Net
@@ -123,8 +123,8 @@ class Pyodide:
         wt = _engine.require_wasmtime()
         self._wt = wt
         self.data = data_dir(data)
-        self.asm_wasm = _override(asm_wasm, "PYODIDE_NOJS_ASM_WASM")
-        self.stdlib = _override(stdlib, "PYODIDE_NOJS_STDLIB")
+        self.asm_wasm = override_path(asm_wasm, "PYODIDE_NOJS_ASM_WASM")
+        self.stdlib = override_path(stdlib, "PYODIDE_NOJS_STDLIB")
         self._override_checked = False
         have = available_flavors(self.data)
         overridden = self.asm_wasm is not None or self.stdlib is not None
@@ -228,7 +228,7 @@ class Pyodide:
         if not (main_path.exists() and adapter_path.exists()):
             return
         # the names are read from 10 MB of wasm: kept in the cache dir, keyed by the two files' size and mtime
-        key = hashlib.sha256(b"|".join(_engine._stamp(p) for p in (main_path, adapter_path))).hexdigest()[:16]
+        key = hashlib.sha256(b"|".join(_engine.file_stamp(p) for p in (main_path, adapter_path))).hexdigest()[:16]
         cached = _engine.cache_dir() / f"stubs-{key}.json"
         try:
             names = json.loads(cached.read_text())
@@ -308,9 +308,9 @@ class Pyodide:
                 if ty.mutable:
                     return pre + "imported mutable global must be a WebAssembly.Global object"
                 if str(ty.content) not in ("i32", "f32", "f64"):
-                    return pre + _GLOBAL_WHY
+                    return pre + GLOBAL_WHY
             elif not isinstance(item, wt.Global):
-                return pre + _GLOBAL_WHY
+                return pre + GLOBAL_WHY
             else:
                 have = item.type(c)
                 if have.mutable != ty.mutable:
@@ -383,8 +383,8 @@ class Pyodide:
         if not blk:  # no memory even for the message: dlerror stays what it was
             return
         self._wr(blk, struct.pack("<I", blk + 8) + b"%s\0\0" + msg + b"\0")
-        ex["__dl_seterr"](c, _s32(blk + 4), _s32(blk))  # the format and the pointer to its arguments
-        ex["free"](c, _s32(blk))
+        ex["__dl_seterr"](c, s32(blk + 4), s32(blk))  # the format and the pointer to its arguments
+        ex["free"](c, s32(blk))
 
     def _dl_instantiate(self, p: int, n: int, mb: int, tb: int, scope: int) -> int:
         wt = self._wt
@@ -420,7 +420,7 @@ class Pyodide:
             main = self.instances[0]["exports"]
             imports = list(module.imports)
             for i, imp in enumerate(imports):  # V8 looks at every module object before it checks any import
-                if imp.module not in _JS_MODULES:
+                if imp.module not in JS_MODULES:
                     return self._dl_reason(
                         f'TypeError: WebAssembly.Instance(): Import #{i} module="{imp.module}": '
                         "module is not an object or function"
@@ -553,7 +553,7 @@ class Pyodide:
                 v = val if ty.mutable else val + base
                 v = int(v) if v == v and abs(v) != float("inf") else 0
                 self._wr(out, struct.pack("<II", 1, 0))
-                return _s32(v & 0xFFFFFFFF)
+                return s32(v & 0xFFFFFFFF)
             if ty.mutable:  # a reference (ToNumber: 0) or an i64 (ToInt32 throws) is no GOT symbol
                 if struct.unpack("<I", self._rd(out + 4, 4))[0] == 0:  # the GOT asks (out[1] = 0)
                     return 0
@@ -563,7 +563,7 @@ class Pyodide:
                 return 0
             if kind != "i64":  # an immutable reference: null + base is the base, a function + base is NaN
                 self._wr(out, struct.pack("<II", 1, 0))
-                return _s32((base if getattr(val, "value", 1) is None else 0) & 0xFFFFFFFF)
+                return s32((base if getattr(val, "value", 1) is None else 0) & 0xFFFFFFFF)
             self._wr(out, struct.pack("<II", 0, 0))
             return 0
         if isinstance(e, wt.Func):
@@ -574,7 +574,7 @@ class Pyodide:
                 self.slots[(id_, name)] = slot
             # kind 3: a slot made by this lookup, with the export's index (the glue's symbolIndex)
             self._wr(out, struct.pack("<II", 3 if new else 2, list(exports).index(name) if new else 0))
-            return _s32(slot)
+            return s32(slot)
         self._wr(out, struct.pack("<II", 0, 0))
         return 0
 
@@ -600,7 +600,7 @@ class Pyodide:
         return f
 
     def _js_call(self, idx: int, args: list) -> Any:
-        """`wasmTable.get(idx)(...args)`: args are Numbers (int, float) or BigInts (_Big); the JavaScript result. What a
+        """`wasmTable.get(idx)(...args)`: args are Numbers (int, float) or BigInts (Big); the JavaScript result. What a
         table entry is does not change (only a closure's slot does: `_ffi_prep`, `_ffi_free`), so its type is kept."""
         ctx = self.guest.cur[-1]
         known = self.functions.get(idx)
@@ -609,16 +609,16 @@ class Pyodide:
             ty = f.type(ctx)
             known = self.functions[idx] = (f, [str(t) for t in ty.params], [str(t) for t in ty.results])
         f, types, results = known
-        vals = [_to_wasm(args[k] if k < len(args) else None, t) for k, t in enumerate(types)]
-        return _from_wasm(f(ctx, *vals), results)
+        vals = [to_wasm(args[k] if k < len(args) else None, t) for k, t in enumerate(types)]
+        return from_wasm(f(ctx, *vals), results)
 
     def _call_any(self, fn: int, a: int, b: int, c: int) -> int:
-        fn &= _U32  # a, b, c are JavaScript Numbers: signed
+        fn &= U32  # a, b, c are JavaScript Numbers: signed
         """`_PyEM_TrampolineCall_JS` for a table entry whose type the WAT trampoline does not know."""
-        return _to_wasm(self._js_call(fn, [a, b, c]), "i32")
+        return to_wasm(self._js_call(fn, [a, b, c]), "i32")
 
     def _ffi_call(self, cif: int, fn: int, rvalue: int, avalue: int) -> None:
-        cif, fn, rvalue, avalue = cif & _U32, fn & _U32, rvalue & _U32, avalue & _U32
+        cif, fn, rvalue, avalue = cif & U32, fn & U32, rvalue & U32, avalue & U32
         ctx = self.guest.cur[-1]
         sp = self.guest.ex["__stack_pointer"]
         orig = sp.value(ctx)
@@ -642,7 +642,7 @@ class Pyodide:
         return self.guest.table.grow(self.guest.cur[-1], 1, self._wt.Val.funcref(None))
 
     def _ffi_free(self, index: int) -> None:
-        index &= _U32
+        index &= U32
         self.closures_out -= 1
         self.functions.pop(index, None)
         self._ffi_release(index)
@@ -653,7 +653,7 @@ class Pyodide:
         """Puts a host function of the closure's signature into table slot `codeloc`; when the guest calls it, the
         arguments are written to the stack as libffi's `avalue` and `fun(cif, ret, args, user_data)` is called."""
         wt = self._wt
-        closure, cif, fun, user_data, codeloc = (x & _U32 for x in (closure, cif, fun, user_data, codeloc))
+        closure, cif, fun, user_data, codeloc = (x & U32 for x in (closure, cif, fun, user_data, codeloc))
         params, results, rk, info, ret_by_arg, nargs, nfixed = _cif.closure_signature(self._rd, wt, cif)
 
         # A wasmtime Func is never freed before its store, so closures reuse them: one per signature and per live
@@ -697,7 +697,7 @@ class Pyodide:
         cif, fun, user_data, ret_ptr, args_ptr, cur = _cif.closure_frame(self._rd, self._wr, state, a, orig)
         sp.set_value(ctx, cur & ~15)  # 16-aligned, as the compiled code expects
         try:
-            self._table_func(fun)(ctx, *(_to_wasm(x, "i32") for x in (cif, ret_ptr, args_ptr, user_data)))
+            self._table_func(fun)(ctx, *(to_wasm(x, "i32") for x in (cif, ret_ptr, args_ptr, user_data)))
         finally:
             sp.set_value(ctx, orig)
         return _cif.closure_result(self._rd, rk, ret_ptr)
@@ -726,7 +726,7 @@ class Pyodide:
     def _dl_depth(self) -> int:
         """How many NEEDED libraries the adapter may nest: what the wasm stack in force allows."""
         _engine.engine()
-        return _engine.depth_cap(_engine._STATE["wasm_stack"])
+        return _engine.depth_cap(_engine.STATE["wasm_stack"])
 
     def interrupt(self, signum: int = 2) -> None:
         """Post signal `signum` (SIGINT: KeyboardInterrupt) to the guest's Python, as JavaScript's
@@ -1058,7 +1058,7 @@ class Pyodide:
                 [
                     SNAPSHOT_VERSION,
                     self.flavor,
-                    [_engine._stamp(f.resolve()).decode() for f in files],
+                    [_engine.file_stamp(f.resolve()).decode() for f in files],
                     PYVER,
                     self.preload,
                     code_hash(Path(__file__).resolve().parent),

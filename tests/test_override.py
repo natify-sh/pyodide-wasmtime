@@ -200,7 +200,7 @@ def test_legacy_exceptions_are_converted_once(tmp_path: Path, monkeypatch: pytes
     done: list[Path] = []
     _engine.load_module(legacy, wasm_opt=opt, converted=done)
     assert (calls, done) == ([1], [legacy.resolve()])
-    _engine._STATE.clear()  # a new process: only the machine-code cache is left
+    _engine.STATE.clear()  # a new process: only the machine-code cache is left
     done.clear()
     _engine.load_module(legacy, wasm_opt=opt, converted=done)
     assert (calls, done) == ([1], [])

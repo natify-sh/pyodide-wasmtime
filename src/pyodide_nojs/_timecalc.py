@@ -7,7 +7,7 @@ import calendar
 import struct
 import time
 
-from ._consts import _U32, GUEST_ERRNO, Reader, Writer
+from ._consts import GUEST_ERRNO, U32, Reader, Writer
 
 # `_localtime_js`, `_mktime_js` and `_tzset_js` read the time zone of the process through `Date` (the host's: its
 # TZ and zoneinfo). Here the host's C library answers the offset at an instant (`time.localtime`), and the rest is
@@ -85,7 +85,7 @@ def year_minutes(year: int) -> tuple[int, int]:
 
 
 def t_localtime(wr: Writer, t: int, tm: int) -> int:
-    tm &= _U32
+    tm &= U32
     """tm_isdst and tm_gmtoff into the struct; the exact offset (s east) for the fields, or INT_MIN: an error."""
     if abs(t) > _DATE_LIMIT:
         return -(1 << 31)
@@ -104,7 +104,7 @@ def t_localtime(wr: Writer, t: int, tm: int) -> int:
 
 
 def t_mktime(rd: Reader, wr: Writer, tm: int) -> int:
-    tm &= _U32
+    tm &= U32
     sec, mi, hour, mday, mon, year, _wday, _yday, dst = struct.unpack("<9i", rd(tm, 36))
     lt = _js_make(year + 1900, mon, mday, hour, mi, sec)
     if lt is None:
@@ -133,7 +133,7 @@ def t_mktime(rd: Reader, wr: Writer, tm: int) -> int:
 
 
 def t_tzset(wr: Writer, timezone: int, daylight: int, std_name: int, dst_name: int) -> None:
-    timezone, daylight, std_name, dst_name = (x & _U32 for x in (timezone, daylight, std_name, dst_name))
+    timezone, daylight, std_name, dst_name = (x & U32 for x in (timezone, daylight, std_name, dst_name))
     winter, summer = year_minutes(time.localtime().tm_year)
 
     def zone(east: int) -> bytes:  # UTC-0200 for two hours east: the sign is of the offset as Date gives it (west)

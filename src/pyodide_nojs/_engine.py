@@ -17,7 +17,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-_STATE: dict[str, Any] = {}
+STATE: dict[str, Any] = {}
 
 
 def shutdown() -> None:
@@ -25,7 +25,7 @@ def shutdown() -> None:
     fail noisily during interpreter teardown). Registered with atexit."""
     import gc
 
-    _STATE.clear()
+    STATE.clear()
     gc.collect()
 
 
@@ -142,18 +142,18 @@ def _wasm_stack() -> int:
 
 def engine() -> Any:
     """One engine: exceptions (exnref), function references and GC are what Pyodide and the trampoline need."""
-    if "engine" not in _STATE:
+    if "engine" not in STATE:
         wt = require_wasmtime()
         cfg = wt.Config()
         cfg.wasm_exceptions = True
         cfg.wasm_function_references = True
         cfg.wasm_gc = True
-        _STATE["wasm_stack"] = cfg.max_wasm_stack = _wasm_stack()  # the loader's NEEDED recursion runs on it
-        _STATE["engine"] = wt.Engine(cfg)
-    return _STATE["engine"]
+        STATE["wasm_stack"] = cfg.max_wasm_stack = _wasm_stack()  # the loader's NEEDED recursion runs on it
+        STATE["engine"] = wt.Engine(cfg)
+    return STATE["engine"]
 
 
-def _stamp(path: Path) -> bytes:
+def file_stamp(path: Path) -> bytes:
     try:
         wt_version = version("wasmtime")
     except PackageNotFoundError:  # pragma: no cover
@@ -174,9 +174,9 @@ def load_module(
     keyed by the source file's stamp, so the conversion runs once per file."""
     wt = require_wasmtime()
     path = Path(path).resolve()
-    stamp = _stamp(path)
+    stamp = file_stamp(path)
     key = (str(path), stamp)
-    modules: dict = _STATE.setdefault("modules", {})
+    modules: dict = STATE.setdefault("modules", {})
     if key in modules:
         return modules[key]
     eng = engine()

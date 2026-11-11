@@ -8,7 +8,7 @@ from __future__ import annotations
 import struct
 from typing import Any
 
-from ._consts import GuestFault, Reader, Writer, _Big, _num, _to_wasm
+from ._consts import Big, GuestFault, Reader, Writer, num, to_wasm
 
 
 # ------------------------------------------------------------------ libffi's emscripten port: calls and closures
@@ -72,9 +72,9 @@ def call_args(rd: Reader, wr: Writer, cif: int, rvalue: int, avalue: int, cur: i
         elif tid in (7, 8):
             args.append(struct.unpack("<H" if tid == 7 else "<h", rd(ap, 2))[0])
         elif tid in (11, 12):
-            args.append(_Big(struct.unpack("<Q", rd(ap, 8))[0]))
+            args.append(Big(struct.unpack("<Q", rd(ap, 8))[0]))
         elif tid == 4:
-            args.extend(_Big(x) for x in struct.unpack("<QQ", rd(ap, 16)))
+            args.extend(Big(x) for x in struct.unpack("<QQ", rd(ap, 16)))
         elif tid == 13:
             size, align = struct.unpack("<IH", rd(tp, 6))
             cur = down(cur, size, align)
@@ -121,13 +121,13 @@ def store_result(wr: Writer, rvalue: int, rid: int, res: Any) -> None:
     if ret_by_arg:
         return
     if rid in (1, 9, 10, 14):
-        wr(rvalue, struct.pack("<I", _num(res, 32)))
+        wr(rvalue, struct.pack("<I", num(res, 32)))
     elif rid in (5, 6):
-        wr(rvalue, struct.pack("<B", _num(res, 8)))
+        wr(rvalue, struct.pack("<B", num(res, 8)))
     elif rid in (7, 8):
-        wr(rvalue, struct.pack("<H", _num(res, 16)))
+        wr(rvalue, struct.pack("<H", num(res, 16)))
     elif rid in (2, 3):
-        if isinstance(res, _Big):
+        if isinstance(res, Big):
             raise TypeError("Cannot mix BigInt and other types")
         x = float("nan") if res is None else float(res)
         try:
@@ -135,7 +135,7 @@ def store_result(wr: Writer, rvalue: int, rid: int, res: Any) -> None:
         except OverflowError:  # a float32 too large for it is an infinity
             wr(rvalue, struct.pack("<f", float("inf") if x > 0 else float("-inf")))
     elif rid in (11, 12):
-        if not isinstance(res, _Big):
+        if not isinstance(res, Big):
             raise TypeError(f"Cannot convert {res} to a BigInt")
         wr(rvalue, struct.pack("<Q", res & 0xFFFFFFFFFFFFFFFF))
 
@@ -254,9 +254,9 @@ def closure_result(rd: Reader, rk: str, ret_ptr: int) -> Any:
         return None
     raw = rd(ret_ptr, 8)
     if rk == "i":
-        return _to_wasm(struct.unpack("<I", raw[:4])[0], "i32")
+        return to_wasm(struct.unpack("<I", raw[:4])[0], "i32")
     if rk == "j":
-        return _to_wasm(_Big(struct.unpack("<Q", raw)[0]), "i64")
+        return to_wasm(Big(struct.unpack("<Q", raw)[0]), "i64")
     if rk == "d":
         return struct.unpack("<d", raw)[0]
     if rk == "f":

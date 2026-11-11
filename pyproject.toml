@@ -82,6 +82,10 @@ include = ["src", "tests", "tools"]
 exclude = ["tests/checks", "src/pyodide_nojs/guest/hostnet.py", "src/pyodide_nojs/guest/pyodide_lock.py", "**/.venv"]
 # strict is wasmhost's setting; the wasmtime-py calls in _host.py are untyped, so the standard mode is used here
 typeCheckingMode = "standard"
+# a component's `_state` is private to its class (tests/test_state_ownership.py checks who owns what); the tests
+# may reach for private names to fake a host or to patch an operation, src and the tools may not
+reportPrivateUsage = "error"
+executionEnvironments = [{ root = "tests", reportPrivateUsage = "none" }, { root = "." }]
 
 [tool.ruff]
 line-length = 120

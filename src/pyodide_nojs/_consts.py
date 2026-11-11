@@ -135,49 +135,49 @@ SERVICES = {
 # JavaScript's numbers, for the calls that Emscripten's glue makes as `wasmTable.get(fn)(...args)` (ffi_call_js, the
 # trampoline): an i32 parameter takes a Number (a fraction is cut, a missing value is 0), an i64 only a BigInt, a float
 # a Number (a missing value is NaN); anything else is a TypeError, as in JavaScript.
-class _Big(int):
+class Big(int):
     """A BigInt (what libffi's JavaScript reads for 64-bit values), as against a Number."""
 
 
-def _to_wasm(v: Any, t: str) -> Any:
+def to_wasm(v: Any, t: str) -> Any:
     if t == "i32":
-        if isinstance(v, _Big):
+        if isinstance(v, Big):
             raise TypeError("Cannot mix BigInt and other types")
         if isinstance(v, float):
             v = int(v) if v == v and abs(v) != float("inf") else 0
         v = (v or 0) & 0xFFFFFFFF
         return v - (1 << 32) if v >> 31 else v
     if t == "i64":
-        if not isinstance(v, _Big):
+        if not isinstance(v, Big):
             raise TypeError(f"Cannot convert {v} to a BigInt")
         v &= 0xFFFFFFFFFFFFFFFF
         return v - (1 << 64) if v >> 63 else v
     if t in ("f32", "f64"):
-        if isinstance(v, _Big):
+        if isinstance(v, Big):
             raise TypeError("Cannot mix BigInt and other types")
         return float("nan") if v is None else float(v)
     raise TypeError(f"a function parameter of type {t} cannot be called from a C signature")
 
 
-def _from_wasm(res: Any, results: list[str]) -> Any:
+def from_wasm(res: Any, results: list[str]) -> Any:
     """A wasm result as the JavaScript value: None (undefined) for no result, a BigInt for an i64."""
     if not results:
         return None
     if len(results) > 1:
         return float("nan")
-    return _Big(res) if results[0] == "i64" else res
+    return Big(res) if results[0] == "i64" else res
 
 
-def _num(v: Any, bits: int) -> int:
+def num(v: Any, bits: int) -> int:
     """A Number (or undefined) stored into an unsigned typed array of `bits`: cut, wrapped; a BigInt is a TypeError."""
-    if isinstance(v, _Big):
+    if isinstance(v, Big):
         raise TypeError("Cannot mix BigInt and other types")
     if isinstance(v, float):
         v = int(v) if v == v and abs(v) != float("inf") else 0
     return (v or 0) & ((1 << bits) - 1)
 
 
-_U32 = 0xFFFFFFFF
+U32 = 0xFFFFFFFF
 
 
 def code_hash(folder: Path) -> str:
@@ -202,7 +202,7 @@ def available_flavors(data: Path) -> list[str]:
     return have
 
 
-def _override(path: str | os.PathLike[str] | None, var: str) -> Path | None:
+def override_path(path: str | os.PathLike[str] | None, var: str) -> Path | None:
     """The file PATH, else $VAR (an asm_wasm or stdlib that replaces the data directory's): None if neither is set."""
     p = path or _engine.env(var)
     if not p:
@@ -253,7 +253,7 @@ def override_warnings(asm: Path | None, stdlib: Path | None, data: Path) -> tupl
     return warn, detail
 
 
-def _s32(x: int) -> int:
+def s32(x: int) -> int:
     """x as the signed i32 wasmtime-py wants for a parameter or a result."""
     x &= 0xFFFFFFFF
     return x - (1 << 32) if x >> 31 else x
@@ -285,5 +285,5 @@ class MainExports(Mapping):
 
 # exports of the adapter that only the host calls: the guest's dlsym and GOT do not see them (Pyodide has no such name)
 SERVICE_EXPORTS = ("__nojs_sigcell_addr", "__nojs_set_runtime")
-_JS_MODULES = ("env", "GOT.mem", "GOT.func", "wasi_snapshot_preview1")  # the glue's import object
-_GLOBAL_WHY = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
+JS_MODULES = ("env", "GOT.mem", "GOT.func", "wasi_snapshot_preview1")  # the glue's import object
+GLOBAL_WHY = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
