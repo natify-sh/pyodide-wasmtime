@@ -605,6 +605,10 @@ class Pyodide:
         )
         sp = root / "lib" / f"python{PYVER}" / "site-packages"
         sp.mkdir()
+        shutil.copy(Path(__file__).with_name("guest") / "pyodide_lock.py", sp)
+        lock = self.data / "pyodide-lock.json"  # Pyodide's package lock, for micropip (guest/pyodide_lock.py)
+        if lock.exists():
+            shutil.copy(lock, sp / "pyodide-lock.json")
         for s in self.site:  # inside the preopen: WASI does not follow a link out of it
             shutil.copytree(s, sp, dirs_exist_ok=True)
         for guest in self.mounts:  # a placeholder, so that a directory listing of the parent shows the mount
@@ -615,10 +619,6 @@ class Pyodide:
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
         (root / "etc" / "services").write_text("".join(f"{n} {p}/{pr}\n" for (n, pr), p in SERVICES.items()))
         shutil.copy(Path(__file__).with_name("guest") / "hostnet.py", sp)
-        shutil.copy(Path(__file__).with_name("guest") / "pyodide_lock.py", sp)
-        lock = self.data / "pyodide-lock.json"  # Pyodide's package lock, for micropip (guest/pyodide_lock.py)
-        if lock.exists():
-            shutil.copy(lock, sp / "pyodide-lock.json")
         # the frozen `encodings` package looks in /lib/python3.15/encodings, which does not exist: the stdlib is the
         # zip (Pyodide's JavaScript sets this up); without it every codec but the frozen ones is missing
         # Pyodide's _socket was built without the constant SO_REUSEADDR (musl's value is 2), which asyncio and

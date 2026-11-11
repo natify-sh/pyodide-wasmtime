@@ -2,7 +2,8 @@ name: Build wasm
 
 # Builds everything the package carries and the tests run against, once, for tests.yml and publish.yml:
 #   wasm-opt   Binaryen 132 as wasm32-wasip1 with wasi-sdk 34 (about 12 min; cached by the hash of its script, the wasi-sdk lines of fetch.sh and the npm Binaryen version)
-#   data       pyodide.asm.wasm (exnref), python_stdlib.zip, adapter.wasm (wasi-sdk's clang), pyodide_fused.wasm, wasm-opt.wasm
+#   data       pyodide.asm.wasm (exnref), python_stdlib.zip, adapter.wasm (wasi-sdk's clang), pyodide_fused.wasm, wasm-opt.wasm,
+#              pyodide-lock.json
 #   testenv    numpy, micropip, openssl, the real _ssl, the `test` wheel and python_tests.yaml (tools/prepare_testenv.sh)
 # Node is a build tool here (Binaryen's wasm-opt and wasm-merge from npm); the package needs none at run time.
 

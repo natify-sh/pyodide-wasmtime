@@ -16,24 +16,44 @@ def patch(compat, lock, base_url):
     layer.lockfile_info.update(lock["info"])
     layer.lockfile_base_url = compat.lockfile_base_url = base_url
 
-    async def loadPackage(names):
-        import hashlib
-        import site
+    if "_lock_done" not in layer.__dict__:
+        layer._lock_done = set()  # what loadPackage installed, so a later call does not repeat it
+    done = layer._lock_done
 
-        packages, todo, order = layer.lockfile_packages, [names] if isinstance(names, str) else list(names), []
-        while todo:  # the closure over `depends`, dependencies first
-            name = todo.pop().lower().replace("_", "-")
+    def closure(names):  # post-order depth-first: the dependencies of a package come before it; a cycle ends
+        packages, order, seen = layer.lockfile_packages, [], set()
+
+        def visit(name):
+            name = name.lower().replace("_", "-")
             if name not in packages:
                 raise ValueError(f"No known package with name {name!r}")
-            if name not in order:
-                order.insert(0, name)
-                todo.extend(packages[name]["depends"])
-        for name in order:
+            if name not in seen:
+                seen.add(name)
+                for dep in packages[name]["depends"]:
+                    visit(dep)
+                order.append(name)
+
+        for name in [names] if isinstance(names, str) else names:
+            visit(name)
+        return order
+
+    async def loadPackage(names):
+        import hashlib
+        import importlib.metadata
+        import site
+
+        packages = layer.lockfile_packages
+        for name in closure(names):
             pkg = packages[name]
             if pkg["package_type"] != "package":  # shared libraries and cpython modules need the JavaScript loader
                 raise NotImplementedError(f"{name}: package_type {pkg['package_type']!r} is not supported")
-            if name in layer.loadedPackages.to_py():
+            if name in done:
                 continue
+            try:
+                importlib.metadata.distribution(name)
+                continue  # already in the guest, from wherever: not overwritten (and numpy is not unpacked over itself)
+            except importlib.metadata.PackageNotFoundError:
+                pass
             url = base_url + pkg["file_name"]
             data = await layer.fetch_bytes(url, {})
             if hashlib.sha256(data).hexdigest() != pkg["sha256"]:
@@ -46,8 +66,26 @@ def patch(compat, lock, base_url):
             }
             await layer.install(data, pkg["file_name"], site.getsitepackages()[0], meta)
             setattr(layer.loadedPackages, name, "default channel")
+            done.add(name)
 
     layer.loadPackage = compat.loadPackage = staticmethod(loadPackage)
+
+
+class _Loader:
+    """The real loader, and `patch` after its exec_module (the original loader object is not touched: a zipimporter is shared)."""
+
+    def __init__(self, loader, after):
+        self._loader, self._after = loader, after
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        self._after(module)
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
 
 
 class _Hook:
@@ -57,21 +95,19 @@ class _Hook:
     def find_spec(self, name, path=None, target=None):
         if name != "micropip._compat":
             return None
-        import importlib.util
+        from importlib.machinery import PathFinder
 
-        sys.meta_path.remove(self)
-        spec = importlib.util.find_spec(name)
-        loader, exec_module = spec.loader, spec.loader.exec_module
-
-        def run(module):
-            import json
-
-            exec_module(module)
-            with open(self.lock_path) as f:
-                patch(module, json.load(f), self.base_url)
-
-        loader.exec_module = run
+        spec = PathFinder.find_spec(name, path)
+        if spec is not None:
+            spec.loader = _Loader(spec.loader, self._patch)
         return spec
+
+    def _patch(self, module):
+        import json
+
+        with open(self.lock_path) as f:
+            patch(module, json.load(f), self.base_url)
+        sys.meta_path.remove(self)  # only after a success: a failed import fails again the next time
 
 
 def hook(lock_path, base_url):
