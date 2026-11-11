@@ -18,7 +18,7 @@ Order inside a section is not a priority; the order of work is at the end.
 | D8 | Windows symlink fix needs a Windows run to isolate (hypothesis: wasmtime resolves the target from the root); skipped on win32 | documented in the audit |
 | D9 | Policy for the license/size of Pyodide artifacts in the wheel (carried now; alternative: download at first run); the owner opens the pull request | BRIEF.md |
 | D10 | The official suite stays red until fixed; what cannot be fixed becomes `xfail` with a reason | decided, see S1 |
-| D14 | Decided 2026-11-11: the guest STARTS in `/home/pyodide` (as Pyodide), not in `/`; the tests that assume `/` are fixed with it (snapshots too); `--mount-cwd` mounts at `/work` (one constant `CWD_MOUNT` in `_cli.py`); `inherit_env` protects only `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`; `sys.executable` stays `''` (Pyodide's value is a Node artifact: the `_` variable of its process): a documented difference, no work | decided; the cwd change is in batch B2 |
+| D14 | Decided 2026-11-11: the guest STARTS in `/home/pyodide` (as Pyodide), not in `/`; the tests that assume `/` are fixed with it (snapshots too); `--mount-cwd` mounts at `/host` (one constant `CWD_MOUNT` in `_cli.py`); `inherit_env` protects only `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`; `sys.executable` stays `''` (Pyodide's value is a Node artifact: the `_` variable of its process): a documented difference, no work | decided; the cwd change is in batch B2 |
 | D11 | When Pyodide 315 is released (now 315.0.0-alpha.2): bump the pin (tools/fetch.sh sha, `PYODIDE_VERSION`/`ABI`, `PYVER`) | later |
 
 Decided and written in BRIEF.md (do not reopen without a reason): dynamic is the default, fused stays in the wheel; sockets follow the host's kernel;

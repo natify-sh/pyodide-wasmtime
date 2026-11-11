@@ -139,7 +139,7 @@ def test_mount_cwd(guest: Guest, tmp_path: Path) -> None:
         cwd=tmp_path,
         stdin=subprocess.DEVNULL,
     )
-    assert (r.returncode, r.stdout.strip()) == (0, "/work hi"), r.stderr
+    assert (r.returncode, r.stdout.strip()) == (0, "/host hi"), r.stderr
     assert (tmp_path / "new.txt").read_text() == "x"
 
 

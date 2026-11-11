@@ -11,7 +11,7 @@ import sys
 from . import PYODIDE_ABI, PYODIDE_VERSION, __version__
 from ._host import FLAVORS, Pyodide
 
-CWD_MOUNT = "/work"  # where --mount-cwd puts the host's current folder
+CWD_MOUNT = "/host"  # where --mount-cwd puts the host's current folder
 
 # The REPL's console lives in the guest (state between lines); the host reads the lines (readline, or prompt_toolkit
 # when installed) and pushes each one. The guest tells the host in /_repl whether the line needs more.
