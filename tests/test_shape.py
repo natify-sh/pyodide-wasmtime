@@ -45,6 +45,8 @@ def test_fused_imports_only_wasi_loader_net():
     # own that the adapter answers first are the adapter's now), the loader's 18 operations (7 of the loader itself,
     # the depth cap among them, 5 of libffi and the trampoline's fallback, 3 of local time, the signal word and the
     # runtime's name, the CPU clocks), the 21 of the host's sockets and names, and the 1 of its files (statvfs)
+    # (the dynamic build's adapter.wasm imports 17 of the 18: `call_any` is the trampoline's, and there the trampoline
+    # is a separate module, which the fused build merges in)
     assert counts == {"wasi_snapshot_preview1": 34, "loader": 18, "net": 21, "fs": 1}
 
 
