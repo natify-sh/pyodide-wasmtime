@@ -761,3 +761,56 @@ def test_tmp_is_in_the_root_with_mode_777_and_tempfile_works(guest: Guest):
     )
     assert p.returncode == 0, p.stderr[-3000:]
     assert p.stdout.splitlines() == ["0o40777 /tmp", "/tmp 1 True", "[]"]
+
+
+def test_readv_writev_and_libcs_preadv_pwritev_use_every_buffer(guest: Guest):
+    check(
+        guest,
+        """
+def new(data=b'0123456789'):
+    with open(B + '/io', 'wb') as f:
+        f.write(data)
+    return os.open(B + '/io', os.O_RDWR)
+class Iov(ctypes.Structure):  # os has no preadv/pwritev here: libc's
+    _fields_ = [('b', ctypes.c_void_p), ('n', ctypes.c_size_t)]
+def libc_iov(name, fd, bufs, off):
+    arr = (Iov * len(bufs))(*[Iov(ctypes.addressof(x), len(x)) for x in bufs])
+    getattr(libc, name).restype = ctypes.c_ssize_t
+    return getattr(libc, name)(fd, arr, len(bufs), ctypes.c_longlong(off))
+def cbuf(data):
+    return ctypes.create_string_buffer(data, len(data))
+fd = new()
+a, b, c = bytearray(4), bytearray(4), bytearray(4)
+assert os.readv(fd, [a, b, c]) == 10 and (a, b, c[:2], c[2:]) == (b'0123', b'4567', b'89', b'\\0\\0'), (a, b, c)
+assert os.readv(fd, [bytearray(2), bytearray(2)]) == 0  # at the end
+a, b = cbuf(b'...'), cbuf(b'...')
+assert libc_iov('preadv', fd, [a, b], 2) == 6 and (a.raw, b.raw) == (b'234', b'567') and os.lseek(fd, 0, 1) == 10
+bs = [bytearray(1) for _ in range(1000)]  # 1000 one-byte buffers of a 2000-byte file
+fd = new(bytes(range(256)) * 8)
+assert os.readv(fd, bs) == 1000 and b''.join(bs) == (bytes(range(256)) * 8)[:1000]
+fd = new(b'abc')  # a short file: the bytes there are
+a, b = cbuf(b'..'), cbuf(b'..')
+assert libc_iov('preadv', fd, [a, b], 1) == 2 and (a.raw, b.raw) == (b'bc', b'..')
+fd = new(b'')
+assert os.writev(fd, [b'ab', b'cd', b'']) == 4 and os.lseek(fd, 0, 1) == 4
+assert os.writev(fd, [bytes([i % 256]) for i in range(1000)]) == 1000 and os.lseek(fd, 0, 1) == 1004
+assert libc_iov('pwritev', fd, [cbuf(b'XY'), cbuf(b'Z')], 1) == 3 and os.lseek(fd, 0, 1) == 1004
+d = open(B + '/io', 'rb').read()
+assert len(d) == 1004 and d[:4] == b'aXYZ' and d[4:9] == bytes([0, 1, 2, 3, 4]), d[:9]
+assert err(os.readv, 999, [bytearray(1), bytearray(1)]) == 'EBADF' and err(os.writev, 999, [b'a', b'b']) == 'EBADF'
+""",
+    )
+
+
+def test_pread_and_pwrite_of_millions_of_bytes_are_not_cut_short(guest: Guest):
+    check(
+        guest,
+        """
+fd = os.open(B + '/big', os.O_CREAT | os.O_RDWR)
+assert os.pwrite(fd, b'z' * 5_000_000, 3) == 5_000_000 and os.fstat(fd).st_size == 5_000_003
+assert len(os.pread(fd, 5_000_000, 0)) == 5_000_000
+d = os.pread(fd, 9_000_000, 5)  # to the end of the file, not past it
+assert len(d) == 4_999_998 and d == b'z' * 4_999_998
+assert os.pread(fd, 100, 5_000_003) == b'' and os.lseek(fd, 0, 1) == 0
+""",
+    )

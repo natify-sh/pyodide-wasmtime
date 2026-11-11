@@ -300,6 +300,32 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     return -28;  // EINVAL
 }
 
+// readv, writev, preadv, pwritev on a file: wasmtime uses only the first buffer of an iovec array, so the buffers are done
+// one by one (op 0 read, 1 write, 2 pread, 3 pwrite). A short count ends the call (the total so far is the result, an error
+// only when nothing was done); the offset kinds go on until the buffer is full or the file ends: wasmtime's pread and pwrite
+// do at most 64 KiB at a time.
+static i32 file_iov(i32 op, i32 fd, const u32 *iov, i32 n, u64 off, i32 *done) {
+    i32 tot = 0, e = 0;
+    u32 none[2] = {0, 0};  // no buffer: one call of length 0, so that a bad descriptor still says so
+    if (n == 0) iov = none, n = 1;
+    for (i32 k = 0; k < n && !e; k++) {
+        i32 len = (i32)iov[2 * k + 1], got = 0;
+        do {
+            u32 one[2] = {iov[2 * k] + (u32)got, (u32)(len - got)};
+            i32 r = 0;
+            e = op == 0 ? w_fd_read(fd, one, 1, &r) : op == 1 ? w_fd_write(fd, one, 1, &r) : op == 2 ? w_fd_pread(fd, one, 1, off + (u64)(tot + got), &r) : w_fd_pwrite(fd, one, 1, off + (u64)(tot + got), &r);
+            if (e || r <= 0) break;
+            got += r;
+            if (op < 2) break;
+        } while (got < len);
+        tot += got;
+        if (got < len) break;
+    }
+    if (e && tot) e = 0;
+    *done = tot;
+    return e;
+}
+
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     if (is_pre(fd)) return FE_BADF;
@@ -307,7 +333,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     for (i32 k = 0; k < n; k++) empty &= !iov[2 * k + 1];
     if (empty && !is_virt(fd) && fd_std(rfd(fd))) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
     if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
-    if (!is_sock(fd)) return w_fd_read(rfd(fd), iov, n, nread);
+    if (!is_sock(fd)) return n <= 1 ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread);
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
@@ -327,7 +353,7 @@ WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     if (is_pre(fd)) return FE_BADF;
     if (is_pipe(fd)) return pipe_write(vobj(fd), iov, n, nw);
-    if (!is_sock(fd)) return w_fd_write(rfd(fd), iov, n, nw);
+    if (!is_sock(fd)) return n <= 1 ? w_fd_write(rfd(fd), iov, n, nw) : file_iov(1, rfd(fd), iov, n, 0, nw);
     if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
@@ -363,11 +389,11 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
 WASI("fd_sync") i32 w_fd_sync(i32 fd);
 EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
-    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pread(rfd(fd), iov, n, off, nread);
+    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : file_iov(2, rfd(fd), (const u32 *)iov, n, off, nread);
 }
 EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;
-    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pwrite(rfd(fd), iov, n, off, nw);
+    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : file_iov(3, rfd(fd), (const u32 *)iov, n, off, nw);
 }
 EXPORT("fd_sync") i32 x_fd_sync(i32 fd) {
     if (is_pre(fd)) return FE_BADF;
