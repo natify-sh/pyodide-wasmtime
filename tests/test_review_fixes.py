@@ -277,11 +277,16 @@ def test_descriptors_work_after_many_files_were_opened_and_closed(guest: Guest) 
     code = """
 import os, socket, time
 open('/tmp/g.txt', 'w').close()
+t = time.perf_counter()
+for _ in range(5): os.close(os.dup(2))
+base = time.perf_counter() - t                          # the same machine before the churn
 L = [os.open('/tmp/g.txt', os.O_RDONLY) for _ in range(1200)]
 for x in L: os.close(x)
 t = time.perf_counter()
 for _ in range(5): os.close(os.dup(2))
-print(time.perf_counter() - t < 3)  # 0.04-0.09 s; it was 18 s when every placeholder held the high numbers again
+# 0.04-0.09 s after the churn; 18 s when every placeholder held the high numbers again: the bound is far from both
+# (and from a stall of a loaded runner: an absolute 3 s failed once on a shared one)
+print(time.perf_counter() - t < max(30 * base, 5.0))
 print(os.dup(2) > 2, len(os.pipe()), socket.socket().fileno() > 2)
 """
     r = guest.run(code)
