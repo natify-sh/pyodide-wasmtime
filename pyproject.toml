@@ -47,6 +47,7 @@ packages = ["pyodide_nojs", "pyodide_nojs.guest"]
 
 [tool.setuptools.package-data]
 pyodide_nojs = ["py.typed", "data/*.wasm", "data/*.zip", "data/*.json"]
+"pyodide_nojs.guest" = ["*.py", "*.pth"]
 
 [tool.setuptools_scm]
 fallback_version = "0.0.0"
@@ -78,7 +79,7 @@ markers = [
 [tool.pyright]
 include = ["src", "tests", "tools"]
 # guest programs run inside Pyodide, where numpy, micropip, cffi... are not this environment's
-exclude = ["tests/checks", "src/pyodide_nojs/guest", "**/.venv"]
+exclude = ["tests/checks", "src/pyodide_nojs/guest/hostnet.py", "src/pyodide_nojs/guest/pyodide_lock.py", "**/.venv"]
 # strict is wasmhost's setting; the wasmtime-py calls in _host.py are untyped, so the standard mode is used here
 typeCheckingMode = "standard"
 

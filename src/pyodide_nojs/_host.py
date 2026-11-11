@@ -44,12 +44,10 @@ from . import _engine, _wasm
 log = logging.getLogger("pyodide_nojs")
 
 PYVER = "3.15"  # the Python of the pinned Pyodide (315.0.0-alpha.2 = 3.15.0rc1)
-LOCK_BASE = (
-    "https://cdn.jsdelivr.net/pyodide/v315.0.0a2/full/"  # where the wheels of the lock are (bump with the release)
-)
 PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited constant in the pinned pyodide.asm.wasm
 FLAVORS = ("fused", "dynamic")
 DATA = Path(__file__).resolve().parent / "data"
+GUEST = Path(__file__).resolve().parent / "guest"  # Python that runs in the guest: copied to its site-packages
 
 # The guest's whole environment (the host's is never passed unless `inherit_env`): what Pyodide has on Node
 # (Emscripten's USER, LOGNAME, PATH, PWD, LANG; HOME from its loader), and LD_LIBRARY_PATH (where NEEDED are sought).
@@ -222,48 +220,6 @@ SERVICES = {
     )  # fmt: skip
     for pr in prs.split()
 }
-
-
-# Run at every start: /tmp and /home/pyodide are 0o777 in Pyodide, and the guest's modes are the adapter's own
-# records, not the host's; stdout is line buffered, as Pyodide's (a line printed before a trap or os._exit is kept);
-# '' first in sys.path as Pyodide's JavaScript puts it after the init (not with PYTHONSAFEPATH); with site= the
-# user's packages come before the stdlib zip (a real _ssl over the zip's stub, as before).
-_AT_START = (
-    "def _start(site_first):\n"  # a function: nothing of it stays in __main__
-    "    import os, sys\n"
-    "    for d in ('/tmp', '/home/pyodide'): os.chmod(d, 0o777)\n"
-    "    sys.stdout.reconfigure(line_buffering=True)\n"
-    "    if not sys.flags.safe_path and sys.path[:1] != ['']: sys.path.insert(0, '')\n"  # also run after a restore
-    f"    sp = '/lib/python{PYVER}/site-packages'\n"
-    "    if site_first and sp in sys.path:\n"
-    "        sys.path.remove(sp)\n"
-    "        sys.path.insert(0 if sys.flags.safe_path else 1, sp)\n"
-)
-
-# What the guest runs for one `run()`: the user's code in __main__, SystemExit as an exit status (the interpreter must
-# survive it: Emscripten's exit() ends in `unreachable`), any other error as a traceback and status 1.
-_WRAPPER = """\
-import sys as _s, __main__ as _m, traceback as _t
-_rc = 0
-_f = _k = None
-try:
-    with open({src!r}) as _f: _k = compile(_f.read(), "<string>", "exec")
-    exec(_k, _m.__dict__)
-except SystemExit as _e:
-    _c = _e.code
-    if _c is None: _rc = 0
-    elif isinstance(_c, int): _rc = int(_c) & 255 if -2**63 <= _c < 2**63 else 255
-    else: print(_c, file=_s.stderr); _rc = 1
-except BaseException:
-    _rc = 1
-    if _s.excepthook is _s.__excepthook__: _t.print_exc()
-    else:
-        try: _s.excepthook(*_s.exc_info())
-        except BaseException: _t.print_exc()
-_s.stdout.flush(); _s.stderr.flush()
-with open({rc!r}, "w") as _f: _f.write(str(_rc))
-del _s, _m, _t, _rc, _f, _k
-"""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -594,7 +550,9 @@ class Pyodide:
         )
         sp = root / "lib" / f"python{PYVER}" / "site-packages"
         sp.mkdir()
-        shutil.copy(Path(__file__).with_name("guest") / "pyodide_lock.py", sp)
+        for g in GUEST.iterdir():  # before the site= folders: a file of the same name there wins
+            if g.suffix in (".py", ".pth"):
+                shutil.copy(g, sp)
         lock = self.data / "pyodide-lock.json"  # Pyodide's package lock, for micropip (guest/pyodide_lock.py)
         if lock.exists():
             shutil.copy(lock, sp / "pyodide-lock.json")
@@ -607,18 +565,6 @@ class Pyodide:
         (root / "etc" / "ssl").mkdir(parents=True)
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
         (root / "etc" / "services").write_text("".join(f"{n} {p}/{pr}\n" for (n, pr), p in SERVICES.items()))
-        shutil.copy(Path(__file__).with_name("guest") / "hostnet.py", sp)
-        # Pyodide's _socket was built without the constant SO_REUSEADDR (musl's value is 2), which asyncio and
-        # socketserver look up; setsockopt itself is real (tools/patch_main.mjs)
-        (sp / "sitecustomize.py").write_text(
-            "import _socket\n_socket.SO_REUSEADDR = 2\n"
-            + (
-                "import pyodide_lock\n"
-                f"pyodide_lock.hook('/lib/python{PYVER}/site-packages/pyodide-lock.json', {LOCK_BASE!r})\n"
-                if lock.exists()
-                else ""
-            )
-        )
 
     def _drop_stubs(self) -> None:
         """The fused module exports the zero/null stubs of the JavaScript bridge (the merge made them functions);
@@ -2420,7 +2366,7 @@ class Pyodide:
         return list(env.items())
 
     def _at_start(self) -> str:
-        return _AT_START + f"_start({bool(self.site)!r})\ndel _start\n"
+        return f"__import__('pyodide_nojs_run').start({bool(self.site)!r})\n"
 
     def _guest_cstr(self, b: bytes) -> int:
         store = self.store
@@ -2462,14 +2408,14 @@ class Pyodide:
                     PYVER,
                     self.preload,
                     hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                    hashlib.sha256(Path(__file__).with_name("guest").joinpath("hostnet.py").read_bytes()).hexdigest(),
-                    [
-                        hashlib.sha256(f.read_bytes()).hexdigest() if f.exists() else None
-                        for f in (
-                            Path(__file__).with_name("guest") / "pyodide_lock.py",
-                            self.data / "pyodide-lock.json",
+                    hashlib.sha256(
+                        b"".join(
+                            g.name.encode() + b"\0" + g.read_bytes() for g in sorted(GUEST.iterdir()) if g.is_file()
                         )
-                    ],
+                    ).hexdigest(),
+                    hashlib.sha256(f.read_bytes()).hexdigest()
+                    if (f := self.data / "pyodide-lock.json").exists()
+                    else None,
                     self._wasi_env(),
                     self.preopen_dev,
                     [isatty(fd) for fd in (0, 1, 2)],  # the guest decides buffering at init
@@ -2625,7 +2571,7 @@ class Pyodide:
         pre = f"import sys; sys.argv = {list(argv)!r}\n" if argv is not None else ""
         (self.root / f"_pw_{self._runs}.py").write_text(pre + code)
         rc_file = f"/_pw_{self._runs}.rc"
-        wrapper = _WRAPPER.format(src=f"/_pw_{self._runs}.py", rc=rc_file)
+        wrapper = f"__import__('pyodide_nojs_run').run({f'/_pw_{self._runs}.py'!r}, {rc_file!r})\n"
         src = wrapper.encode() + b"\0"
         store = self.store
         p = self.ex["PyMem_Malloc"](store, len(src))

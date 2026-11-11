@@ -217,7 +217,7 @@ def test_a_failed_hook_fails_the_import_every_time(guest: Guest):
 
 def test_the_lock_base_is_the_pinned_release():
     from pyodide_nojs import PYODIDE_VERSION
-    from pyodide_nojs._host import LOCK_BASE
+    from pyodide_nojs.guest.pyodide_nojs_start import LOCK_BASE
 
     assert LOCK_BASE == f"https://cdn.jsdelivr.net/pyodide/v{PYODIDE_VERSION.replace('-alpha.', 'a')}/full/"
 

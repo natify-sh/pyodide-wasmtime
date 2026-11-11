@@ -340,6 +340,14 @@ def test_site_folders_come_before_the_stdlib_zip(guest: Guest, tmp_path: Path) -
     assert r.stdout.splitlines() == ["['/lib/python315.zip', '/lib/python3.15/lib-dynload']", "None"], r.stderr
 
 
+def test_a_site_folders_own_sitecustomize_runs_beside_ours(guest: Guest, tmp_path: Path) -> None:
+    """Our start code is a .pth, so a `site=` folder's sitecustomize.py is not overwritten: both run."""
+    (tmp_path / "sitecustomize.py").write_text("MARK = 'user sitecustomize'\n")
+    code = "import sitecustomize, socket; print(sitecustomize.MARK, socket.SO_REUSEADDR)"
+    r = guest.run(code, None, "--site", str(tmp_path))
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["user sitecustomize 2"]), r.stderr
+
+
 def test_frozen_modules_follow_the_stdlib_dir(guest: Guest) -> None:
     """CI of cb1f608: `sys._stdlib_dir` is the zip (as Pyodide's), but the frozen modules were laid out under
     /lib/python3.15 at init; a fresh import of importlib (the tests of importlib do it) asserted they agree."""

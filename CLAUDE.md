@@ -17,7 +17,7 @@ The maintainer communicates in Ukrainian; code, comments, commit messages and do
   (`wasm-opt`, `wasm-merge`) exist only in the build (`tools/*.sh`) and in CI. (The owner, 2026-11-10.)
 * **One toolchain: wasi-sdk 34's clang** builds every wasm we build (`adapter.wasm`, `wasm-opt.wasm`, the guest's `_ssl`); no `clang` from the system. (The owner, 2026-11-10.)
 * **Both packagings are tested** wherever a test runs, and **Pyodide's official test suite** (`tests/test_pyodide_suite.py`, `python_tests.yaml`, libregrtest) runs on both, locally and in CI. A feature that works on one only is not done. (The owner, 2026-11-10.)
-* **The supported Pyodide is pinned in `package.json`** (Dependabot tracks it); the adapter answers that build's `env` imports. A bump needs the new release sha in `tools/fetch.sh`, `PYODIDE_VERSION`/`PYODIDE_ABI`/`LOCK_BASE` (the jsDelivr URL of the lock and wheels, `_host.py`)
+* **The supported Pyodide is pinned in `package.json`** (Dependabot tracks it); the adapter answers that build's `env` imports. A bump needs the new release sha in `tools/fetch.sh`, `PYODIDE_VERSION`/`PYODIDE_ABI`/`LOCK_BASE` (the jsDelivr URL of the lock and wheels, `guest/pyodide_nojs_start.py`)
   in `src/pyodide_nojs/__init__.py`, `PYVER` if Python changes, and a green CI on both packagings.
 * **State lives in the `Pyodide` object, never in module globals**: two interpreters in one process must work (`test_two_interpreters_in_one_process`).
 * **What cannot work is reported, not faked**: an import the adapter does not answer is a stub that returns 0/null (the JavaScript bridge: documented in BRIEF.md); a missing build or engine is an error that says what to run.
