@@ -183,11 +183,9 @@ _U32 = 0xFFFFFFFF
 def code_hash(folder: Path) -> str:
     """A digest of the host's Python: every module directly in `folder` (the package) but `_version.py` (made at
     build time), by name and content. Part of a snapshot's key: a change of any host module invalidates snapshots."""
-    return hashlib.sha256(
-        b"".join(
-            f.name.encode() + b"\0" + f.read_bytes() for f in sorted(folder.glob("*.py")) if f.name != "_version.py"
-        )
-    ).hexdigest()
+    mods = (f for f in sorted(folder.glob("*.py")) if f.name != "_version.py" and not f.name.startswith("."))
+    # not a dotfile (an editor's dangling lock symlink such as Emacs's `.#_host.py`) and a real file
+    return hashlib.sha256(b"".join(f.name.encode() + b"\0" + f.read_bytes() for f in mods if f.is_file())).hexdigest()
 
 
 def data_dir(path: str | os.PathLike[str] | None = None) -> Path:

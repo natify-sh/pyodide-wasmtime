@@ -138,6 +138,19 @@ def test_key_changes_with_stdlib_stamp_and_dev(flavor, cache, monkeypatch):
     assert Pyodide(flavor, preload=PRE)._snapshot_path() != base
 
 
+def test_the_code_hash_ignores_an_editors_dangling_lock_symlink(tmp_path):
+    """Review of the split: `.#_host.py` (an Emacs lock, a dangling symlink) in the package folder must not break the key."""
+    from pyodide_nojs._consts import code_hash
+
+    (tmp_path / "a.py").write_text("x = 1\n")
+    before = code_hash(tmp_path)
+    try:
+        (tmp_path / ".#a.py").symlink_to(tmp_path / "gone")
+    except OSError:  # Windows without the privilege to link
+        pytest.skip("cannot make a symlink here")
+    assert code_hash(tmp_path) == before
+
+
 def test_key_covers_every_host_module(flavor, cache, monkeypatch, tmp_path):
     """The host is several modules: touching or adding any of them (not `_version.py`, made at build time) changes the
     digest that is part of the key, and the key takes that digest."""
