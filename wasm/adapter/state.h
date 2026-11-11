@@ -14,12 +14,24 @@ static inline u64 *state_get(void) {
 static inline void state_set(u64 *v) {
     __asm__ volatile("local.get %0\n\tglobal.set adapter_state" : : "r"(v));
 }
-// per descriptor: the next fd_readdir cookie (a table that grows with the descriptor numbers)
+// per descriptor of a directory: the snapshot of its listing (a table that grows with the descriptor numbers). Pyodide's
+// getdents reads the names once and serves them by the position; so does this: `buf` holds the WASI dirent records of the
+// whole directory ({d_next u64, d_ino u64, d_namlen u32, d_type u8, name}, `len` bytes), read at the first getdents64,
+// `off` is the directory's position as lseek and getdents64 see it (entry index * DIR_STEP, Emscripten's struct size),
+// (cpos, cidx) the byte position of entry number cidx, so that reading in order does not walk the records again.
+#define DIR_STEP 280
+typedef struct {
+    u8 *buf;
+    u32 len, cpos, cidx;
+    u64 off;
+    i32 loaded;
+} Snap;
 typedef struct {
     u32 cap;
-    u64 *v;
+    Snap **v;
 } Ck;
-static u64 *ckp(i32 fd) {  // 0 when out of memory
+static Snap **snp(i32 fd) {  // the slot of the descriptor (0 when out of memory or fd is no number)
+    if (fd < 0) return 0;
     Ck *c = (Ck *)state_get();
     if (!c) {
         c = (Ck *)calloc(1, sizeof(Ck));
@@ -29,7 +41,7 @@ static u64 *ckp(i32 fd) {  // 0 when out of memory
     if ((u32)fd >= c->cap) {
         u32 nc = c->cap ? c->cap : 256;
         while (nc <= (u32)fd) nc *= 2;
-        u64 *nv = (u64 *)calloc(nc, 8);
+        Snap **nv = (Snap **)calloc(nc, sizeof(Snap *));
         if (!nv) return 0;
         for (u32 i = 0; i < c->cap; i++) nv[i] = c->v[i];
         if (c->v) free(c->v);
@@ -37,6 +49,14 @@ static u64 *ckp(i32 fd) {  // 0 when out of memory
         c->cap = nc;
     }
     return &c->v[fd];
+}
+static void snap_free(i32 fd) {
+    Snap **sp = snp(fd);
+    if (sp && *sp) {
+        if ((*sp)->buf) free((*sp)->buf);
+        free(*sp);
+        *sp = 0;
+    }
 }
 
 static i32 slen(const char *p) {

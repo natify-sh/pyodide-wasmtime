@@ -814,3 +814,71 @@ assert len(d) == 4_999_998 and d == b'z' * 4_999_998
 assert os.pread(fd, 100, 5_000_003) == b'' and os.lseek(fd, 0, 1) == 0
 """,
     )
+
+
+def test_a_big_directory_lists_every_name_once_and_fast(guest: Guest):
+    # 3000 names took about 4 s when every getdents asked WASI from the cookie again (the listing is a snapshot now)
+    check(
+        guest,
+        """
+import time
+os.mkdir(B + '/big')
+want = ['f%04d' % i for i in range(3000)]
+for n in want:
+    open(B + '/big/' + n, 'w').close()
+t = time.perf_counter()
+assert sorted(os.listdir(B + '/big')) == want
+names = [e.name for e in os.scandir(B + '/big')]
+assert sorted(names) == want
+assert sum(len(f) for _, _, f in os.walk(B + '/big')) == 3000
+took = time.perf_counter() - t
+assert took < 3, took
+""",
+    )
+
+
+def test_files_created_while_scandir_runs_are_not_listed_twice(guest: Guest):
+    check(
+        guest,
+        """
+os.mkdir(B + '/m')
+want = {'f%02d' % i for i in range(25)}
+for n in want:
+    open(B + '/m/' + n, 'w').close()
+got = []
+for k, e in enumerate(os.scandir(B + '/m')):
+    got.append(e.name)
+    if k == 3:
+        for i in range(500):
+            open(B + '/m/new%03d' % i, 'w').close()
+assert len(got) == len(set(got)) and set(got) == want, (len(got), len(set(got)))
+""",
+    )
+
+
+def test_rewinddir_and_lseek_of_a_directory_read_the_listing_again(guest: Guest):
+    check(
+        guest,
+        """
+os.mkdir(B + '/r')
+for i in range(5):
+    open(B + '/r/f%d' % i, 'w').close()
+fd = os.open(B + '/r', os.O_RDONLY | os.O_DIRECTORY)
+assert len(os.listdir(fd)) == 5
+open(B + '/r/added', 'w').close()
+os.rename(B + '/r/f0', B + '/r/renamed')
+assert sorted(os.listdir(fd)) == ['added', 'f1', 'f2', 'f3', 'f4', 'renamed']  # listdir(fd) rewinds first
+assert os.lseek(fd, 0, 1) == 0  # and again at the end
+libc.fdopendir.restype = libc.readdir.restype = ctypes.c_void_p
+libc.fdopendir.argtypes = [ctypes.c_int]
+libc.readdir.argtypes = [ctypes.c_void_p]
+d = libc.fdopendir(os.dup(fd))
+n = 0
+while libc.readdir(d):
+    n += 1
+assert n == 8 and os.lseek(fd, 0, 1) == 8 * 280  # the dup shares the position: Pyodide's step is 280 per entry
+os.lseek(fd, 0, 0)
+os.unlink(B + '/r/added')
+assert sorted(os.listdir(fd)) == ['f1', 'f2', 'f3', 'f4', 'renamed']
+""",
+    )

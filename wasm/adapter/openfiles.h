@@ -34,6 +34,7 @@ static const char *fd_base_path(i32 fd) {  // the path of a directory descriptor
 }
 static char *absdup(i32 dirfd, const char *path);
 static void fd_forget(i32 fd) {
+    snap_free(fd);  // the directory listing of the number, if it was read
     if (fd >= 0 && fd < MAXFD && fds()->path[fd]) {
         free(fds()->path[fd]);
         fds()->path[fd] = 0;
@@ -45,9 +46,9 @@ static void fd_move_meta(i32 from, i32 to) {
     fd_forget(to);
     fds()->path[to] = fds()->path[from], fds()->flags[to] = fds()->flags[from];
     fds()->path[from] = 0;
-    if (!ckp(from > to ? from : to)) return;  // the table grows (and moves) here, not between the two pointers
-    u64 *a = ckp(from), *b = ckp(to);
-    if (a && b) *b = *a, *a = 0;
+    if (!snp(from > to ? from : to)) return;  // the table grows (and moves) here, not between the two pointers
+    Snap **a = snp(from), **b = snp(to);
+    if (a && b) *b = *a, *a = 0;  // (fd_forget(to) freed the target's)
 }
 // is a descriptor (other than `skip`) that this adapter opened still open on the file (dev, ino)?
 static i32 fd_open_inode(u64 dev, u64 ino, i32 skip) {
@@ -498,9 +499,8 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
         u64 fs[8];
         if (!w_fd_filestat_get(out, fs)) meta_created((const u8 *)fs, mode, 07777);
     }
+    snap_free(out);  // a new descriptor lists its directory from the start
     if (out >= 0 && out < MAXFD) {
-        u64 *ck = ckp(out);
-        if (ck) *ck = 0;  // a new descriptor lists its directory from the start
         fd_forget(out);
         char *copy = absdup(dirfd, path);  // the path mmap opens again, of any length
         if (copy) {
@@ -586,44 +586,99 @@ EXPORT("__syscall_faccessat") i32 sc_faccessat(i32 dirfd, const char *path, i32 
     return 0;
 }
 
+// The listing of a directory is read once, whole, at the first getdents64 of its descriptor, and served from that snapshot by
+// the position (Pyodide's glue does the same with FS.readdir): an entry comes exactly once, files made or removed after it
+// are not seen, and a big directory is not asked from WASI again for every few entries (wasmtime lists the host directory
+// from the start at every fd_readdir call). lseek(fd, 0, SEEK_SET) (rewinddir) drops it, so the next read sees the
+// directory as it is then.
+static Snap *snap_get(i32 fd) {
+    Snap **sp = snp(fd);
+    if (sp && !*sp) *sp = (Snap *)calloc(1, sizeof(Snap));
+    return sp ? *sp : 0;
+}
+static void snap_drop(Snap *s) {
+    if (s->buf) free(s->buf);
+    s->buf = 0, s->len = s->cpos = s->cidx = 0, s->loaded = 0;
+}
+// WASI errno, 0 or ENOMEM
+static i32 snap_load(i32 fd, Snap *s) {
+    snap_drop(s);
+    const i32 ch = 1 << 20;  // one call for about 30,000 names: wasmtime lists the directory again for every call
+    u8 *tmp = (u8 *)malloc((u32)ch);
+    if (!tmp) return ENOMEM;
+    u32 cap = 0;
+    u64 cookie = 0;
+    i32 e = 0;
+    for (;;) {
+        i32 used = 0, in = 0;
+        e = w_fd_readdir(fd, tmp, ch, cookie, &used);
+        if (e) break;
+        while (in + 24 <= used) {
+            u32 nl = *(u32 *)(tmp + in + 16), rl = 24 + nl;
+            if (in + (i32)rl > used) break;  // a truncated last entry: read it again from its cookie
+            if (s->len + rl > cap) {
+                u32 nc = cap ? cap * 2 : 8192;
+                while (nc < s->len + rl) nc *= 2;
+                u8 *nb = (u8 *)malloc(nc);
+                if (!nb) {
+                    e = ENOMEM;
+                    break;
+                }
+                for (u32 i = 0; i < s->len; i++) nb[i] = s->buf[i];
+                if (s->buf) free(s->buf);
+                s->buf = nb, cap = nc;
+            }
+            for (u32 i = 0; i < rl; i++) s->buf[s->len + i] = tmp[in + (i32)i];
+            s->len += rl;
+            cookie = *(u64 *)(tmp + in);
+            in += (i32)rl;
+        }
+        if (e || used < ch || in == 0) break;
+    }
+    free(tmp);
+    if (e) {
+        snap_drop(s);
+        return e;
+    }
+    s->loaded = 1;
+    return 0;
+}
+
 // WASI dirents {d_next u64, d_ino u64, d_namlen u32, d_type u8, name} -> linux_dirent64
-// {d_ino u64, d_off i64, d_reclen u16, d_type u8, name\0, padded to 8}
+// {d_ino u64, d_off i64, d_reclen u16, d_type u8, name\0, padded to 8}. The position is the index of the next entry times
+// DIR_STEP and d_off the one after the entry (the glue's numbers: what lseek(fd, 0, SEEK_CUR) says on a directory).
 EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
     if (fd < 0 || is_pre(fd)) return -EBADF;
     if (is_virt(fd)) return -FE_NOTDIR;
     fd = rfd(fd);
-    u64 *ck = ckp(fd);
-    if (!ck) return -ENOMEM;
-    i32 cap = count + 512;
-    u8 *tmp = (u8 *)malloc((u32)cap);
-    if (!tmp) return -ENOMEM;
-    i32 used = 0;
-    i32 e = w_fd_readdir(fd, tmp, cap, *ck, &used);
-    if (e) {
-        free(tmp);
-        return -e;
+    Snap *s = snap_get(fd);
+    if (!s) return -ENOMEM;
+    if (!s->loaded) {
+        i32 e = snap_load(fd, s);
+        if (e) return -e;
     }
-    i32 in = 0, out = 0;
-    while (in + 24 <= used) {
-        u64 next = *(u64 *)(tmp + in), ino = *(u64 *)(tmp + in + 8);
-        u32 nl = *(u32 *)(tmp + in + 16);
-        u8 wt = tmp[in + 20];
-        if (in + 24 + (i32)nl > used) break;  // a truncated last entry: read it again next time
+    u64 idx = s->off / DIR_STEP;
+    if (idx < s->cidx) s->cpos = s->cidx = 0;
+    while (s->cidx < idx && s->cpos + 24 <= s->len) s->cpos += 24 + *(u32 *)(s->buf + s->cpos + 16), s->cidx++;
+    if (s->cidx < idx) return 0;  // past the end
+    i32 out = 0;
+    while (s->cpos + 24 <= s->len) {
+        const u8 *r = s->buf + s->cpos;
+        u32 nl = *(u32 *)(r + 16);
         i32 reclen = (19 + (i32)nl + 1 + 7) & ~7;
         if (out + reclen > count) break;
-        u8 *d = dirp + out;
-        *(u64 *)(d + 0) = ino;
-        *(i64 *)(d + 8) = (i64)next;
+        u8 wt = r[20], *d = dirp + out;
+        *(u64 *)(d + 0) = *(const u64 *)(r + 8);
+        *(i64 *)(d + 8) = (i64)(s->cidx + 1) * DIR_STEP;
         *(u16 *)(d + 16) = (u16)reclen;
         d[18] = wt == 3 ? 4 : wt == 4 ? 8 : wt == 7 ? 10 : wt == 2 ? 2 : wt == 1 ? 6 : 0;
-        for (u32 i = 0; i < nl; i++) d[19 + i] = tmp[in + 24 + i];
+        for (u32 i = 0; i < nl; i++) d[19 + i] = r[24 + i];
         for (i32 i = 19 + (i32)nl; i < reclen; i++) d[i] = 0;
         out += reclen;
-        *ck = next;
-        in += 24 + (i32)nl;
+        s->cpos += 24 + nl, s->cidx++;
     }
-    free(tmp);
-    if (out == 0 && in + 24 <= used) return -22;  // EINVAL: the buffer cannot hold one entry
+    if (out == 0 && s->cpos + 24 <= s->len) return -22;  // EINVAL: the buffer cannot hold one entry
+    s->off = (u64)s->cidx * DIR_STEP;
     return out;
 }
 
@@ -700,8 +755,8 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
     }
 }
 
-// lseek on a descriptor: a directory keeps its readdir cookie here (rewinddir is SEEK_SET 0, seekdir/telldir use the
-// d_off of the entries, getdents64 continues from it); the others go to WASI. Sockets can not seek.
+// lseek on a descriptor: a directory keeps its position in its listing here (rewinddir is SEEK_SET 0 and reads the listing
+// again, seekdir/telldir use the d_off of the entries, getdents64 continues from it); the others go to WASI. Sockets can not seek.
 EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
     if (off > (1ll << 53) || off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
     if (is_pre(fd)) return FE_BADF;
@@ -715,11 +770,12 @@ EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
     if (e != FE_BADF) return e;  // WASI refuses a directory descriptor (EBADF): that one is ours
     u8 st[24] __attribute__((aligned(8)));
     if (w_fd_fdstat_get(fd, st) || st[0] != 3) return e;
-    u64 *ck = ckp(fd);
-    if (!ck) return ENOMEM;
-    i64 pos = whence == 1 ? (i64)*ck + off : off;  // SEEK_SET, SEEK_END (a directory has no size: as SET), SEEK_CUR
+    Snap *s = snap_get(fd);
+    if (!s) return ENOMEM;
+    i64 pos = whence == 1 ? (i64)s->off + off : off;  // SEEK_SET, SEEK_END (a directory has no size: as SET), SEEK_CUR
     if (whence < 0 || whence > 2 || pos < 0) return FE_INVAL;
-    *ck = (u64)pos;
+    if (whence == 0 && pos == 0) snap_drop(s);
+    s->off = (u64)pos;
     *newoff = (u64)pos;
     return 0;
 }
