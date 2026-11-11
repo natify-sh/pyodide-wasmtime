@@ -1,5 +1,5 @@
-"""Emscripten's JavaScript date helpers (`_localtime_js`, `_mktime_js`, `_tzset_js`) in Python: functions of the host's
-C library and of the guest's memory, which they are given (`rd`, `wr`)."""
+"""Emscripten's JavaScript date helpers (`_localtime_js`, `_mktime_js`, `_tzset_js`) in Python, and the CPU clocks:
+functions of the host's C library and of the guest's memory, which they are given (`rd`, `wr`)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import calendar
 import struct
 import time
 
-from ._consts import _U32, Reader, Writer
+from ._consts import _U32, GUEST_ERRNO, Reader, Writer
 
 # `_localtime_js`, `_mktime_js` and `_tzset_js` read the time zone of the process through `Date` (the host's: its
 # TZ and zoneinfo). Here the host's C library answers the offset at an instant (`time.localtime`), and the rest is
@@ -144,3 +144,21 @@ def t_tzset(wr: Writer, timezone: int, daylight: int, std_name: int, dst_name: i
     std, dst = (winter, summer) if summer > winter else (summer, winter)  # JS: summerOffset < winterOffset (west)
     wr(std_name, zone(std))
     wr(dst_name, zone(dst))
+
+
+def cpu_clock(wr: Writer, cid: int, res: int, out: int) -> int:
+    """clock_gettime(CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID): the host's own CPU time, in nanoseconds
+    (or the clock's resolution). EINVAL where the host has no such clock."""
+    name = "process_time" if cid == 2 else "thread_time"
+    try:
+        if res:
+            v = max(1, round(time.get_clock_info(name).resolution * 1e9))
+        else:
+            v = time.process_time_ns() if cid == 2 else time.thread_time_ns()
+    except (AttributeError, OSError, ValueError):
+        return GUEST_ERRNO["INVAL"]
+    try:
+        wr(out, struct.pack("<Q", v))
+    except Exception:  # a pointer outside the memory
+        return GUEST_ERRNO["FAULT"]
+    return 0

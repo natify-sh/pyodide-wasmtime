@@ -1136,21 +1136,7 @@ class Pyodide:
         self._wr(cell, struct.pack("<I", signum))
 
     def _cpu_clock(self, cid: int, res: int, out: int) -> int:
-        """clock_gettime(CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID): the host's own CPU time, in nanoseconds
-        (or the clock's resolution). EINVAL where the host has no such clock."""
-        name = "process_time" if cid == 2 else "thread_time"
-        try:
-            if res:
-                v = max(1, round(time.get_clock_info(name).resolution * 1e9))
-            else:
-                v = time.process_time_ns() if cid == 2 else time.thread_time_ns()
-        except (AttributeError, OSError, ValueError):
-            return GUEST_ERRNO["INVAL"]
-        try:
-            self._wr(out, struct.pack("<Q", v))
-        except Exception:  # a pointer outside the memory
-            return GUEST_ERRNO["FAULT"]
-        return 0
+        return _timecalc.cpu_clock(self._wr, cid, res, out)
 
     # ------------------------------------------------------------------ the host's view of the files
     def _preopen_dir(self, pfd: int) -> str | None:
