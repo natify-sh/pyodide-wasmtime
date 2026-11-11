@@ -2,8 +2,17 @@
 """Differential audit: run one probe on the real Pyodide (Node) and on ours (fused, dynamic); print a diff per flavor.
 
 Usage (from the repository root, with the data built):
-    uv run python tools/diff_pyodide.py [--tz TZ] [--site DIR] [--flavors fused,dynamic] PROBE.py [PROBE.py ...]
+    uv run python tools/diff_pyodide.py [--tz TZ] [--site DIR] [--flavors fused,dynamic] [--ours-arg=ARG ...]
+        [--isolate] [--jobs N] [--keep DIR] PROBE.py [PROBE.py ...]
     PYODIDE_DIST=<folder with pyodide.mjs> (default: work/dl/dist of this repository, made by tools/fetch.sh), $KEEP=1 keeps the outputs.
+    The folder PYODIDE_DIST is visible in both guests as /dist (NODEFS on Pyodide, --mount on ours): wheels are read from there.
+
+Each probe set has its own prelude (tools/diff_probes/), put in front of the probe, chosen by the probe's file name prefix or by a
+first-line marker `# prelude: NAME` (_prelude_NAME.py): `files_*` -> files (case, w, tree(): only for a file with no `def case(` and no
+`# standalone`), `io_*`/`loader_*`/`mmap_*` -> io (the fresh directory B, case(id, fn), and the side modules of _sides.py written to
+B/so/), `runtime_*` -> none. `--isolate`, or a line `# isolate` at the top of an io probe, runs every case of it in a fresh interpreter
+(3 targets x N cases, 60 s each, --jobs at a time; a case that dies is `id | CRASH`): for cases that leave state in the loader or kill
+the guest. --keep DIR keeps the raw outputs in DIR. --ours-arg=ARG passes ARG to pyodide_wasmtime (e.g. --ours-arg=--dev).
 
 A probe is a Python file that prints one line per case: `case-id | result` (`ERR errno-name` for an OSError).
 A file may hold several programs, each run in a fresh interpreter: a line `# --- name` starts a program
@@ -19,6 +28,7 @@ Normalised before the diff: a trap (both sides' reports, also a failed host func
 hex digits -> 0xADDR), trailing spaces, the CR of a CRLF. Exit code of this script: 0 if there is no difference.
 """
 
+import concurrent.futures
 import difflib
 import os
 import re
@@ -42,6 +52,8 @@ if (process.env.PYO_SITE) {
   py.FS.mount(py.FS.filesystems.NODEFS, { root: process.env.PYO_SITE }, "/site");
   py.runPython("import sys; sys.path.append('/site')");
 }
+py.FS.mkdir("/dist");
+py.FS.mount(py.FS.filesystems.NODEFS, { root: "%(dist)s" }, "/dist");
 let st = 0;
 try { py.runPython(fs.readFileSync(process.argv[2], "utf8")); }
 catch (e) {
@@ -65,6 +77,11 @@ NORM = [
     (re.compile(r"/tmp/dp_\d+"), "<B>"),
     (re.compile(r"0x[0-9a-fA-F]{5,}"), "0xADDR"),
     (re.compile(r"[ \r]+$"), ""),
+]
+NORM_IO = [  # io probes only: process ids, inode numbers, times
+    (re.compile(r"\bpid[ =]\d+"), "pid N"),
+    (re.compile(r"\b(inode|ino)[ =:]+\d+"), r"\1 N"),
+    (re.compile(r"\d+\.\d+s\b"), "<T>"),
 ]
 
 
@@ -90,30 +107,52 @@ def squash(text):
     return text
 
 
-def norm(text):
+def norm(text, io=False):
     text = re.sub(r"Traceback \(most recent call last\):\n(?:  .*\n)+", "TRACEBACK ", text)
     lines = []
     for line in text.splitlines():
-        for rx, rep in NORM:
+        for rx, rep in NORM + (NORM_IO if io else []):
             line = rx.sub(rep, line)
         lines.append(line)
     return lines
 
 
+def prelude_kind(path, src):
+    """files, io or None: by a first-line marker `# prelude: NAME`, else by the file name prefix."""
+    m = re.match(r"# prelude: (\w+)", src)
+    if m:
+        return m.group(1) if m.group(1) != "none" else None
+    name = os.path.basename(path)
+    if name.startswith("files_"):
+        return "files"
+    if name.startswith(("io_", "loader_", "mmap_")):
+        return "io"
+    return None
+
+
 def programs(path):
     src = open(path, encoding="utf8").read()
-    prelude = os.path.join(os.path.dirname(os.path.abspath(path)), "_prelude.py")
-    if (
-        "def case(" not in src and "# standalone" not in src and os.path.exists(prelude)
-    ):  # the matrix probes of the files area
-        src = open(prelude, encoding="utf8").read() + src
+    here = os.path.dirname(os.path.abspath(path))
+    kind = prelude_kind(path, src)
+    if kind == "files":
+        if "def case(" not in src and "# standalone" not in src:  # the matrix probes of the files area
+            src = open(os.path.join(here, "_prelude_files.py"), encoding="utf8").read() + src
+    elif kind:
+        pre = open(os.path.join(here, "_prelude_%s.py" % kind), encoding="utf8").read()
+        if kind == "io":
+            sys.path.insert(0, here)
+            import _sides  # type: ignore[import-not-found]
+
+            sides = {n: b.hex() for n, b in _sides.build().items()}
+            pre = "SIDES = %r\nONLY = None\n" % sides + pre
+        src = pre + "\n" + src
     parts = re.split(r"^# ?--- (.*)$", src, flags=re.M)
     if len(parts) == 1:
         return [(os.path.basename(path), src)]
     return [(parts[i], parts[i + 1]) for i in range(1, len(parts), 2)]
 
 
-def run(cmd, env, cwd, status=False):
+def run(cmd, env, cwd, status=False, timeout=None):
     """Output through a file, so that a timeout ($DIFF_TIMEOUT, 170 s: "TIMEOUT") keeps what was printed."""
     with tempfile.TemporaryFile("w+", encoding="utf8", errors="replace") as out:
         proc = subprocess.Popen(
@@ -126,7 +165,7 @@ def run(cmd, env, cwd, status=False):
             start_new_session=True,
         )
         try:
-            rc = proc.wait(float(os.environ.get("DIFF_TIMEOUT", 170)))
+            rc = proc.wait(timeout or float(os.environ.get("DIFF_TIMEOUT", 170)))
             tail = "EXIT-STATUS %d\n" % rc if status else ""
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -136,22 +175,22 @@ def run(cmd, env, cwd, status=False):
         return out.read() + tail
 
 
-def run_pyodide(code, work, env, site):
+def run_pyodide(code, work, env, site, timeout=None):
     f = os.path.join(work, "p.py")
     open(f, "w", encoding="utf8").write(code)
     m = os.path.join(work, "r.mjs")
     open(m, "w").write(MJS % {"dist": DIST})
     e = dict(env, **({"PYO_SITE": site} if site else {}))
-    return run(["node", m, f], e, DIST)
+    return run(["node", m, f], e, DIST, timeout=timeout)
 
 
-def run_ours(code, work, env, flavor, site):
+def run_ours(code, work, env, flavor, site, extra=(), timeout=None):
     f = os.path.join(work, "p.py")
     open(f, "w", encoding="utf8").write(code)
-    cmd = [sys.executable, "-m", "pyodide_wasmtime", "--flavor", flavor]
+    cmd = [sys.executable, "-m", "pyodide_wasmtime", "--flavor", flavor, "--mount", "/dist=" + DIST, *extra]
     if site:
         cmd += ["--site", site]
-    return run(cmd + [f], env, None, True)
+    return run(cmd + [f], env, None, True, timeout)
 
 
 def resumable(runner, code):
@@ -177,8 +216,32 @@ def resumable(runner, code):
     return "\n".join(final) + "\n"
 
 
+def settle(cid, out):
+    """One isolated case: its case line(s), or `id | CRASH` when the run died before the case line."""
+    lines = [x for x in squash(out).splitlines() if not x.startswith("EXIT-STATUS") and x != "TRAP"]
+    at = [i for i, x in enumerate(lines) if x.startswith(cid + " | ")]
+    if at:  # what the case printed before its line is kept, what comes after (a callback that dies later) is not
+        return "\n".join(lines[: at[-1] + 1])
+    return "%s | CRASH" % cid
+
+
+def isolated(code, work, env, targets, jobs, runner):
+    """Run every case of an io probe alone: ONLY = -1 lists the case ids, ONLY = k runs the k-th."""
+
+    def one(target, k):
+        return runner(
+            target, code.replace("ONLY = None\n", "ONLY = %d\n" % k, 1), os.path.join(work, "%s%d" % (target[:2], k))
+        )
+
+    ids = [x.split(" | ")[0] for x in one("pyodide", -1).splitlines() if x.endswith(" | dry")]
+    with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
+        futs = {t: [ex.submit(one, t, i) for i in range(len(ids))] for t in targets}
+        return {t: "\n".join(settle(ids[i], f.result()) for i, f in enumerate(fs)) for t, fs in futs.items()}
+
+
 def main(argv):
     flavors, site, tz, files = ["fused", "dynamic"], None, None, []
+    extra, isolate, jobs, keep = [], False, 3, os.environ.get("KEEP_DIR")
     it = iter(argv)
     for a in it:
         if a == "--tz":
@@ -187,6 +250,14 @@ def main(argv):
             site = next(it)
         elif a == "--flavors":
             flavors = next(it).split(",")
+        elif a.startswith("--ours-arg="):
+            extra.append(a.split("=", 1)[1])
+        elif a == "--isolate":
+            isolate = True
+        elif a == "--jobs":
+            jobs = int(next(it))
+        elif a == "--keep":
+            keep = next(it)
         else:
             files.append(a)
     env = dict(os.environ)
@@ -195,10 +266,27 @@ def main(argv):
     bad = 0
     for path in files:
         for name, code in programs(path):
+            io = prelude_kind(path, code) == "io" or "SIDES = " in code[:20]
+            iso = io and (isolate or "\n# isolate\n" in code)
             with tempfile.TemporaryDirectory(prefix="dpw_") as work:
-                ref = norm(resumable(lambda c: run_pyodide(c, work, env, site), code))
+                if iso:
+
+                    def runner(target, c, w):
+                        os.makedirs(w, exist_ok=True)
+                        if target == "pyodide":
+                            return run_pyodide(c, w, env, site, 60)
+                        return run_ours(c, w, env, target, site, extra, 60)
+
+                    raw = isolated(code, work, env, ["pyodide", *flavors], jobs, runner)
+                    ref, outs = norm(raw["pyodide"], io), {fl: norm(raw[fl], io) for fl in flavors}
+                else:
+                    ref = norm(resumable(lambda c: run_pyodide(c, work, env, site), code), io)
+                    outs = {
+                        fl: norm(resumable(lambda c, fl=fl: run_ours(c, work, env, fl, site, extra), code), io)
+                        for fl in flavors
+                    }
                 for fl in flavors:
-                    got = norm(resumable(lambda c, fl=fl: run_ours(c, work, env, fl, site), code))
+                    got = outs[fl]
                     d = list(difflib.unified_diff(ref, got, "pyodide", fl, lineterm="", n=0))
                     n = sum(1 for x in d if x[:1] in "+-" and x[:3] not in ("+++", "---"))
                     print("### %s :: %s :: %s: %d cases (pyodide), %d differing lines" % (path, name, fl, len(ref), n))
@@ -207,8 +295,16 @@ def main(argv):
                         print("\n".join(d))
                     if os.environ.get("KEEP"):
                         open("%s.%s.%s.out" % (path, name, fl), "w").write("\n".join(got))
+                    if keep:
+                        open(
+                            os.path.join(keep, "%s.%s" % (os.path.splitext(os.path.basename(path))[0], fl)), "w"
+                        ).write("\n".join(got))
                 if os.environ.get("KEEP"):
                     open("%s.%s.pyodide.out" % (path, name), "w").write("\n".join(ref))
+                if keep:
+                    open(os.path.join(keep, "%s.pyodide" % os.path.splitext(os.path.basename(path))[0]), "w").write(
+                        "\n".join(ref)
+                    )
     return 1 if bad else 0
 
 
