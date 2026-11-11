@@ -26,7 +26,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 ## 2. Work: files and descriptors (from `docs/DIFF_AUDIT_files.md`, N-numbers are its rows)
 
-* **W1 crashes and hangs (first):** N1 `lseek` with whence 3/4/7/-1 kills the guest (validate; sweep every WASI enum argument: fadvise advice, flags, whence, dup3); N2 `os.read(0, 0)` hangs; N4 `lseek` overflow past 2**63-1 gives `errno 0` then `SystemError`; N3 `os.close(3)` closes the root preopen; N5 after `close(1)` print still works and shutdown prints a traceback (exit 255).
+* **W1 crashes and hangs:** done except N3's numbering (the preopen numbers are hidden from the guest now, but the first `open()` is still 4 and `close(3)`/`dup2(x, 3)` say EBADF where Pyodide has a free number: W5) and N5 after `close(1)` print still works and shutdown prints a traceback (exit 255).
 * **W2 `/dev` as virtual objects in the adapter** (same on every OS, fixes Windows): `/dev/null`, `zero`, `urandom`/`random`, `tty`, `stdin`/`stdout`/`stderr`; `/dev`, `/proc` (what Pyodide has), `/home`. Fixes `test_logging`, `test_shutil` and `os.devnull`; today `--dev` mounts the host's `/dev` (absent on Windows).
 * **W3 errors and paths:** N6 the empty path is "." in about 20 calls (must be ENOENT); N7 `rmdir('d/')`/`rmtree('d/')` EINVAL; N10 read/pread/ftruncate/fsync on a directory fd; N11 write-open of a directory (EISDIR); N23 ftruncate/fsync/utime on stdio; N32 file fd as dirfd (ENOTDIR); N33 `fstatat` bad dirfd + empty path; N34 `dup3` flags, `fadvise` advice, `access` mode unchecked; N14 `truncate` on a 0444 file vs `open` for write; N36 `os.open(f, 3)`.
 * **W4 multiple buffers and sizes:** N15 `readv`/`writev`/`preadv`/`pwritev` handle only the first buffer (wasmtime on files; the pipes loop already); N16 `pread` capped at 64 KiB; fails `test_os.test_posix` test_readv/test_writev.
@@ -50,11 +50,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 * Files: done (`docs/DIFF_AUDIT_files.md`). Runtime: done (`docs/DIFF_AUDIT_runtime.md`, 12 probe files, about 7500 cases per TZ-run; time functions show NO difference in 7 zones x 4509 cases). Loader/io: the agent is still running.
 * **R-rows from the runtime audit (new differences, each with `tools/diff_probes/runtime_repro.py` as the acceptance probe):**
-  * R1 (crash) a `CFUNCTYPE` callback with 3+ arguments that touches a descriptor traps `Pointer not aligned to 8` (`_host.py` `_ffi_closure`: align the stack pointer down to 16; check `_ffi_call` the same way).
-  * R2 `os._exit(n)`, C `exit(n)` and default-action signals with status >= 126 or < 0 fail in the host (`exit with invalid exit status outside of [0..126)`, code 134): mask with 255.
-  * R3 `clock_gettime(2/3)`, `time.process_time()`, C `clock()` fail (EBADF, RuntimeError, -1); Pyodide answers with the monotonic clock (D12: mirror it or give real CPU time). This is the suite's "processor time" group.
-  * R4 `sys.exit(True)` (host `int('True')`); R5 uncaught exception with a custom `sys.excepthook` (the wrapper prints the traceback itself); R6 `print` then trap/abort/`_exit` on a pipe loses the line (`line_buffering` is False; Pyodide True).
-  * R7 environment: HOME, USER, LOGNAME, PATH, LANG, PYTHONINSPECT missing or different (`expanduser('~')` stays `~`, `Path.home()` and `getpass.getuser()` raise), `PYTHONHOME`/`PYTHONPATH` leak into `os.environ` (D13: copy Pyodide's environment, `BASE_ENV` in `_host.py`); R8 `sys.path` order (site-packages first: a wheel can shadow the stdlib), `sys.executable` is empty, `flags.inspect` 0.
+  * R7/R8 left: `sys.executable` is empty (Pyodide has the host process's `_` variable, a Node artifact) and `sys.flags.inspect` is 0 (`PYTHONINSPECT=1` is not mirrored); `/home` has no `web_user` folder (Pyodide has both).
   * R9 19 glue library functions that no wasm of the build calls (`emscripten_get_now_res`, `emscripten_random`, `emscripten_console_*`, `emscripten_run_script`, `emscripten_force_exit` ...) are missing from dlsym and not in `import_audit.json` (`audit_imports.py` should list the glue's library too); R10 `__assert_fail` with a pointer outside memory traps while printing; R11 `mktime((-271821, 6, 15, ...))` returns a value where Pyodide raises OverflowError.
   * Known and re-observed: `_setitimer_js` fires in a busy loop (deliberate), a struct nested 100 deep traps in `ffi_call_js`, `emscripten_resize_heap`, `os.system` -1, progname, the JS bridge.
   * Not probed: Windows/macOS TZ, `interrupt()` from another thread, a side module importing an `emscripten_*` function, `resource` (cannot be imported on either side).
@@ -98,7 +94,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 ## Order of work now (2026-11-11)
 
 1. Wait for the two audits (runtime, loader/io); triage their tables here (new rows, known, host-dependent).
-2. W1 crashes and hangs and R1/R2 (crash and exit status); W2 `/dev`; R3 process time; W4 multiple buffers; the small suite items.
+2. W2 `/dev`; W4 multiple buffers; the small suite items.
 3. W2, W3, W4, W5 on the host root now (D4 is parked: nothing waits for it); D5 (decoupled fd numbers) with W5.
 4. A `reviewer` on the descriptor layer and the override feature (section 6).
 5. T1 terminal, then S1 (xfail for what is left).

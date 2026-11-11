@@ -31,6 +31,9 @@ It is meant to run anything Pyodide runs without the browser's JavaScript: the s
 files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs the JavaScript bridge (`js`, `pyodide.ffi`,
 `pyodide.http` outside `hostnet`) does not exist here: those 169 `env` imports (158 of the bridge, 11 hooks that mean nothing here) are not answered: zero/null stubs, and hidden from `dlsym` in the fused build ([docs/IMPORT_AUDIT.md](docs/IMPORT_AUDIT.md)).
 
+**The guest is isolated.** Its environment is Pyodide's own minimal one (`USER`/`LOGNAME=web_user`, `PATH=/`, `PWD=/`, `HOME=/home/pyodide` (the folder exists), `LANG=en_US.UTF-8`, `LD_LIBRARY_PATH`), plus `env=`; nothing of the host's environment or files reaches it unless you ask:
+`Pyodide(inherit_env=True)` / `--inherit-env` pass the host's variables too (`env=` / `--env K=V` win; the interpreter's own `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH` are not taken), `mounts=` / `--mount GUEST=HOST` give a host folder, `--mount-cwd` gives the current folder as the guest's working directory (`/work`). The network and the time zone are still the host's.
+
 | | |
 |---|---|
 | Pyodide | **315.0.0-alpha.2** (`pyodide_wasmtime.PYODIDE_VERSION`), Python 3.15.0rc1, Emscripten 6.0.5, wheels of ABI `pyemscripten_2026_5_wasm32` (`PYODIDE_ABI`) |
