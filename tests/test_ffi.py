@@ -139,6 +139,7 @@ def test_pointers_of_the_operations_are_unsigned_and_checked() -> None:
 
 
 def test_a_cif_from_the_guest_cannot_make_the_host_loop_or_copy_without_end() -> None:
+    from pyodide_nojs._cif import unbox
     from pyodide_nojs._host import GuestFault
 
     py = fake_host()
@@ -147,7 +148,7 @@ def test_a_cif_from_the_guest_cannot_make_the_host_loop_or_copy_without_end() ->
     mem[16 + 8 : 16 + 12] = (32).to_bytes(4, "little")  # ... whose elements (at 32) are [itself, NULL]
     mem[32:36] = (16).to_bytes(4, "little")
     with pytest.raises(RuntimeError, match="too deep"):
-        py._unbox(16)
+        unbox(py._rd, 16)
     # a cif (abi, nargs, arg_types, rtype, bytes, flags, nfixedargs) whose argument types lie outside the memory
     mem[64:92] = struct.pack("<7I", 0, 100, 2**31, 0, 0, 0, 100)
     with pytest.raises(GuestFault):

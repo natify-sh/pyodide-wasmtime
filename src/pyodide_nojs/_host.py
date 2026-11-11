@@ -33,7 +33,7 @@ import weakref
 from pathlib import Path
 from typing import Any
 
-from . import _engine, _timecalc, _wasm
+from . import _cif, _engine, _timecalc, _wasm
 from ._consts import (
     _GLOBAL_WHY,
     _JS_MODULES,
@@ -57,9 +57,7 @@ from ._consts import (
     GuestExit,
     GuestFault,
     MainExports,
-    _Big,
     _from_wasm,
-    _num,
     _override,
     _s32,
     _to_wasm,
@@ -981,34 +979,6 @@ class Pyodide:
         self._wr(ap, socket.inet_aton(ip))
         return 0
 
-    # ------------------------------------------------------------------ libffi's emscripten port: calls and closures
-    # What pyodide.asm.mjs does in ffi_call_js / ffi_prep_closure_loc_js, with the type of the function from the wasm
-    # table (a JavaScript call tolerates any signature: extra arguments are dropped, missing ones are undefined).
-    @staticmethod
-    def _down(cur: int, size: int, align: int) -> int:
-        """cur - size, aligned down, on the guest's stack: GuestFault if a size from the guest takes it below 0."""
-        new = (cur - size) & ~(max(align, 1) - 1)
-        if size < 0 or new < 0:
-            raise GuestFault(f"{size:#x} bytes do not fit on the stack")
-        return new
-
-    def _u32(self, a: int) -> int:
-        return struct.unpack("<I", self._rd(a, 4))[0]
-
-    def _unbox(self, t: int) -> tuple[int, int]:
-        """A struct of one member is that member (libffi's JS `unbox_small_structs`): (type pointer, type id)."""
-        for _depth in range(64):
-            tid = struct.unpack("<H", self._rd(t + 6, 2))[0]
-            if tid != 13:
-                return t, tid
-            first, second = struct.unpack("<II", self._rd(self._u32(t + 8), 8))
-            if first == 0:
-                return t, 0
-            if second != 0:
-                return t, 13
-            t = first
-        raise RuntimeError("an ffi_type of structs inside structs, too deep")
-
     def _table_func(self, idx: int) -> Any:
         f = self.table.get(self.cur[-1], idx)
         if not isinstance(f, self._wt.Func):
@@ -1036,76 +1006,9 @@ class Pyodide:
     def _ffi_call(self, cif: int, fn: int, rvalue: int, avalue: int) -> None:
         cif, fn, rvalue, avalue = cif & _U32, fn & _U32, rvalue & _U32, avalue & _U32
         ctx = self.cur[-1]
-        _abi, nargs, atp, rtp, _bytes, _flags, nfixed = struct.unpack("<7I", self._rd(cif, 28))
-        if nargs > 1000:  # a wasm function has at most 1000 parameters
-            raise RuntimeError(f"a cif of {nargs} arguments")
-        _rp, rid = self._unbox(rtp)
-        if rid == 15:
-            raise RuntimeError("complex ret marshalling nyi")
-        if rid > 15:
-            raise RuntimeError(f"Unexpected rtype {rid}")
         sp = self.ex["__stack_pointer"]
-        orig = cur = sp.value(ctx)
-        args: list = []
-        ret_by_arg = rid in (4, 13)
-        if ret_by_arg:
-            args.append(rvalue)
-        aptrs = struct.unpack(f"<{nargs}I", self._rd(avalue, 4 * nargs)) if nargs else ()
-        atypes = struct.unpack(f"<{nargs}I", self._rd(atp, 4 * nargs)) if nargs else ()
-        for i in range(nfixed):
-            ap = aptrs[i]
-            tp, tid = self._unbox(atypes[i])
-            if tid in (1, 9, 10, 14):
-                args.append(self._u32(ap))
-            elif tid == 2:
-                args.append(struct.unpack("<f", self._rd(ap, 4))[0])
-            elif tid == 3:
-                args.append(struct.unpack("<d", self._rd(ap, 8))[0])
-            elif tid in (5, 6):
-                args.append(struct.unpack("<B" if tid == 5 else "<b", self._rd(ap, 1))[0])
-            elif tid in (7, 8):
-                args.append(struct.unpack("<H" if tid == 7 else "<h", self._rd(ap, 2))[0])
-            elif tid in (11, 12):
-                args.append(_Big(struct.unpack("<Q", self._rd(ap, 8))[0]))
-            elif tid == 4:
-                args.extend(_Big(x) for x in struct.unpack("<QQ", self._rd(ap, 16)))
-            elif tid == 13:
-                size, align = struct.unpack("<IH", self._rd(tp, 6))
-                cur = self._down(cur, size, align)
-                self._wr(cur, self._rd(ap, size))
-                args.append(cur)
-            else:
-                raise RuntimeError("complex marshalling nyi" if tid == 15 else f"Unexpected type {tid}")
-        if nfixed != nargs:  # the variadic part: a block on the stack, its address the last argument
-            structs = []
-            for i in range(nargs - 1, nfixed - 1, -1):
-                ap = aptrs[i]
-                tp, tid = self._unbox(atypes[i])
-                if tid in (5, 6):
-                    cur = self._down(cur, 1, 1)
-                    self._wr(cur, self._rd(ap, 1))
-                elif tid in (7, 8):
-                    cur = self._down(cur, 2, 2)
-                    self._wr(cur, self._rd(ap, 2))
-                elif tid in (1, 9, 10, 14, 2):
-                    cur = self._down(cur, 4, 4)
-                    self._wr(cur, self._rd(ap, 4))
-                elif tid in (3, 11, 12):
-                    cur = self._down(cur, 8, 8)
-                    self._wr(cur, self._rd(ap, 8))
-                elif tid == 4:
-                    cur = self._down(cur, 16, 8)
-                    self._wr(cur, self._rd(ap, 16))
-                elif tid == 13:
-                    cur = self._down(cur, 4, 4)
-                    structs.append((cur, ap, *struct.unpack("<IH", self._rd(tp, 6))))
-                else:
-                    raise RuntimeError("complex arg marshalling nyi" if tid == 15 else f"Unexpected argtype {tid}")
-            args.append(cur)
-            for target, ap, size, align in structs:
-                cur = self._down(cur, size, align)
-                self._wr(cur, self._rd(ap, size))
-                self._wr(target, struct.pack("<I", cur))
+        orig = sp.value(ctx)
+        args, cur, rid = _cif.call_args(self._rd, self._wr, cif, rvalue, avalue, orig)
         cur &= ~15  # the stack pointer stays 16-aligned (WASI wants out structures aligned to 8)
         if cur == orig:  # nothing on the stack: stackRestore(cur) is a no-op
             res = self._js_call(fn, args)
@@ -1115,26 +1018,7 @@ class Pyodide:
                 res = self._js_call(fn, args)
             finally:
                 sp.set_value(ctx, orig)
-        if ret_by_arg:
-            return
-        if rid in (1, 9, 10, 14):
-            self._wr(rvalue, struct.pack("<I", _num(res, 32)))
-        elif rid in (5, 6):
-            self._wr(rvalue, struct.pack("<B", _num(res, 8)))
-        elif rid in (7, 8):
-            self._wr(rvalue, struct.pack("<H", _num(res, 16)))
-        elif rid in (2, 3):
-            if isinstance(res, _Big):
-                raise TypeError("Cannot mix BigInt and other types")
-            x = float("nan") if res is None else float(res)
-            try:
-                self._wr(rvalue, struct.pack("<f" if rid == 2 else "<d", x))
-            except OverflowError:  # a float32 too large for it is an infinity
-                self._wr(rvalue, struct.pack("<f", float("inf") if x > 0 else float("-inf")))
-        elif rid in (11, 12):
-            if not isinstance(res, _Big):
-                raise TypeError(f"Cannot convert {res} to a BigInt")
-            self._wr(rvalue, struct.pack("<Q", res & 0xFFFFFFFFFFFFFFFF))
+        _cif.store_result(self._wr, rvalue, rid, res)
 
     def _ffi_slot(self) -> int:
         """getEmptyTableSlot(): a freed slot (the last freed first), else the table grown by one."""
@@ -1156,49 +1040,7 @@ class Pyodide:
         arguments are written to the stack as libffi's `avalue` and `fun(cif, ret, args, user_data)` is called."""
         wt = self._wt
         closure, cif, fun, user_data, codeloc = (x & _U32 for x in (closure, cif, fun, user_data, codeloc))
-        _abi, nargs, atp, rtp, _bytes, _flags, nfixed = struct.unpack("<7I", self._rd(cif, 28))
-        if nargs > 1000:  # a wasm function has at most 1000 parameters
-            raise RuntimeError(f"a cif of {nargs} arguments")
-        _rp, rid = self._unbox(rtp)
-        i32, i64, f32, f64 = (getattr(wt.ValType, n)() for n in ("i32", "i64", "f32", "f64"))
-        if rid == 15:
-            raise RuntimeError("complex ret marshalling nyi")
-        ret_by_arg = rid in (4, 13)
-        if ret_by_arg:
-            params, results, rk = [i32], [], "v"
-        elif rid == 0:
-            params, results, rk = [], [], "v"
-        elif rid in (1, 5, 6, 7, 8, 9, 10, 14):
-            params, results, rk = [], [i32], "i"
-        elif rid == 2:
-            params, results, rk = [], [f32], "f"
-        elif rid == 3:
-            params, results, rk = [], [f64], "d"
-        elif rid in (11, 12):
-            params, results, rk = [], [i64], "j"
-        else:
-            raise RuntimeError(f"Unexpected rtype {rid}")
-        atypes = struct.unpack(f"<{nargs}I", self._rd(atp, 4 * nargs)) if nargs else ()
-        info = []  # (type id, size, alignment) of each argument
-        for t in atypes:
-            tp, tid = self._unbox(t)
-            size, align = struct.unpack("<IH", self._rd(tp, 6))
-            info.append((tid, size, align))
-        for tid, _s, _a in info[:nfixed]:
-            if tid in (1, 5, 6, 7, 8, 9, 10, 14, 13):
-                params.append(i32)
-            elif tid == 2:
-                params.append(f32)
-            elif tid == 3:
-                params.append(f64)
-            elif tid == 4:
-                params += [i64, i64]
-            elif tid in (11, 12):
-                params.append(i64)
-            else:
-                raise RuntimeError("complex marshalling nyi" if tid == 15 else f"Unexpected argtype {tid}")
-        if nfixed < nargs:
-            params.append(i32)
+        params, results, rk, info, ret_by_arg, nargs, nfixed = _cif.closure_signature(self._rd, wt, cif)
 
         # A wasmtime Func is never freed before its store, so closures reuse them: one per signature and per live
         # closure, with the closure's own data in a list that the Func's callback reads when it is called.
@@ -1237,76 +1079,17 @@ class Pyodide:
             self.func_pool[key].append((func, state))
 
     def _ffi_closure(self, state: list, a: tuple) -> Any:
-        closure, nargs, nfixed, info, ret_by_arg, rk = state
+        rk = state[5]  # the closure's own entry may be released while it runs (`state` is then cleared)
         ctx = self.cur[-1]
         sp = self.ex["__stack_pointer"]
-        orig = cur = sp.value(ctx)
-        _index, cif, fun, user_data = struct.unpack("<IIII", self._rd(closure, 16))
-        j = 0
-        if ret_by_arg:
-            ret_ptr = a[0] & 0xFFFFFFFF
-            j = 1
-        else:
-            cur = self._down(cur, 8, 8)
-            ret_ptr = cur
-        cur = self._down(cur, 4 * nargs, 1)
-        args_ptr = cur
-        slots: dict[int, int] = {}
-
-        def put(c: int, size: int, align: int, data: bytes) -> None:
-            nonlocal cur
-            cur = self._down(cur, size, align)
-            slots[c] = cur
-            self._wr(cur, data)
-
-        for c in range(nfixed):
-            v = a[j]
-            j += 1
-            tid, size, align = info[c]
-            if tid in (5, 6):
-                put(c, 1, 4, struct.pack("<B", v & 0xFF))
-            elif tid in (7, 8):
-                put(c, 2, 4, struct.pack("<H", v & 0xFFFF))
-            elif tid in (1, 9, 10, 14):
-                put(c, 4, 4, struct.pack("<I", v & 0xFFFFFFFF))
-            elif tid == 13:
-                put(c, size, align, self._rd(v & 0xFFFFFFFF, size))
-            elif tid == 2:
-                put(c, 4, 4, struct.pack("<f", v))
-            elif tid == 3:
-                put(c, 8, 8, struct.pack("<d", v))
-            elif tid in (11, 12):
-                put(c, 8, 8, struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF))
-            elif tid == 4:
-                put(c, 16, 8, struct.pack("<QQ", v & 0xFFFFFFFFFFFFFFFF, a[j] & 0xFFFFFFFFFFFFFFFF))
-                j += 1
-        varargs = a[-1] & 0xFFFFFFFF if nfixed < nargs else 0
-        for c in range(nfixed, nargs):
-            tid, size, align = info[c]
-            if tid == 13:
-                put(c, size, align, self._rd(self._u32(varargs), size))
-            else:
-                slots[c] = varargs
-            varargs += 4
-        if nargs:
-            self._wr(args_ptr, struct.pack(f"<{nargs}I", *(slots[c] for c in range(nargs))))
+        orig = sp.value(ctx)
+        cif, fun, user_data, ret_ptr, args_ptr, cur = _cif.closure_frame(self._rd, self._wr, state, a, orig)
         sp.set_value(ctx, cur & ~15)  # 16-aligned, as the compiled code expects
         try:
             self._table_func(fun)(ctx, *(_to_wasm(x, "i32") for x in (cif, ret_ptr, args_ptr, user_data)))
         finally:
             sp.set_value(ctx, orig)
-        if rk == "v":
-            return None
-        raw = self._rd(ret_ptr, 8)
-        if rk == "i":
-            return _to_wasm(struct.unpack("<I", raw[:4])[0], "i32")
-        if rk == "j":
-            return _to_wasm(_Big(struct.unpack("<Q", raw)[0]), "i64")
-        if rk == "d":
-            return struct.unpack("<d", raw)[0]
-        if rk == "f":
-            return struct.unpack("<f", raw[:4])[0]
-        return None
+        return _cif.closure_result(self._rd, rk, ret_ptr)
 
     # ------------------------------------------------------------------ local time (_timecalc)
     def _t_localtime(self, t: int, tm: int) -> int:
