@@ -21,7 +21,7 @@ Facts checked (raw files from `raw.githubusercontent.com`, GitHub pages through 
 
 * The lock of 315.0.0-alpha.2 lists exactly one OpenSSL: `libopenssl 1.1.1w`, `package_type: shared_library`, file
   `libopenssl-1.1.1w.zip`, platform `emscripten_6_0_5`, ABI `2026_5`
-  (`python3 -c ... pyodide-lock.json` on `work/dl/dist/pyodide-lock.json`).
+  (`python3 -c ... pyodide-lock.json` on `pyo-build/dl/dist/pyodide-lock.json`).
 * Its recipe (`pyodide/pyodide` tag 315.0.0a2 and `main`, `packages/libopenssl/meta.yaml`; the two are identical): source
   `https://www.openssl.org/source/openssl-1.1.1w.tar.gz`, `./Configure gcc -no-ui-console -no-tests -DHAVE_FORK=0
   -DOPENSSL_NO_SECURE_MEMORY -DNO_SYSLOG ${SIDE_MODULE_CFLAGS}`, static archives first, then `emcc
@@ -88,7 +88,7 @@ Files fetched from `raw.githubusercontent.com/python/cpython/<tag>/...` (`v3.15.
 ## 3. Routes to a newer OpenSSL, with what was measured
 
 Toolchain and recipe used (all in `/tmp/claude-0/.../scratchpad/openssl_research/build`): wasi-sdk 34 clang (`clang 23`) from
-`work/sdk`, target `wasm32-unknown-emscripten`, the Emscripten 6.0.5 musl headers sysroot that `tools/build_ssl.sh` already assembles, and
+`pyo-build/sdk`, target `wasm32-unknown-emscripten`, the Emscripten 6.0.5 musl headers sysroot that `tools/build_ssl.sh` already assembles, and
 `wasm/ssl_prelude.h`; OpenSSL **3.5.9** (release tag `openssl-3.5.9`, 29 Sep 2026, sha256
 `603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a` of the tarball as downloaded from the GitHub release):
 
@@ -142,7 +142,7 @@ for its sockets in our case (it passes the fd through `SSL_set_fd`, and our gues
 ### 3(b) shared `libssl.so` + `libcrypto.so` (not built)
 
 Pyodide's lock `libopenssl` is an Emscripten shared library: `dylink.0` with MEM_INFO (libcrypto 377 664 bytes memory, libssl 63 645) and, for libssl, `NEEDED libcrypto.so`;
-`_ssl.so` records `NEEDED libssl.so libcrypto.so` (read from the files with a small parser; `work/testenv/site_tls`). A wasi-sdk-built shared library of the same shape is
+`_ssl.so` records `NEEDED libssl.so libcrypto.so` (read from the files with a small parser; `pyo-build/testenv/site_tls`). A wasi-sdk-built shared library of the same shape is
 what `tools/build_ssl.sh` already produces for `_ssl.so` (`--experimental-pic -shared`, `dylink.0` with NEEDED taken from the linked `.so` inputs). So dlopen by our loader and by Pyodide's JS
 `dlopen` are possible in principle (same `env` import and `GOT.*` conventions as the Emscripten 6.0.5 main module, which the `_ssl.so` above already uses). Not tried; needs the `--export` list of the OpenSSL API (everything is hidden in the build above because of `-fvisibility=hidden`; a shared build would need `OPENSSL_EXPORT`-style visibility or `--export-dynamic` on `libcrypto.a`). Estimate 2 to 4 days; benefit only if several modules (`_hashlib`, `cryptography`) must share one copy.
 
@@ -202,7 +202,7 @@ Owner request D15: if the real wasm `_ssl` is not shipped, a guest-side Python `
 
 ### 6.1 The `_ssl` surface CPython 3.15's `ssl.py` needs
 
-From `Lib/ssl.py` (`work/ref/cpython`, 3.15.0rc1): `import _ssl`; `from _ssl import OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_INFO, OPENSSL_VERSION`;
+From `Lib/ssl.py` (`pyo-build/ref/cpython`, 3.15.0rc1): `import _ssl`; `from _ssl import OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_INFO, OPENSSL_VERSION`;
 `_SSLContext, MemoryBIO, SSLSession`; the exception classes `SSLError, SSLZeroReturnError, SSLWantReadError, SSLWantWriteError, SSLSyscallError, SSLEOFError, SSLCertVerificationError`;
 `_txt2obj`/`_nid2obj` (`txt2obj`, `nid2obj`); `RAND_status, RAND_add, RAND_bytes`; `get_sigalgs`; `_DEFAULT_CIPHERS`, `_OPENSSL_API_VERSION`; `enum_certificates`, `enum_crls` (Windows only, guarded);
 `get_default_verify_paths`; constants and flags: `HAS_*` (ALPN, SNI, ECDH, NEVER_CHECK_COMMON_NAME, PHA, PSK, TLSv1_x), `PROTO_*`, `VERIFY_*`, `OP_*`, `ALERT_DESCRIPTION_*`, `CERT_*`, `ENCODING_DER`, `HOSTFLAG_NEVER_CHECK_SUBJECT`, `SSL_ERROR_*`, `PROTOCOL_*`.

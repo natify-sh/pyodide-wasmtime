@@ -56,7 +56,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: testenv
-          path: work/testenv
+          path: pyo-build/testenv
 
       - name: Install
         run: uv sync --locked
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: testenv
-          path: work/testenv
+          path: pyo-build/testenv
 
       - run: uv sync --locked
 
@@ -120,7 +120,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: testenv
-          path: work/testenv
+          path: pyo-build/testenv
 
       - run: uv sync --locked --group suite
 

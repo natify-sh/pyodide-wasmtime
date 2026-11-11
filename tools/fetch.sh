@@ -5,8 +5,8 @@
 #   WORKDIR/dl/pyodide, WORKDIR/dl/binaryen  npm packages (Node + Binaryen are BUILD tools; the run time has neither)
 #   WORKDIR/dl/dist                          the files of Pyodide's 315.0.0a2 release (wheels, `test`, lock)
 set -e
-mkdir -p "${1:-work}"
-W=$(cd "${1:-work}" && pwd)
+mkdir -p "${1:-pyo-build}"
+W=$(cd "${1:-pyo-build}" && pwd)
 mkdir -p "$W/sdk" "$W/dl"
 SDK=wasi-sdk-34.0-x86_64-linux
 if [ ! -d "$W/sdk/$SDK" ]; then

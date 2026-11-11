@@ -2,7 +2,7 @@
 
 Nothing was fixed in this step; only `tools/diff_pyodide.py`, `tools/diff_probes/runtime_*.py` and this file were added.
 Every number below comes from a run of the harness on this machine (Linux, wasmtime-py 50.0.1, Node of the audit's
-`work/dl/dist`), on both packagings. **Fused and dynamic agree on every probe** (the same differing cases, the same text).
+`pyo-build/dl/dist`), on both packagings. **Fused and dynamic agree on every probe** (the same differing cases, the same text).
 
 ## 1. The harness
 

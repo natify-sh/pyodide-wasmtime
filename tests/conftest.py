@@ -16,7 +16,7 @@ ROOT = HERE.parent
 
 
 def work_dir() -> Path:
-    return Path(os.environ.get("PYODIDE_WASMTIME_WORK") or ROOT / "work")
+    return Path(os.environ.get("PYODIDE_WASMTIME_WORK") or ROOT / "pyo-build")
 
 
 def testenv() -> Path:

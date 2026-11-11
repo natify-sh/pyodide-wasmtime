@@ -80,7 +80,7 @@ Report:      files changed, commands run with output, docs updated, open questio
   `_engine.py` is the one engine (exceptions, function references, GC), the machine-code cache in the user's cache dir, and `wasm-opt.wasm` run in-process. `_wasm.py` is the WAT of the dynamic build; import types come from `Module.imports`
   (wasmtime-py prints every reference type as `anyref`; here they are all `externref`). `guest/hostnet.py` runs inside the guest.
 * Wheels with legacy exceptions are converted at `dlopen` by `wasm-opt.wasm` (`Pyodide.converted` counts them); the modules the build ships are converted at build time.
-* The tests need the build: `sh tools/build_data.sh work` and `sh tools/prepare_testenv.sh work` (`WASM_OPT_WASM=path` skips the 12-minute build of `wasm-opt.wasm`). A missing build is a skip locally and a failure with `CI` set.
+* The tests need the build: `sh tools/build_data.sh pyo-build` and `sh tools/prepare_testenv.sh work` (`WASM_OPT_WASM=path` skips the 12-minute build of `wasm-opt.wasm`). A missing build is a skip locally and a failure with `CI` set.
 * A host function must not hold the engine across a wait for another thread; there are no threads here (as in Pyodide).
 
 ## Commands
@@ -88,8 +88,8 @@ Report:      files changed, commands run with output, docs updated, open questio
 uv sync                                                    # dev environment (add --group suite for the official suite)
 uv run ruff check . && uv run ruff format --check .
 uv run pyright
-sh tools/build_data.sh work                                # the wasm of the package -> src/pyodide_wasmtime/data (needs node, npm; cmake + ninja for wasm-opt.wasm)
-sh tools/prepare_testenv.sh work                           # numpy, micropip, openssl, the real _ssl, the `test` wheel -> work/testenv
+sh tools/build_data.sh pyo-build                                # the wasm of the package -> src/pyodide_wasmtime/data (needs node, npm; cmake + ninja for wasm-opt.wasm)
+sh tools/prepare_testenv.sh pyo-build                           # numpy, micropip, openssl, the real _ssl, the `test` wheel -> pyo-build/testenv
 uv run pytest -m "not network and not suite"               # offline, both packagings
 uv run pytest -m network                                   # PyPI and jsDelivr
 uv run pytest -m suite                                     # Pyodide's official CPython suite, both packagings (long; -n auto spreads it over the cores; PYODIDE_SUITE_SHARD=I/N, PYODIDE_SUITE_FLAVORS=fused)

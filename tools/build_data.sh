@@ -11,8 +11,8 @@
 # with wasmtime-py (fuse.py checks its result with it).
 set -e
 H=$(cd "$(dirname "$0")/.." && pwd)
-mkdir -p "${1:-work}"
-W=$(cd "${1:-work}" && pwd)
+mkdir -p "${1:-pyo-build}"
+W=$(cd "${1:-pyo-build}" && pwd)
 DATA=${DATA:-$H/src/pyodide_wasmtime/data}
 mkdir -p "$DATA"
 sh "$H/tools/fetch.sh" "$W" >/dev/null

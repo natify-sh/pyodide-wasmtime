@@ -2,7 +2,7 @@
 
 Nothing was fixed in this step: `wasm/adapter*`, `src/` and `tests/` are untouched. The harness, the probes and this
 report are new. Machine: Linux, 4 shared cores, wasmtime-py 50.0.1, Node 22; ours built from `410bede`
-(`tools/build_data.sh`), the baseline is `work/dl/dist` (Pyodide 315.0.0a2 on Node). Every number below is from the
+(`tools/build_data.sh`), the baseline is `pyo-build/dl/dist` (Pyodide 315.0.0a2 on Node). Every number below is from the
 runs of these probes; the raw outputs are not committed (`--keep DIR` writes them).
 
 ## 1. The harness

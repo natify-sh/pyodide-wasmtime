@@ -40,7 +40,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q cmake ninja-build
-          OUT="$PWD/wasm-opt.wasm" sh tools/build_binaryen.sh work
+          OUT="$PWD/wasm-opt.wasm" sh tools/build_binaryen.sh pyo-build
 
       - uses: actions/upload-artifact@v7
         with:
@@ -72,10 +72,10 @@ jobs:
       - name: Build the package's wasm
         run: |
           uv sync --locked
-          PATH="$PWD/.venv/bin:$PATH" WASM_OPT_WASM="$PWD/wasm-opt/wasm-opt.wasm" sh tools/build_data.sh work
+          PATH="$PWD/.venv/bin:$PATH" WASM_OPT_WASM="$PWD/wasm-opt/wasm-opt.wasm" sh tools/build_data.sh pyo-build
 
       - name: Build the test environment
-        run: PATH="$PWD/.venv/bin:$PATH" sh tools/prepare_testenv.sh work
+        run: PATH="$PWD/.venv/bin:$PATH" sh tools/prepare_testenv.sh pyo-build
 
       - uses: actions/upload-artifact@v7
         with:
@@ -86,5 +86,5 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: testenv
-          path: work/testenv
+          path: pyo-build/testenv
           retention-days: 14

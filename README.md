@@ -66,8 +66,8 @@ One toolchain: **wasi-sdk 34's clang** builds `adapter.wasm`, `wasm-opt.wasm` an
 
 ```sh
 uv sync
-sh tools/build_data.sh work         # -> src/pyodide_wasmtime/data/*  (wasm-opt.wasm from source takes ~12 min; WASM_OPT_WASM=path reuses one)
-sh tools/prepare_testenv.sh work    # -> work/testenv: numpy, micropip, openssl, the real _ssl, the `test` wheel, python_tests.yaml
+sh tools/build_data.sh pyo-build         # -> src/pyodide_wasmtime/data/*  (wasm-opt.wasm from source takes ~12 min; WASM_OPT_WASM=path reuses one)
+sh tools/prepare_testenv.sh pyo-build    # -> pyo-build/testenv: numpy, micropip, openssl, the real _ssl, the `test` wheel, python_tests.yaml
 uv build --wheel                    # the wheel carries data/ (the wasm is built, not committed)
 ```
 Needs: node, npm, curl, git, cmake and ninja (for `wasm-opt.wasm`), perl and make (OpenSSL's `opensslconf.h`).

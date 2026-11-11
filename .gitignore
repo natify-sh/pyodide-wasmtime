@@ -21,6 +21,7 @@ src/pyodide_wasmtime/data/*
 !src/pyodide_wasmtime/data/.gitkeep
 # compiled-module caches, work directories of the build and of the test runs
 *.cwasm
+/pyo-build/
 /work/
 
 # git worktrees of the agents that work in parallel (each is its own checkout)

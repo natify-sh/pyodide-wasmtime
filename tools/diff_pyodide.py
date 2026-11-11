@@ -4,7 +4,7 @@
 Usage (from the repository root, with the data built):
     uv run python tools/diff_pyodide.py [--tz TZ] [--site DIR] [--flavors fused,dynamic] [--ours-arg=ARG ...]
         [--isolate] [--jobs N] [--keep DIR] PROBE.py [PROBE.py ...]
-    PYODIDE_DIST=<folder with pyodide.mjs> (default: work/dl/dist of this repository, made by tools/fetch.sh), $KEEP=1 keeps the outputs.
+    PYODIDE_DIST=<folder with pyodide.mjs> (default: pyo-build/dl/dist of this repository, made by tools/fetch.sh), $KEEP=1 keeps the outputs.
     The folder PYODIDE_DIST is visible in both guests as /dist (NODEFS on Pyodide, --mount on ours): wheels are read from there.
 
 Each probe set has its own prelude (tools/diff_probes/), put in front of the probe, chosen by the probe's file name prefix or by a
@@ -39,7 +39,7 @@ import tempfile
 
 # the folder tools/fetch.sh makes (WORKDIR/dl/dist: Pyodide's release with pyodide.mjs); node and the npm package are build tools
 DIST = os.environ.get("PYODIDE_DIST") or os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work", "dl", "dist"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pyo-build", "dl", "dist"
 )
 
 MJS = """

@@ -11,8 +11,8 @@
 # Build tools: node (Binaryen from npm), curl, git, perl and make (OpenSSL's Configure: opensslconf.h only).
 set -e
 H=$(cd "$(dirname "$0")/.." && pwd)
-mkdir -p "${1:-work}"
-W=$(cd "${1:-work}" && pwd)
+mkdir -p "${1:-pyo-build}"
+W=$(cd "${1:-pyo-build}" && pwd)
 sh "$H/tools/fetch.sh" "$W" >/dev/null
 D=$W/dl/dist
 T=$W/testenv
