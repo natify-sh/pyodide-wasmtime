@@ -86,6 +86,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 * Loader: JS-implemented functions accept any signature in Pyodide (a trampoline on a mismatch: not done, a gap); the failed-load registry and the hidden bridge are deliberate differences; `emscripten_dlopen` is `partial` (no event loop). The names the glue resolves and we do not (1293: bridge, GL/SDL, about 265 others): no wheel of the release imports them; answer the few a real wheel needs when one turns up (scan: wheels' `env` imports against the list, script in the scratchpad).
 * A warning for a different SIGNATURE of an import (we warn for an unknown name only) and the stub-instead-of-trap (BRIEF, Python 3.14).
 * Time: `_mktime_js`/`_localtime_js` clamp to [0, 32535215999] on a narrow `time_t` (Windows); zone names other than UTC are not understood by the Windows CRT (tests skip them there).
+* `socket.getservbyname('http')` and `getservbyport(80, 'tcp')` answer 80/'http' here (the host writes /etc/services) where real Pyodide raises 'service/proto not found': a known difference, undecided (the owner decides whether to mirror Pyodide by writing no /etc/services).
 
 ## 9. Later: wasip2 and the bundle mode (only after everything above; the owner's order)
 

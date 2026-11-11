@@ -255,6 +255,7 @@ def test_a_failed_dlopen_in_the_preload_leaves_the_loader_working(flavor, cache,
 
 
 def test_runtime_name_and_interrupt_after_a_restore(flavor, cache, capfd):
+    """A guard (the old code behaved the same), not a regression test."""
     # the adapter's wasm globals (the runtime's name, the signal cell) are not in the memory: a restore sets them again
     code = "import sys; print(sys._emscripten_info.runtime)"
     for want_restored in (False, True):
@@ -265,3 +266,26 @@ def test_runtime_name_and_interrupt_after_a_restore(flavor, cache, capfd):
             assert py.run("try:\n    for _ in range(10**6): pass\nexcept KeyboardInterrupt: print('interrupted')") == 0
         out = capfd.readouterr().out.splitlines()
         assert out[0].startswith("pyodide-nojs ") and out[1:] == ["interrupted"]
+
+
+def test_runtime_name_is_a_fresh_copy_per_call(flavor, cache, capfd):
+    # CPython frees what _Py_emscripten_runtime returns (stringToNewUTF8 gives a new string each time): the same block
+    # twice would be freed heap
+    code = (
+        "import ctypes, sys\n"
+        "c = ctypes.CDLL(None)\n"
+        "f = c._Py_emscripten_runtime\nf.restype = ctypes.c_void_p\nc.free.argtypes = [ctypes.c_void_p]\n"
+        "a, b = f(), f()\n"
+        "assert a and b and a != b\n"
+        "print(ctypes.string_at(a).decode(), ctypes.string_at(b).decode())\n"
+        "c.free(a); c.free(b)\n"
+        "blocks = [c.malloc(24) for _ in range(50)]\n"
+        "for p in blocks: c.free(p)\n"
+        "print(sys._emscripten_info.runtime)\n"
+    )
+    for _ in range(2):  # fresh, then restored
+        with Pyodide(flavor, preload=PRE) as py:
+            assert py.run(code) == 0
+        out = capfd.readouterr().out.splitlines()
+        assert len(out) == 2 and out[0].count("pyodide-nojs ") == 2 and out[1].startswith("pyodide-nojs ")
+        assert out[0].split(" ")[1] == out[0].split(" ")[3] == out[1].split(" ")[1]

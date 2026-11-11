@@ -58,8 +58,9 @@ EXPORT("_Py_CheckEmscriptenSignals_Helper") i32 check_signals(void) {
     return v;
 }
 
-// sys._emscripten_info.runtime: the host asks for a block of n bytes once at start (__nojs_set_runtime, hidden from dlsym
-// and the GOT), writes the name into it, and Python gets the block's address
+// sys._emscripten_info.runtime: the host asks for a private block of n bytes once at start (__nojs_set_runtime, hidden
+// from dlsym and the GOT) and writes the name into it; every call of _Py_emscripten_runtime returns a fresh malloc'd copy,
+// as the glue's stringToNewUTF8 does (CPython frees what it gets). 0 if the name was never set or malloc fails.
 __asm__(".globaltype runtime_state, i32\nruntime_state:\n");
 EXPORT("__nojs_set_runtime") u32 set_runtime(u32 n) {
     u32 p = (u32)calloc(1, n);
@@ -67,9 +68,15 @@ EXPORT("__nojs_set_runtime") u32 set_runtime(u32 n) {
     return p;
 }
 EXPORT("_Py_emscripten_runtime") u32 runtime_name(void) {
-    u32 p;
-    __asm__ volatile("global.get runtime_state\n\tlocal.set %0" : "=r"(p));
-    return p;
+    const char *src;
+    __asm__ volatile("global.get runtime_state\n\tlocal.set %0" : "=r"(src));
+    if (!src) return 0;
+    u32 n = 0;
+    while (src[n]) n++;
+    char *d = (char *)malloc(n + 1);
+    if (!d) return 0;
+    for (u32 i = 0; i <= n; i++) d[i] = src[i];
+    return (u32)d;
 }
 
 #endif

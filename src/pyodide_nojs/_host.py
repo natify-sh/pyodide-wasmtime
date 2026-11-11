@@ -413,7 +413,7 @@ class MainExports(Mapping):
         for n in self.base:
             if n not in self.hidden and n not in self.extra:
                 yield n
-        yield from self.extra
+        yield from (n for n in self.extra if n not in self.hidden)
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
@@ -1865,7 +1865,9 @@ class Pyodide:
         from . import __version__
 
         b = f"pyodide-nojs {__version__}".encode() + b"\0"
-        self._wr(self._svc_ex["__nojs_set_runtime"](self.store, len(b)) & 0xFFFFFFFF, b)
+        p = self._svc_ex["__nojs_set_runtime"](self.store, len(b)) & 0xFFFFFFFF
+        if p:  # out of memory: no name is set, and the adapter's _Py_emscripten_runtime answers NULL
+            self._wr(p, b)
 
     def _dl_depth(self) -> int:
         """How many NEEDED libraries the adapter may nest: what the wasm stack in force allows."""
@@ -1886,6 +1888,8 @@ class Pyodide:
         ]  # a byte: Python looks for signals if it is 1
         self._wr(flag.value(self.cur[-1]), b"\x01")
         cell = self._svc_ex["__nojs_sigcell_addr"](self.cur[-1]) & 0xFFFFFFFF  # the adapter's, made on first call
+        if not cell:
+            raise RuntimeError("the guest is out of memory: no word for the signal")
         self._wr(cell, struct.pack("<I", signum))
 
     def _cpu_clock(self, cid: int, res: int, out: int) -> int:

@@ -1292,7 +1292,7 @@
   "class": "hook",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c runtime_name returns the block the host asked for once at start (no host operation: _host.py _set_runtime calls the adapter's export __nojs_set_runtime, hidden from dlsym and the GOT, and writes 'pyodide-nojs <version>' into it, again after a snapshot restore): a calloc'd string (Pyodide on Node: 'node v22.23.4 (v8 ...)'; the engine's version is not named: it belongs to neither the adapter nor this host); sys._emscripten_info.runtime shows it",
+  "evidence": "adapter.c runtime_name returns a fresh malloc'd copy of a private block per call, as stringToNewUTF8 gives (CPython frees it); the host asked for the block once at start (no host operation: _host.py _set_runtime calls the adapter's export __nojs_set_runtime, hidden from dlsym and the GOT, and writes 'pyodide-nojs <version>' into it, again after a snapshot restore): a calloc'd string (Pyodide on Node: 'node v22.23.4 (v8 ...)'; the engine's version is not named: it belongs to neither the adapter nor this host); sys._emscripten_info.runtime shows it",
   "tested": "tests/test_signals.py::test_the_runtime_is_named, tests/test_snapshot.py::test_runtime_name_and_interrupt_after_a_restore, tests/test_review_fixes.py::test_sys_executable_is_the_web_pyodides"
  },
  {
