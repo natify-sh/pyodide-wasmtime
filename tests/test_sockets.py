@@ -184,7 +184,8 @@ def test_a_server_socket_binds_listens_and_accepts(guest: Guest, port: int):
     out = run(
         guest,
         port,
-        "l = socket.socket(); l.bind(('127.0.0.1', 0)); l.listen(5); la = l.getsockname()\n"
+        "l = socket.socket(); l.bind(('127.0.0.1', 0)); la = l.getsockname()\n"
+        "print('acceptconn before listen:', l.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)); l.listen(5)\n"
         "print('type/acceptconn:', l.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE),"
         " l.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))\n"
         "c = socket.create_connection(la); s, peer = l.accept()\n"
@@ -200,6 +201,7 @@ def test_a_server_socket_binds_listens_and_accepts(guest: Guest, port: int):
         "print('option values are the host:', l.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) > 0)\n",
     )
     assert out == [
+        "acceptconn before listen: 0",
         "type/acceptconn: 1 1",
         "addresses: True True True",
         "data: b'hi'",
@@ -234,8 +236,8 @@ def test_a_non_blocking_connect_is_in_progress_then_completes(guest: Guest, port
         "k = socket.socket(); k.settimeout(3); k.connect(('127.0.0.1', PORT))\n"
         "print('timeout connect:', k.getpeername()[1] == PORT)\n",
     )
-    # the "revents" line is only for the message: macOS gave POLLERR [False] (CI run 42829422107) and what it gives
-    # instead (POLLHUP?) is not known yet
+    # the "revents" line is only for the message: Linux gives POLLERR|POLLHUP|POLLOUT, macOS gave POLLHUP alone
+    # (CI run 42844873832), and the host adds the POLLERR from SO_ERROR
     assert [x for x in out if not x.startswith("revents:")] == [
         "connect: True",
         "POLLOUT: [True]",
@@ -261,8 +263,8 @@ def test_poll_reports_a_hang_up(guest: Guest, port: int):
     )
     if sys.platform == "darwin":
         # BSD refuses shutdown() on a socket whose peer has closed (ENOTCONN: CI run 42829422107); Linux accepts it.
-        # What poll says after it is not known there yet: the line is in the message
-        assert out[:2] == ["[(True, False)] b''", "shutdown: ENOTCONN"], out
+        # and its poll says POLLHUP at once for the closed peer (Linux only after shutdown): CI run 42844873832
+        assert out[:2] == ["[(True, True)] b''", "shutdown: ENOTCONN"], out
     else:
         assert out == ["[(True, False)] b''", "[True]"]
 

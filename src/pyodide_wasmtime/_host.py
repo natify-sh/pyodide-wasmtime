@@ -157,7 +157,7 @@ SOCK_OPTIONS = {
     (41, 26): "IPV6_V6ONLY",
 }
 # on/off options: BSD (macOS) answers getsockopt with the option's bit (SO_KEEPALIVE 8, TCP_NODELAY 4), Linux with 1
-BOOL_OPTIONS = {(1, 1), (1, 2), (1, 5), (1, 6), (1, 9), (1, 10), (1, 15), (1, 30), (6, 1), (6, 3), (41, 26)}
+BOOL_OPTIONS = {(1, 1), (1, 2), (1, 5), (1, 6), (1, 9), (1, 10), (1, 15), (6, 1), (6, 3), (41, 26)}
 AI_FLAGS = {
     1: "AI_PASSIVE",
     2: "AI_CANONNAME",
@@ -514,6 +514,9 @@ class Pyodide:
         self.socks: dict = {}
         self.netlog: list[str] = []
         self._shut_both: weakref.WeakSet[socket.socket] = weakref.WeakSet()  # shutdown(RDWR) was called: poll's HUP
+        self._listening: set[socket.socket] = set()  # listen() was called: SO_ACCEPTCONN (macOS refuses to say it)
+        self._connecting: set[socket.socket] = set()  # a non-blocking connect that has not been looked at yet
+        self._pending_err: dict[socket.socket, int] = {}  # SO_ERROR read by poll for POLLERR, kept for the guest's read
         self.protoents: dict[str, int] = {}  # getprotobyname's answers, by name (guest addresses)
         self.lazy: list[str] = []
         self.converted = 0  # modules whose legacy exceptions the loader converted at dlopen
@@ -1088,6 +1091,7 @@ class Pyodide:
             self.socks[h].listen(backlog if backlog >= 0 else socket.SOMAXCONN)
         except OSError as e:
             return self._werr(e)
+        self._listening.add(self.socks[h])
         return 0
 
     @staticmethod
@@ -1126,7 +1130,9 @@ class Pyodide:
                 finally:
                     s.setblocking(True)
                 if err:
-                    raise OSError(errno.EINPROGRESS if err == 10035 else err, "connect")  # Windows: WSAEWOULDBLOCK
+                    if err in (errno.EINPROGRESS, 10035):  # Windows: WSAEWOULDBLOCK
+                        self._connecting.add(s)
+                    raise OSError(errno.EINPROGRESS if err == 10035 else err, "connect")
             else:
                 s.connect(addr)
         except OSError as e:
@@ -1255,6 +1261,15 @@ class Pyodide:
                 | (16 if r & select.POLLHUP else 0)
                 | (32 if r & select.POLLNVAL else 0)
             )
+            if s in self._pending_err:
+                g |= 8
+            elif s in self._connecting and g & 20 and not g & 1:
+                # a refused connect: Linux says POLLERR|POLLHUP|POLLOUT, macOS only POLLHUP. SO_ERROR is cleared by the
+                # read, so it is kept for the guest's own getsockopt(SO_ERROR), once, as the kernel would give it
+                self._connecting.discard(s)
+                if err := s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                    self._pending_err[s] = err
+                    g |= 8
             out[i] = g & (events[i] | 8 | 16 | 32)
         return out
 
@@ -1277,6 +1292,9 @@ class Pyodide:
     def _n_close(self, h: int) -> int:
         s = self.socks.pop(h, None)
         if s:
+            self._listening.discard(s)
+            self._connecting.discard(s)
+            self._pending_err.pop(s, None)
             s.close()
         return 0
 
@@ -1327,10 +1345,11 @@ class Pyodide:
         """getsockopt: the option is found by name in the host's socket module; an unknown one is ENOPROTOOPT."""
         s = self.socks[h]
         cap = int.from_bytes(self._rd(lenp, 4), "little")
-        if level == 1 and opt in (3, 38, 39):  # SO_TYPE, SO_PROTOCOL, SO_DOMAIN: musl's numbers, not the host's
+        if level == 1 and opt in (3, 30, 38, 39):  # SO_TYPE, SO_ACCEPTCONN, SO_PROTOCOL, SO_DOMAIN: musl's numbers
             stream = s.type == socket.SOCK_STREAM
             val = {
                 3: 1 if stream else 2,
+                30: int(s in self._listening),
                 38: s.proto or (6 if stream else 17),
                 39: 2 if s.family == socket.AF_INET else 10,
             }
@@ -1341,7 +1360,12 @@ class Pyodide:
                 self.netlog.append(f"getsockopt {level}/{opt}: the host's socket module has no such option")
                 return -GUEST_ERRNO["NOPROTOOPT"]
             try:
-                raw = s.getsockopt(hl, ho, min(max(cap, 4), 1024))
+                if (level, opt) == (1, 4):
+                    self._connecting.discard(s)
+                if (level, opt) == (1, 4) and s in self._pending_err:
+                    raw = self._pending_err.pop(s).to_bytes(4, "little")
+                else:
+                    raw = s.getsockopt(hl, ho, min(max(cap, 4), 1024))
             except OSError as e:
                 self.netlog.append(f"getsockopt {level}/{opt} -> {e}")
                 return self._werr(e)
@@ -1755,8 +1779,14 @@ class Pyodide:
         off = self._gmtoff(t)
         winter, summer = self._year_minutes(_civil_from_days((t + off) // 86400)[0])
         minutes = int(off / 60)
+        if not -(1 << 31) <= minutes * 60 < 1 << 31:  # not an offset: a host C library that failed (Windows)
+            return -(1 << 31)
         # the offset of the summer (the larger one) is DST when the year has two
-        self._wr(tm + 32, struct.pack("<ii", int(summer != winter and minutes == max(winter, summer)), minutes * 60))
+        flag = int(summer != winter and minutes == max(winter, summer))
+        try:
+            self._wr(tm + 32, struct.pack("<ii", flag, minutes * 60))
+        except struct.error as e:
+            raise RuntimeError(f"localtime t={t} off={off} winter={winter} summer={summer}: {e}") from e
         return off
 
     def _t_mktime(self, tm: int) -> int:
@@ -1781,7 +1811,10 @@ class Pyodide:
         y, m, d = _civil_from_days(days)
         yday = days - _days_from_civil(y, 1, 1)
         fields = (secs % 60, secs // 60 % 60, secs // 3600, d, m - 1, y - 1900, (days + 4) % 7, yday)
-        self._wr(tm, struct.pack("<8i", *fields) + struct.pack("<i", dst))
+        try:
+            self._wr(tm, struct.pack("<8i", *fields) + struct.pack("<i", dst))
+        except struct.error as e:
+            raise RuntimeError(f"mktime u={u} fields={fields} dst={dst} guessed={guessed}: {e}") from e
         return u
 
     def _t_tzset(self, timezone: int, daylight: int, std_name: int, dst_name: int) -> None:

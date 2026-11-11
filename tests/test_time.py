@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 from conftest import Guest, check_file
 
+from pyodide_wasmtime._host import Pyodide
+
 ZONES = ["UTC", "Europe/Kyiv", "America/New_York", "Australia/Lord_Howe", "Asia/Kolkata"]
 
 
@@ -76,3 +78,17 @@ def test_structs_above_2_gib_are_read_and_written_where_they_are(guest: Guest) -
     the other end of the memory."""
     out = run_in_zone(guest, ABOVE_2GIB, "UTC", raw=True).splitlines()
     assert out == ["True 1593604800 12 1 3 182", "12 1 120 0"]
+
+
+def test_a_host_offset_that_is_not_one_is_the_error_code_not_a_crash() -> None:
+    """A C library that returns an absurd tm_gmtoff (seen on Windows) gives the JS error convention (INT_MIN), and a
+    struct that can not hold a value says which values it had."""
+    host = object.__new__(Pyodide)
+    written: list[bytes] = []
+    host._wr = lambda a, d: written.append(bytes(d))  # type: ignore[method-assign]
+    host._gmtoff = lambda t: 1 << 40  # type: ignore[method-assign]
+    assert host._t_localtime(0, 0) == -(1 << 31)
+    assert not written
+    host._gmtoff = lambda t: 3600  # type: ignore[method-assign]
+    assert host._t_localtime(0, 0) == 3600
+    assert written[0][4:] == (3600).to_bytes(4, "little")
