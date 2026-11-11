@@ -9,6 +9,8 @@ pyodide-nojs -c "import sys; print(sys.version, sys.platform)"      # 3.15.0rc1 
 pyodide-nojs script.py arg1 arg2
 pyodide-nojs                                                        # a REPL on a terminal; the script on stdin otherwise
 ```
+Command line flags (`pyodide-nojs -h` has the rest): `--flavor fused|dynamic`, `--site DIR` (a folder copied into the guest's site-packages), `--mount GUEST=HOST`, `--mount-cwd`, `--env K=V`, `--inherit-env`, `--dev` (the host's `/dev`, which OpenSSL reads), `--allow-top-level-await` (in the REPL), `--asm-wasm FILE` / `--stdlib FILE` / `--data DIR` (other wasm files than the package's), `-v` (log the loader and the network).
+
 ```python
 from pyodide_nojs import Pyodide
 
@@ -38,17 +40,17 @@ a lock package already installed in the guest (by any source) is not fetched aga
 The lock and `pyodide_lock.py` are written before the `site=` folders, so a `site=` file of the same name wins.
 
 **The guest is isolated.** Its environment is Pyodide's own minimal one (`USER`/`LOGNAME=web_user`, `PATH=/`, `PWD=/`, `HOME=/home/pyodide` (the folder exists), `LANG=en_US.UTF-8`, `LD_LIBRARY_PATH`), plus `env=`; nothing of the host's environment or files reaches it unless you ask (one exception: the CA bundle for TLS is read from the host, as `SSL_CERT_FILE` names it or from the system's, and copied to the guest's `/etc/ssl/cert.pem`: a file named by `SSL_CERT_FILE` that also holds a private key would put that key there):
-`Pyodide(inherit_env=True)` / `--inherit-env` pass ALL the host's variables too, secrets included: the guest can print or send them (`env=` / `--env K=V` win; the interpreter's own `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH` are not taken), `mounts=` / `--mount GUEST=HOST` give a host folder, `--mount-cwd` gives the current folder as the guest's working directory (`/host`). `sys.executable` is `'/home/pyodide/this.program'` as in the browser (the file does not exist); to tell this runtime from the browser's, read `sys._emscripten_info.runtime` (here `'pyodide-nojs <ver>'`). The network and the time zone are still the host's.
+`Pyodide(inherit_env=True)` / `--inherit-env` pass ALL the host's variables too, secrets included: the guest can print or send them (`env=` / `--env K=V` win; the interpreter's own `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH` are not taken), `mounts=` / `--mount GUEST=HOST` give a host folder, `--mount-cwd` mounts the host's current folder at `/host` (the guest itself starts in `/home/pyodide`, as in Pyodide). `sys.executable` is `'/home/pyodide/this.program'` as in the browser (the file does not exist); to tell this runtime from the browser's, read `sys._emscripten_info.runtime` (here `'pyodide-nojs <ver>'`). The network and the time zone are still the host's.
 
 | | |
 |---|---|
 | Pyodide | **315.0.0-alpha.2** (`pyodide_nojs.PYODIDE_VERSION`), Python 3.15.0rc1, Emscripten 6.0.5, wheels of ABI `pyemscripten_2026_5_wasm32` (`PYODIDE_ABI`) |
 | Python | 3.10+ (the host); CPython and PyPy |
-| Needs at run time | wasmtime-py (`[wasmtime]`, 50.0.1+) and the wasm files **in the wheel**: `pyodide.asm.wasm`, `python_stdlib.zip`, `adapter.wasm`, `pyodide_fused.wasm`, `wasm-opt.wasm`. No Node, no native Binaryen |
+| Needs at run time | wasmtime-py (`[wasmtime]`, 50.0.1+) and the wasm files **in the wheel**: `pyodide.asm.wasm`, `python_stdlib.zip`, `adapter.wasm`, `pyodide_fused.wasm`, `wasm-opt.wasm`, `pyodide-lock.json`. No Node, no native Binaryen |
 
 ## How it works
 Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**, after the
-shape of Wasmtime's `wasi_snapshot_preview1` adapter (`wasm/adapter.c`, which includes the sections in `wasm/adapter/*.h`; about 3 000 lines of C, no data section, no stack of its own):
+shape of Wasmtime's `wasi_snapshot_preview1` adapter (`wasm/adapter.c`, which includes the sections in `wasm/adapter/*.h`; about 3 500 lines of C, no data section, no stack of its own):
 system calls over WASI, the dynamic loader (`dlopen` of a wheel's `.so`), libffi's calls, sockets, time, the trampoline.
 The host (`_host.py`) gives what a wasm module cannot do: wasmtime's WASI, the loader operations (it holds the instances by name),
 libffi's calls and callbacks (a call is made with the callee's real wasm type, as the JavaScript glue does), the host's time zone, the host's sockets and `statvfs`

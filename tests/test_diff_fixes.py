@@ -135,7 +135,7 @@ def test_inherit_env_and_env_flags(guest: Guest, monkeypatch: pytest.MonkeyPatch
 
 
 def test_mount_cwd(guest: Guest, tmp_path: Path) -> None:
-    """--mount-cwd: the host's current folder is the guest's working directory."""
+    """--mount-cwd: the host's current folder is mounted in the guest at /host."""
     (tmp_path / "hello.txt").write_text("hi")
     import subprocess
 

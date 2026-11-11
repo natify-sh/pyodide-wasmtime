@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--mount-cwd",
         action="store_true",
-        help=f"the host's current folder as the guest's working directory ({CWD_MOUNT}), in one flag",
+        help=f"mount the host's current folder at {CWD_MOUNT} in the guest, in one flag",
     )
     ap.add_argument(
         "--env", action="append", default=[], metavar="K=V", help="an environment variable for the guest (repeatable)"
