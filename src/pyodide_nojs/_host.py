@@ -419,6 +419,8 @@ class MainExports(Mapping):
         return sum(1 for _ in self)
 
 
+# exports of the adapter that only the host calls: the guest's dlsym and GOT do not see them (Pyodide has no such name)
+SERVICE_EXPORTS = ("__nojs_sigcell_addr",)
 _JS_MODULES = ("env", "GOT.mem", "GOT.func", "wasi_snapshot_preview1")  # the glue's import object
 _GLOBAL_WHY = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
 
@@ -536,8 +538,9 @@ class Pyodide:
         self.host_state = False
         self.closures_out = 0  # closures the guest holds (allocated, not yet freed): their slots are the host's
         self.live_funcs: dict[int, tuple] = {}  # table slot -> (signature, Func, state) of a closure in use
-        self._cell = 0  # the word with a pending signal (_Py_CheckEmscriptenSignals_Helper), in the guest's memory
-        self._pending = 0  # a signal posted before the guest asked for the word
+        self._svc_ex: Any = (
+            None  # where the host's own exports of the adapter are: the main module (fused), the adapter
+        )
         self.memory: Any = None
         self.store: Any = None
 
@@ -1861,15 +1864,6 @@ class Pyodide:
         _engine.engine()
         return _engine.depth_cap(_engine._STATE["wasm_stack"])
 
-    def _sigcell(self) -> int:
-        """The word that `_Py_CheckEmscriptenSignals_Helper` reads (JavaScript's Py_EmscriptenSignalBuffer)."""
-        self.host_state = True
-        if not self._cell:
-            self._cell = self.ex["malloc"](self.cur[-1], 4)
-            self._wr(self._cell, struct.pack("<I", self._pending))
-            self._pending = 0
-        return self._cell
-
     def interrupt(self, signum: int = 2) -> None:
         """Post signal `signum` (SIGINT: KeyboardInterrupt) to the guest's Python, as JavaScript's
         ``Py_EmscriptenSignalBuffer[0] = 2`` does. Python takes it when it checks for signals: between bytecodes of the
@@ -1883,10 +1877,8 @@ class Pyodide:
             "Py_EMSCRIPTEN_SIGNAL_HANDLING"
         ]  # a byte: Python looks for signals if it is 1
         self._wr(flag.value(self.cur[-1]), b"\x01")
-        if self._cell:
-            self._wr(self._cell, struct.pack("<I", signum))
-        else:
-            self._pending = signum
+        cell = self._svc_ex["__nojs_sigcell_addr"](self.cur[-1]) & 0xFFFFFFFF  # the adapter's, made on first call
+        self._wr(cell, struct.pack("<I", signum))
 
     def _cpu_clock(self, cid: int, res: int, out: int) -> int:
         """clock_gettime(CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID): the host's own CPU time, in nanoseconds
@@ -2095,7 +2087,6 @@ class Pyodide:
             "localtime",
             "mktime",
             "tzset",
-            "sigcell",
             "runtime",
             "depth",
         )
@@ -2142,7 +2133,6 @@ class Pyodide:
             "localtime": (self._t_localtime, wt.FuncType([wt.ValType.i64(), i32], [i32])),
             "mktime": (self._t_mktime, wt.FuncType([i32], [wt.ValType.i64()])),
             "tzset": (self._t_tzset, ft(4, 0)),
-            "sigcell": (self._sigcell, ft(0)),
             "runtime": (self._runtime_name, ft(0)),
             "depth": (self._dl_depth, ft(0)),
             "cpuclock": (self._cpu_clock, ft(3)),
@@ -2231,6 +2221,8 @@ class Pyodide:
             self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
             self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
             self.instances[0] = {"exports": MainExports(self.ex), "got": []}
+            self._svc_ex = self.ex
+            self.instances[0]["exports"].hidden.update(SERVICE_EXPORTS)
             self._drop_stubs()
             mods: dict[str, int] = {}
             for i in main_mod.imports:
@@ -2310,6 +2302,8 @@ class Pyodide:
             # what the fused module exports: the main module's symbols and the adapter's (dlsym(NULL), the GOT)
             self.instances[0]["exports"].extra.update({n: adapter[n] for n in adapter_names})
             self.instances[0]["exports"].extra[_wasm.TRAMP] = tramp[_wasm.TRAMP]
+            self._svc_ex = adapter
+            self.instances[0]["exports"].hidden.update(SERVICE_EXPORTS)
             table = shim["table"]  # fixup
             for n, k in fwd.items():
                 table.set(store, k, wt.Val.funcref(tramp[n] if n == _wasm.TRAMP else adapter[n]))
@@ -2610,7 +2604,6 @@ class Pyodide:
         self.functions.clear()
         self.func_pool.clear()
         self.live_funcs.clear()
-        self._cell = self._pending = 0
         self._started = False
 
     def __enter__(self) -> Pyodide:

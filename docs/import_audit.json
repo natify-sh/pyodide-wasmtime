@@ -1302,7 +1302,7 @@
   "gaps": [
    "Pyodide.interrupt() writes the guest's memory through the Store, which is not thread-safe: it works from a host function the guest is calling (a poll, a callback) and between run() calls, not from another thread against a running busy loop (JS writes a SharedArrayBuffer from any thread)."
   ],
-  "evidence": "adapter.c check_signals: reads and clears the word at the address the host gave (loader.sigcell); Pyodide.interrupt(signum=2) (_host.py) writes the signal number there and sets Python's Py_EMSCRIPTEN_SIGNAL_HANDLING byte (what setInterruptBuffer does). Python takes it between bytecodes (within ~50): SIGINT -> KeyboardInterrupt, another signal runs its handler. Tested from a host function (the net.pollv operation) the guest is calling; not from another thread (see gaps)",
+  "evidence": "adapter.c check_signals: reads and clears the word that lives in the adapter's own block (no host operation: the host asks for its address through the adapter's export __nojs_sigcell_addr, which dlsym and the GOT do not show, since Pyodide has no such name); Pyodide.interrupt(signum=2) (_host.py) writes the signal number there and sets Python's Py_EMSCRIPTEN_SIGNAL_HANDLING byte (what setInterruptBuffer does). Python takes it between bytecodes (within ~50): SIGINT -> KeyboardInterrupt, another signal runs its handler. Tested from a host function (the net.pollv operation) the guest is calling; not from another thread (see gaps)",
   "tested": "tests/test_signals.py::test_interrupt_from_a_host_function"
  },
  {

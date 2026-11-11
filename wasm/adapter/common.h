@@ -77,7 +77,6 @@ LOADER("ffi_free") void host_ffi_free(u32 index);
 LOADER("localtime") i32 host_localtime(i64 t, i32 *tm);  // tm_isdst and tm_gmtoff of the host's zone; 1 beyond Date's range
 LOADER("mktime") i64 host_mktime(i32 *tm);
 LOADER("tzset") void host_tzset(i32 *timezone, i32 *daylight, char *std_name, char *dst_name);
-LOADER("sigcell") u32 *host_sigcell(void);  // the word where the host posts a signal for Python
 LOADER("depth") i32 host_depth(void);       // how many NEEDED libraries may nest (the wasm stack in force decides)
 LOADER("runtime") u32 host_runtime(void);   // a malloc'd string naming the runtime
 LOADER("cpuclock") i32 host_cpuclock(i32 id, i32 res, u64 *out);  // the host's CPU time of the process (2) or thread (3), in ns; res: its resolution. -> an errno

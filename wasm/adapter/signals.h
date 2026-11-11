@@ -12,7 +12,7 @@
 EXPORT("__call_sighandler") void call_sighandler(u32 fp, i32 sig) { ((void (*)(i32))fp)(sig); }
 
 typedef struct {
-    u32 *cell;          // where the host posts a signal number
+    u32 cell;           // where the host posts a signal number (its address: __nojs_sigcell_addr)
     double deadline[3];  // ITIMER_REAL, VIRTUAL, PROF: when it fires (get_now's clock), 0: not armed
 } Sig;
 __asm__(".globaltype sig_state, i32\nsig_state:\n");
@@ -21,11 +21,13 @@ static Sig *sigst(void) {
     __asm__ volatile("global.get sig_state\n\tlocal.set %0" : "=r"(r));
     if (!r) {
         r = (Sig *)calloc(1, sizeof(Sig));
-        r->cell = host_sigcell();
         __asm__ volatile("local.get %0\n\tglobal.set sig_state" : : "r"(r));
     }
     return r;
 }
+
+// the host reads the cell's address from here (Pyodide.interrupt); the name is the host's own, hidden from dlsym
+EXPORT("__nojs_sigcell_addr") u32 sigcell_addr(void) { return (u32)&sigst()->cell; }
 
 EXPORT("_setitimer_js") i32 setitimer_js(i32 which, double timeout_ms) {
     if ((u32)which > 2) return 0;
@@ -51,8 +53,8 @@ EXPORT("_Py_CheckEmscriptenSignals_Helper") i32 check_signals(void) {
         u32 out[2], slot = dl_sym(0, (const char *)nm, 19, out);
         if (out[0] == 2 || out[0] == 3) ((void (*)(i32, double))slot)(which, now);  // 3: a slot made by this lookup
     }
-    i32 v = (i32)*s->cell;
-    *s->cell = 0;
+    i32 v = (i32)s->cell;
+    s->cell = 0;
     return v;
 }
 
