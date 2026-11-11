@@ -48,7 +48,17 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 ## 5. Work: the differential audit (task #17)
 
-* Files: done (`docs/DIFF_AUDIT_files.md`, `tools/diff_pyodide.py`, `tools/diff_probes/`, merged). **Runtime** (time/zones, signals, exit/abort/assert, sys/os info, ctypes/ffi) and **loader/io** (dlopen/dlsym with built side modules, mmap, std streams, poll/select, `/dev`, env) agents are running; their reports are triaged here when they arrive.
+* Files: done (`docs/DIFF_AUDIT_files.md`). Runtime: done (`docs/DIFF_AUDIT_runtime.md`, 12 probe files, about 7500 cases per TZ-run; time functions show NO difference in 7 zones x 4509 cases). Loader/io: the agent is still running.
+* **R-rows from the runtime audit (new differences, each with `tools/diff_probes/runtime_repro.py` as the acceptance probe):**
+  * R1 (crash) a `CFUNCTYPE` callback with 3+ arguments that touches a descriptor traps `Pointer not aligned to 8` (`_host.py` `_ffi_closure`: align the stack pointer down to 16; check `_ffi_call` the same way).
+  * R2 `os._exit(n)`, C `exit(n)` and default-action signals with status >= 126 or < 0 fail in the host (`exit with invalid exit status outside of [0..126)`, code 134): mask with 255.
+  * R3 `clock_gettime(2/3)`, `time.process_time()`, C `clock()` fail (EBADF, RuntimeError, -1); Pyodide answers with the monotonic clock (D12: mirror it or give real CPU time). This is the suite's "processor time" group.
+  * R4 `sys.exit(True)` (host `int('True')`); R5 uncaught exception with a custom `sys.excepthook` (the wrapper prints the traceback itself); R6 `print` then trap/abort/`_exit` on a pipe loses the line (`line_buffering` is False; Pyodide True).
+  * R7 environment: HOME, USER, LOGNAME, PATH, LANG, PYTHONINSPECT missing or different (`expanduser('~')` stays `~`, `Path.home()` and `getpass.getuser()` raise), `PYTHONHOME`/`PYTHONPATH` leak into `os.environ` (D13: copy Pyodide's environment, `BASE_ENV` in `_host.py`); R8 `sys.path` order (site-packages first: a wheel can shadow the stdlib), `sys.executable` is empty, `flags.inspect` 0.
+  * R9 19 glue library functions that no wasm of the build calls (`emscripten_get_now_res`, `emscripten_random`, `emscripten_console_*`, `emscripten_run_script`, `emscripten_force_exit` ...) are missing from dlsym and not in `import_audit.json` (`audit_imports.py` should list the glue's library too); R10 `__assert_fail` with a pointer outside memory traps while printing; R11 `mktime((-271821, 6, 15, ...))` returns a value where Pyodide raises OverflowError.
+  * Known and re-observed: `_setitimer_js` fires in a busy loop (deliberate), a struct nested 100 deep traps in `ffi_call_js`, `emscripten_resize_heap`, `os.system` -1, progname, the JS bridge.
+  * Not probed: Windows/macOS TZ, `interrupt()` from another thread, a side module importing an `emscripten_*` function, `resource` (cannot be imported on either side).
+* Add to section 1: **D12** mirror Pyodide's CPU-clock answer (the monotonic clock) or give real CPU time; **D13** the guest's environment: copy Pyodide's (`HOME=/home/pyodide`, `USER=web_user`, `LANG=en_US.UTF-8`) or keep the minimal one.
 * `tools/diff_pyodide.py` needs `PYO_RUN` (a script running a Python file in the real Pyodide on Node); make a real tool of it (a node script on the npm `pyodide` package, a build-time tool) instead of a scratchpad script.
 * Re-run the root-dependent rows (N14, N27) as a non-root user.
 
@@ -82,7 +92,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 ## Order of work now (2026-11-11)
 
 1. Wait for the two audits (runtime, loader/io); triage their tables here (new rows, known, host-dependent).
-2. W1 crashes and hangs; W2 `/dev`; process time; W4 multiple buffers; the small suite items.
+2. W1 crashes and hangs and R1/R2 (crash and exit status); W2 `/dev`; R3 process time; W4 multiple buffers; the small suite items.
 3. D4/D5 (root in memory? decoupled fd numbers) decided with the audit's numbers, then W3/W5.
 4. A `reviewer` on the descriptor layer and the override feature (section 6).
 5. T1 terminal, then S1 (xfail for what is left).
