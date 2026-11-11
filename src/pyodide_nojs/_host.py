@@ -44,6 +44,9 @@ from . import _engine, _wasm
 log = logging.getLogger("pyodide_nojs")
 
 PYVER = "3.15"  # the Python of the pinned Pyodide (315.0.0-alpha.2 = 3.15.0rc1)
+LOCK_BASE = (
+    "https://cdn.jsdelivr.net/pyodide/v315.0.0a2/full/"  # where the wheels of the lock are (bump with the release)
+)
 PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited constant in the pinned pyodide.asm.wasm
 FLAVORS = ("fused", "dynamic")
 DATA = Path(__file__).resolve().parent / "data"
@@ -612,6 +615,10 @@ class Pyodide:
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
         (root / "etc" / "services").write_text("".join(f"{n} {p}/{pr}\n" for (n, pr), p in SERVICES.items()))
         shutil.copy(Path(__file__).with_name("guest") / "hostnet.py", sp)
+        shutil.copy(Path(__file__).with_name("guest") / "pyodide_lock.py", sp)
+        lock = self.data / "pyodide-lock.json"  # Pyodide's package lock, for micropip (guest/pyodide_lock.py)
+        if lock.exists():
+            shutil.copy(lock, sp / "pyodide-lock.json")
         # the frozen `encodings` package looks in /lib/python3.15/encodings, which does not exist: the stdlib is the
         # zip (Pyodide's JavaScript sets this up); without it every codec but the frozen ones is missing
         # Pyodide's _socket was built without the constant SO_REUSEADDR (musl's value is 2), which asyncio and
@@ -619,6 +626,12 @@ class Pyodide:
         (sp / "sitecustomize.py").write_text(
             f"import encodings\nencodings.__path__.append('/lib/python{PYVER.replace('.', '')}.zip/encodings')\n"
             "import _socket\n_socket.SO_REUSEADDR = 2\n"
+            + (
+                "import pyodide_lock\n"
+                f"pyodide_lock.hook('/lib/python{PYVER}/site-packages/pyodide-lock.json', {LOCK_BASE!r})\n"
+                if lock.exists()
+                else ""
+            )
         )
 
     def _drop_stubs(self) -> None:
@@ -2453,6 +2466,13 @@ class Pyodide:
                     self.preload,
                     hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     hashlib.sha256(Path(__file__).with_name("guest").joinpath("hostnet.py").read_bytes()).hexdigest(),
+                    [
+                        hashlib.sha256(f.read_bytes()).hexdigest() if f.exists() else None
+                        for f in (
+                            Path(__file__).with_name("guest") / "pyodide_lock.py",
+                            self.data / "pyodide-lock.json",
+                        )
+                    ],
                     self._wasi_env(),
                     self.preopen_dev,
                     [isatty(fd) for fd in (0, 1, 2)],  # the guest decides buffering at init

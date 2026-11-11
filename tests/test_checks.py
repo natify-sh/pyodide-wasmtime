@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import http.server
+import io
 import re
 import sys
+import threading
+import zipfile
 
 import pytest
 from conftest import Guest, check_file
@@ -95,3 +101,68 @@ def test_numpy_wheel_from_the_cdn_is_converted_at_dlopen(guest: Guest):
     assert p.returncode == 0, p.stderr[-2000:]
     assert p.stdout.splitlines() == check_file("numpy_check.expected").splitlines()
     assert p.stderr.count("[loader] converted legacy exceptions") >= 2
+
+
+def _wheel(name: str, body: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(f"{name}.py", body)
+        z.writestr(f"{name}-1.0.dist-info/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n")
+        z.writestr(f"{name}-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        z.writestr(f"{name}-1.0.dist-info/RECORD", "")
+    return buf.getvalue()
+
+
+LOCK_GUEST = """
+import asyncio, json
+import micropip
+import pyodide_lock
+
+L = micropip._compat.LOCKFILE_PACKAGES
+print("lock", micropip._compat.LOCKFILE_INFO["abi_version"], len(L), L["numpy"]["version"])
+lock = {"info": {}, "packages": {
+    n: {"name": n, "version": "1.0", "file_name": n + "-1.0-py3-none-any.whl", "sha256": h, "depends": d,
+        "imports": [n], "package_type": "package", "install_dir": "site"}
+    for n, h, d in %r}}
+pyodide_lock.patch(micropip._compat, lock, "http://127.0.0.1:%d/")
+asyncio.run(micropip.install("fakelockpkg"))
+import fakelockpkg
+print("installed", fakelockpkg.VALUE, micropip.list()["fakelockdep"].source)
+"""
+
+
+def test_micropip_finds_a_package_of_the_lock(guest: Guest, tmp_path):
+    """The lock is in the guest; micropip resolves a lock package by name and installs it (and its `depends`)
+    from the base URL, sha256 checked: here a fake lock and a local server, no PyPI, no jsDelivr."""
+    wheels = {"fakelockpkg": _wheel("fakelockpkg", "import fakelockdep\nVALUE = fakelockdep.X + 1\n")}
+    wheels["fakelockdep"] = _wheel("fakelockdep", "X = 41\n")
+    for n, w in wheels.items():
+        (tmp_path / f"{n}-1.0-py3-none-any.whl").write_bytes(w)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
+    handler.log_message = lambda *a: None  # type: ignore[attr-defined]
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    entries = [
+        (n, hashlib.sha256(w).hexdigest(), ["fakelockdep"] if n == "fakelockpkg" else []) for n, w in wheels.items()
+    ]
+    try:
+        lines(
+            guest,
+            LOCK_GUEST % (entries, srv.server_address[1]),
+            "site_net",
+            [r"^lock 2026_5 31 2\.4\.3$", r"^installed 42 pyodide$"],
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.network
+def test_micropip_installs_numpy_from_pyodides_lock(guest: Guest):
+    p = guest.run(
+        "import hostnet; hostnet.install()\nimport asyncio, micropip\nasyncio.run(micropip.install('numpy'))\n"
+        "import numpy\nprint('numpy', numpy.__version__, numpy.arange(3).sum())\n",
+        "site_net",
+    )
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert re.search(r"^numpy 2\.4\.3 3$", p.stdout, re.M), p.stdout

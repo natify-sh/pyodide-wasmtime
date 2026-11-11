@@ -46,7 +46,7 @@ package-dir = { "" = "src" }
 packages = ["pyodide_nojs", "pyodide_nojs.guest"]
 
 [tool.setuptools.package-data]
-pyodide_nojs = ["py.typed", "data/*.wasm", "data/*.zip"]
+pyodide_nojs = ["py.typed", "data/*.wasm", "data/*.zip", "data/*.json"]
 
 [tool.setuptools_scm]
 fallback_version = "0.0.0"

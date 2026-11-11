@@ -3,6 +3,7 @@
 #   sh tools/build_data.sh WORKDIR
 #   pyodide.asm.wasm      Pyodide 315.0.0-alpha.2's, with libc's setsockopt stub made an import (tools/patch_main.mjs), legacy exceptions -> exnref (Binaryen 132 from npm: a BUILD tool)
 #   python_stdlib.zip     the same release's
+#   pyodide-lock.json     the release's package lock (numpy etc.), read by micropip in the guest (guest/pyodide_lock.py)
 #   adapter.wasm          wasm/adapter.c, built with wasi-sdk 34's clang (the one toolchain)
 #   pyodide_fused.wasm    the three above merged into one core module (tools/fuse.py, wasm-merge)
 #   wasm-opt.wasm         Binaryen 132 as wasm32-wasip1 (tools/build_binaryen.sh, ~12 min); $WASM_OPT_WASM names a
@@ -25,6 +26,7 @@ OPT="node $W/dl/binaryen/package/bin/wasm-opt"
 node "$H/tools/patch_main.mjs" "$W/dl/binaryen/package" "$W/dl/pyodide/package/pyodide.asm.wasm" "$W/pyodide.patched.wasm"
 $OPT "$W/pyodide.patched.wasm" --all-features --disable-compact-imports --translate-to-exnref -o "$DATA/pyodide.asm.wasm"
 cp "$W/dl/pyodide/package/python_stdlib.zip" "$DATA/"
+cp "$W/dl/dist/pyodide-lock.json" "$DATA/"
 sh "$H/tools/build_adapter.sh" "$W" "$DATA/adapter.wasm"
 if [ -n "$WASM_OPT_WASM" ]; then cp "$WASM_OPT_WASM" "$DATA/wasm-opt.wasm"; fi
 if [ -n "$BG" ]; then wait "$BG"; fi
