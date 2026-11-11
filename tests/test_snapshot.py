@@ -252,3 +252,16 @@ def test_a_failed_dlopen_in_the_preload_leaves_the_loader_working(flavor, cache,
     assert outs[1][1].splitlines()[0] == (
         'could not load dynamic lib: /nope2.so|Error: Failed to find dynamic library "/nope2.so"'
     )
+
+
+def test_runtime_name_and_interrupt_after_a_restore(flavor, cache, capfd):
+    # the adapter's wasm globals (the runtime's name, the signal cell) are not in the memory: a restore sets them again
+    code = "import sys; print(sys._emscripten_info.runtime)"
+    for want_restored in (False, True):
+        with Pyodide(flavor, preload=PRE) as py:
+            assert py.run(code) == 0
+            assert py.restored is want_restored
+            py.interrupt()
+            assert py.run("try:\n    for _ in range(10**6): pass\nexcept KeyboardInterrupt: print('interrupted')") == 0
+        out = capfd.readouterr().out.splitlines()
+        assert out[0].startswith("pyodide-nojs ") and out[1:] == ["interrupted"]

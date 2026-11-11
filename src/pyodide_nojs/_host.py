@@ -420,7 +420,7 @@ class MainExports(Mapping):
 
 
 # exports of the adapter that only the host calls: the guest's dlsym and GOT do not see them (Pyodide has no such name)
-SERVICE_EXPORTS = ("__nojs_sigcell_addr",)
+SERVICE_EXPORTS = ("__nojs_sigcell_addr", "__nojs_set_runtime")
 _JS_MODULES = ("env", "GOT.mem", "GOT.func", "wasi_snapshot_preview1")  # the glue's import object
 _GLOBAL_WHY = "global import must be a number, valid Wasm reference, or WebAssembly.Global object"
 
@@ -1859,6 +1859,14 @@ class Pyodide:
         self._wr(dst_name, zone(dst))
 
     # ------------------------------------------------------------------ signals and the runtime's name
+    def _set_runtime(self) -> None:
+        """`sys._emscripten_info.runtime`: the name goes into a block of the adapter's, once per start (after a
+        restore too: the adapter's global is new, the string in the restored memory is not referenced again)"""
+        from . import __version__
+
+        b = f"pyodide-nojs {__version__}".encode() + b"\0"
+        self._wr(self._svc_ex["__nojs_set_runtime"](self.store, len(b)) & 0xFFFFFFFF, b)
+
     def _dl_depth(self) -> int:
         """How many NEEDED libraries the adapter may nest: what the wasm stack in force allows."""
         _engine.engine()
@@ -1896,15 +1904,6 @@ class Pyodide:
         except Exception:  # a pointer outside the memory
             return GUEST_ERRNO["FAULT"]
         return 0
-
-    def _runtime_name(self) -> int:
-        """`sys._emscripten_info.runtime`: a string from the guest's malloc, as stringToNewUTF8 gives."""
-        from . import __version__
-
-        b = f"pyodide-nojs {__version__}".encode() + b"\0"
-        p = self.ex["malloc"](self.cur[-1], len(b))
-        self._wr(p, b)
-        return p
 
     # ------------------------------------------------------------------ the host's view of the files
     def _preopen_dir(self, pfd: int) -> str | None:
@@ -2087,7 +2086,6 @@ class Pyodide:
             "localtime",
             "mktime",
             "tzset",
-            "runtime",
             "depth",
         )
     )
@@ -2133,7 +2131,6 @@ class Pyodide:
             "localtime": (self._t_localtime, wt.FuncType([wt.ValType.i64(), i32], [i32])),
             "mktime": (self._t_mktime, wt.FuncType([i32], [wt.ValType.i64()])),
             "tzset": (self._t_tzset, ft(4, 0)),
-            "runtime": (self._runtime_name, ft(0)),
             "depth": (self._dl_depth, ft(0)),
             "cpuclock": (self._cpu_clock, ft(3)),
             "error": (self._dl_error, ft(5, 0)),
@@ -2421,12 +2418,14 @@ class Pyodide:
             path = self._snapshot_path()
             if self._restore(path, slots):
                 self.restored = self._started = True
+                self._set_runtime()
                 self._chdir_home()
                 # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
                 self.run(self._at_start() + 'import sys; "random" in sys.modules and __import__("random").seed()')
                 return
         self.ex["emscripten_stack_init"](store)
         self.ex["__wasm_call_ctors"](store)
+        self._set_runtime()
         self._chdir_home()
         # Pyodide's own main(): PyConfig (home "/", stdlib_dir the zip, no bytecode, argv), Py_InitializeFromConfig; its
         # argv[0] is Emscripten's thisProgram, "./this.program", which CPython resolves against the cwd

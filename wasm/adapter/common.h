@@ -67,7 +67,7 @@ LOADER("call") i32 dl_call(i32 id, const char *name, i32 n);
 LOADER("error") void dl_error(u32 code, const char *name, i32 nn, const char *arg, i32 an);
 // the main module's table, grown by n null entries -> the old size (the trampoline module's table.grow)
 __attribute__((import_module("aux"), import_name("table_grow"))) u32 table_grow(u32 n);
-// libffi's emscripten port (calls and closures), the local time zone, signals and the runtime's name: host operations
+// libffi's emscripten port (calls and closures), the local time zone, signals: host operations
 // (_host.py). ffi_call performs the call with the callee's real wasm type, as the JavaScript glue's
 // `wasmTable.get(fn)(...args)` does; ffi_prep puts a host function into the closure's table slot.
 LOADER("ffi_call") void host_ffi_call(const void *cif, u32 fn, void *rvalue, void **avalue);
@@ -78,7 +78,6 @@ LOADER("localtime") i32 host_localtime(i64 t, i32 *tm);  // tm_isdst and tm_gmto
 LOADER("mktime") i64 host_mktime(i32 *tm);
 LOADER("tzset") void host_tzset(i32 *timezone, i32 *daylight, char *std_name, char *dst_name);
 LOADER("depth") i32 host_depth(void);       // how many NEEDED libraries may nest (the wasm stack in force decides)
-LOADER("runtime") u32 host_runtime(void);   // a malloc'd string naming the runtime
 LOADER("cpuclock") i32 host_cpuclock(i32 id, i32 res, u64 *out);  // the host's CPU time of the process (2) or thread (3), in ns; res: its resolution. -> an errno
 
 #define AT_FDCWD (-100)

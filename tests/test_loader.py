@@ -326,7 +326,7 @@ def test_the_main_modules_symbols_are_the_same_on_both_builds(guest: Guest):
 m = ctypes.CDLL(None)
 for n in {NAMES_OF_THE_ADAPTER!r}.split() + ["malloc", "emscripten_log", "emscripten_dlopen", "emscripten_log_impl_js",
                                               "_emscripten_log_formatted", "JsArray_count_js", "JsProxy_Bool_js",
-                                              "__nojs_sigcell_addr"]:
+                                              "__nojs_sigcell_addr", "__nojs_set_runtime"]:
     try:
         getattr(m, n)
         print(n, "found")
@@ -342,7 +342,7 @@ for n in {NAMES_OF_THE_ADAPTER!r}.split() + ["malloc", "emscripten_log", "emscri
     # here they are zero stubs, and a stub that returns 0 in silence would be a fake: hidden from dlsym and the GOT
     assert found["JsArray_count_js"] == "missing" and found["JsProxy_Bool_js"] == "missing"
     # also on purpose: the adapter exports that only the host calls have names Pyodide does not have: not visible
-    assert found["__nojs_sigcell_addr"] == "missing"
+    assert found["__nojs_sigcell_addr"] == found["__nojs_set_runtime"] == "missing"
 
 
 FILES_SCOPE = {

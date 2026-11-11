@@ -58,7 +58,18 @@ EXPORT("_Py_CheckEmscriptenSignals_Helper") i32 check_signals(void) {
     return v;
 }
 
-// sys._emscripten_info.runtime
-EXPORT("_Py_emscripten_runtime") u32 runtime_name(void) { return host_runtime(); }
+// sys._emscripten_info.runtime: the host asks for a block of n bytes once at start (__nojs_set_runtime, hidden from dlsym
+// and the GOT), writes the name into it, and Python gets the block's address
+__asm__(".globaltype runtime_state, i32\nruntime_state:\n");
+EXPORT("__nojs_set_runtime") u32 set_runtime(u32 n) {
+    u32 p = (u32)calloc(1, n);
+    __asm__ volatile("local.get %0\n\tglobal.set runtime_state" : : "r"(p));
+    return p;
+}
+EXPORT("_Py_emscripten_runtime") u32 runtime_name(void) {
+    u32 p;
+    __asm__ volatile("global.get runtime_state\n\tlocal.set %0" : "=r"(p));
+    return p;
+}
 
 #endif
