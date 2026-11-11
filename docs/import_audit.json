@@ -1284,8 +1284,8 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_exit -> WASI proc_exit. Pyodide's exitJS does not run C atexit handlers or flush stdio either (Pyodide keeps the runtime alive); probe: ctypes atexit(callback) + printf without newline + exit(3) -> status 3, the handler did not run, nothing flushed, in both. Found by dlsym in the dynamic packaging too",
-  "tested": "tests/test_runtime.py::test_c_exit_ends_the_process_without_atexit_handlers_or_a_flush"
+  "evidence": "adapter.c sc_exit -> WASI proc_exit, which the host answers (`_define_exit`) so that any status ends the process as a process's does, masked to 8 bits (exit(200) is 200, exit(-1) 255; wasmtime's own refuses 126 and above). Pyodide's exitJS does not run C atexit handlers or flush stdio either (Pyodide keeps the runtime alive); probe: ctypes atexit(callback) + printf without newline + exit(3) -> status 3, the handler did not run, nothing flushed, in both. Found by dlsym in the dynamic packaging too",
+  "tested": "tests/test_runtime.py::test_c_exit_ends_the_process_without_atexit_handlers_or_a_flush, tests/test_diff_fixes.py::test_exit_status"
  },
  {
   "name": "_Py_emscripten_runtime",
@@ -1529,8 +1529,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "vfd.h fd_dup/sc_dup: the new number (the lowest free) is another handle on the same object: a file or directory shares its WASI descriptor and so its offset and readdir cookie, a socket its host handle and O_NONBLOCK, a pipe end its buffer; the WASI descriptor is closed with the last number (fd_release; the real descriptor moves to another number when its own is closed first), so a renamed or unlinked file is still the same file. dup of 0/1/2, sockets and pipes works. Probes (pipes_b.py) on real Pyodide, fused and dynamic: the same answers (shared offset (b'01', b'23', 4, 4), dup(999)/dup(-1)/dup(1<<30) EBADF, redirection of 1 and 2).",
-  "tested": "tests/test_descriptors.py::test_dup_shares_the_offset_and_does_not_depend_on_the_name, ::test_dup_of_directories, ::test_dup_of_the_standard_streams, ::test_dup_of_pipe_ends, ::test_dup_of_a_socket, ::test_mmap_keeps_working_after_the_descriptor_is_closed, tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree"
+  "evidence": "vfd.h fd_dup/sc_dup: the new number (the lowest free) is another handle on the same object: a file or directory shares its WASI descriptor and so its offset and readdir cookie, a socket its host handle and O_NONBLOCK, a pipe end its buffer; the WASI descriptor is closed with the last number (fd_release; the real descriptor moves to another number when its own is closed first), so a renamed or unlinked file is still the same file. dup of 0/1/2, sockets and pipes works. Probes (pipes_b.py) on real Pyodide, fused and dynamic: the same answers (shared offset (b'01', b'23', 4, 4), dup(999)/dup(-1)/dup(1<<30) EBADF, redirection of 1 and 2). A preopen directory's number (the root's 3, a mount's, /dev's) is no descriptor of the guest: a call that names it is EBADF as for a free number (is_pre in state.h), and the adapter's own use of it is unchanged (the numbering itself is still WASI's, W5).",
+  "tested": "tests/test_descriptors.py::test_dup_shares_the_offset_and_does_not_depend_on_the_name, ::test_dup_of_directories, ::test_dup_of_the_standard_streams, ::test_dup_of_pipe_ends, ::test_dup_of_a_socket, ::test_mmap_keeps_working_after_the_descriptor_is_closed, tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree, tests/test_diff_fixes.py::test_preopen_descriptors_are_not_the_guests"
  },
  {
   "name": "__syscall_dup3",
@@ -1540,8 +1540,8 @@
    "deliberate difference (owner's design of this step): FD_CLOEXEC is kept per descriptor number (F_GETFD/F_SETFD, pipe2/dup3 O_CLOEXEC, F_DUPFD_CLOEXEC); Pyodide's F_GETFD is constant 0 and F_SETFD a no-op, so there os.get_inheritable is True after os.dup2(a, b, inheritable=False) and after os.set_inheritable(fd, False), and F_DUPFD_CLOEXEC is EINVAL (so os.dup() reports non-inheritable here and inheritable there).",
    "A descriptor number of 1024 or more is not supported (the adapter's tables have 1024 entries, as sockets and files already had; Pyodide's limit is 4096): dup2(fd, 2000) is EBADF here, 2000 there."
   ],
-  "evidence": "vfd.h sc_dup3 over fd_dup: flags other than O_CLOEXEC and oldfd == newfd are EINVAL, a bad oldfd or a newfd outside the table EBADF; what is on newfd is closed first (fd_release: a file's real descriptor moves to another of its numbers, a socket or pipe end drops a reference), then newfd is made (the number must come out of WASI's allocator, which gives the last freed, not the lowest: fd_alloc opens placeholder directories until the wanted number comes, and closes the others, the highest first), and it shares the object of oldfd. dup2 onto an unused number works (it was EBADF), onto an open one shares the offset (equal lseek), onto 0/1/2 redirects. Probes (pipes_b.py) on real Pyodide, fused and dynamic: the same except FD_CLOEXEC and the limit above.",
-  "tested": "tests/test_descriptors.py::test_dup_shares_the_offset_and_does_not_depend_on_the_name, ::test_dup_of_the_standard_streams, ::test_dup_of_pipe_ends"
+  "evidence": "vfd.h sc_dup3 over fd_dup: flags other than O_CLOEXEC and oldfd == newfd are EINVAL, a bad oldfd or a newfd outside the table EBADF; what is on newfd is closed first (fd_release: a file's real descriptor moves to another of its numbers, a socket or pipe end drops a reference), then newfd is made (the number must come out of WASI's allocator, which gives the last freed, not the lowest: fd_alloc opens placeholder directories until the wanted number comes, and closes the others, the highest first), and it shares the object of oldfd. dup2 onto an unused number works (it was EBADF), onto an open one shares the offset (equal lseek), onto 0/1/2 redirects. Probes (pipes_b.py) on real Pyodide, fused and dynamic: the same except FD_CLOEXEC and the limit above. A preopen directory's number (the root's 3, a mount's, /dev's) is no descriptor of the guest: a call that names it is EBADF as for a free number (is_pre in state.h), and the adapter's own use of it is unchanged (the numbering itself is still WASI's, W5).",
+  "tested": "tests/test_descriptors.py::test_dup_shares_the_offset_and_does_not_depend_on_the_name, ::test_dup_of_the_standard_streams, ::test_dup_of_pipe_ends, tests/test_diff_fixes.py::test_preopen_descriptors_are_not_the_guests"
  },
  {
   "name": "_dlopen_js",
@@ -1723,8 +1723,8 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c put_stat/sc_fstat64: the S_IF* type from the WASI filetype (char, block, socket, symlink, directory, regular), the permission bits, uid and gid from the metadata table (defaults 0644/0755/0777), st_dev/st_ino from WASI (st_dev is 32 bits in this ABI: the two halves are folded, st_ino is the full 64 bits), a symlink's size is the length of the target it holds; fd 0-2 are 0o20666 character devices as Pyodide's fstat(1). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings. The guest's root directory has the default mode 0o40777, as Pyodide's.",
-  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_the_guest_root_is_0777"
+  "evidence": "adapter.c put_stat/sc_fstat64: the S_IF* type from the WASI filetype (char, block, socket, symlink, directory, regular), the permission bits, uid and gid from the metadata table (defaults 0644/0755/0777), st_dev/st_ino from WASI (st_dev is 32 bits in this ABI: the two halves are folded, st_ino is the full 64 bits), a symlink's size is the length of the target it holds; fd 0-2 are 0o20666 character devices as Pyodide's fstat(1). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings. The guest's root directory has the default mode 0o40777, as Pyodide's. A preopen directory's number (the root's 3, a mount's, /dev's) is no descriptor of the guest: a call that names it is EBADF as for a free number (is_pre in state.h), and the adapter's own use of it is unchanged (the numbering itself is still WASI's, W5).",
+  "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_the_guest_root_is_0777, tests/test_diff_fixes.py::test_preopen_descriptors_are_not_the_guests"
  },
  {
   "name": "__syscall_stat64",
@@ -1801,10 +1801,12 @@
  {
   "name": "emscripten_get_now",
   "class": "runtime",
-  "verdict": "full",
-  "gaps": [],
+  "verdict": "partial",
+  "gaps": [
+   "deliberate difference (owner, D12): clock_gettime(CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID), clock_getres of them, time.process_time() and C clock() give the host's REAL CPU time (the adapter routes WASI's clock_time_get/clock_res_get and answers ids 2 and 3 from the host's time.process_time_ns()/thread_time_ns()); Pyodide answers them with this monotonic clock (checkWasiClock(id) is 0..3, then performance.now()), so there process_time() is wall time since start. Other ids are EINVAL (as the glue; WASI's own enum conversion would trap)."
+  ],
   "evidence": "adapter.c get_now: WASI monotonic clock in ms with sub-ms digits (performance.now() is relative to process start; ours to the host's monotonic origin, which nothing depends on); time.monotonic/perf_counter are non-decreasing in both",
-  "tested": "suite test_time"
+  "tested": "suite test_time, tests/test_diff_fixes.py::test_cpu_time_clocks_are_the_hosts"
  },
  {
   "name": "__syscall_linkat",

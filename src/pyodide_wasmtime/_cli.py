@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from . import PYODIDE_ABI, PYODIDE_VERSION, __version__
 from ._host import FLAVORS, Pyodide
+
+CWD_MOUNT = "/work"  # where --mount-cwd puts the host's current folder
 
 # The REPL's console lives in the guest (state between lines); the host reads the lines (readline, or prompt_toolkit
 # when installed) and pushes each one. The guest tells the host in /_repl whether the line needs more.
@@ -114,6 +117,19 @@ def main(argv: list[str] | None = None) -> int:
         metavar="GUEST=HOST",
         help="a host folder visible in the guest (repeatable)",
     )
+    ap.add_argument(
+        "--mount-cwd",
+        action="store_true",
+        help=f"the host's current folder as the guest's working directory ({CWD_MOUNT}), in one flag",
+    )
+    ap.add_argument(
+        "--env", action="append", default=[], metavar="K=V", help="an environment variable for the guest (repeatable)"
+    )
+    ap.add_argument(
+        "--inherit-env",
+        action="store_true",
+        help="pass the host's environment variables to the guest (by default it has Pyodide's minimal one)",
+    )
     ap.add_argument("--data", metavar="DIR", help="the wasm files (default: the package's, or $PYODIDE_WASMTIME_DATA)")
     ap.add_argument(
         "--asm-wasm",
@@ -145,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     flavor = ns.flavor or ("dynamic" if ns.asm_wasm or ns.stdlib else None)
     mounts = dict(m.split("=", 1) for m in ns.mount)
+    if ns.mount_cwd:
+        mounts[CWD_MOUNT] = os.getcwd()
     argv0: list[str] | None = None
     code: str | None
     if ns.code is not None:
@@ -163,12 +181,16 @@ def main(argv: list[str] | None = None) -> int:
         flavor,
         site=ns.site,
         mounts=mounts,
+        env=dict(e.split("=", 1) for e in ns.env),
+        inherit_env=ns.inherit_env,
         data=ns.data,
         preopen_dev=ns.dev or None,
         preload=preload,
         asm_wasm=ns.asm_wasm,
         stdlib=ns.stdlib,
     ) as py:
+        if ns.mount_cwd:
+            py.run(f"__import__('os').chdir({CWD_MOUNT!r})")
         if code is None:
             return repl(py)
         return py.run(code, argv0)  # 0, 1 for an uncaught error, or the code of sys.exit()/os._exit()

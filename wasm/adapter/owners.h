@@ -27,6 +27,7 @@ EXPORT("__syscall_fchownat") i32 sc_fchownat(i32 dirfd, const char *path, i32 ui
 
 EXPORT("__syscall_fchown32") i32 sc_fchown32(i32 fd, i32 uid, i32 gid) {
     u64 fs[8];
+    if (is_pre(fd)) return -FE_BADF;
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
     return is_virt(fd) ? 0 : set_owner(fs, uid, gid);

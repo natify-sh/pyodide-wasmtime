@@ -72,6 +72,7 @@ EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, 
 }
 
 EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
+    if (is_pre(fd)) return -FE_BADF;
     if (is_virt(fd)) return -FE_INVAL;
     i32 e = w_fd_set_size(rfd(fd), (u64)len);
     return e ? -e : 0;
@@ -353,7 +354,7 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         i32 n, fd = resolve(AT_FDCWD, dot, &p, &n, dot);
         e = w_path_set_times(fd, 1, p, n, tv[0], tv[1], ff);
     } else {
-        e = w_fd_set_times(rfd(dirfd), tv[0], tv[1], ff);
+        e = is_pre(dirfd) ? FE_BADF : w_fd_set_times(rfd(dirfd), tv[0], tv[1], ff);
     }
     return e ? -e : 0;
 }
@@ -372,6 +373,7 @@ EXPORT("__syscall_chmod") i32 sc_chmod(const char *path, i32 mode) {
 }
 EXPORT("__syscall_fchmod") i32 sc_fchmod(i32 fd, i32 mode) {
     u64 fs[8];
+    if (is_pre(fd)) return -FE_BADF;
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
     return is_virt(fd) ? 0 : set_mode(fs, mode);

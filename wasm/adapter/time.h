@@ -76,4 +76,17 @@ EXPORT("_tzset_js") void tzset_js(i32 *timezone, i32 *daylight, char *std_name, 
     host_tzset(timezone, daylight, std_name, dst_name);
 }
 
+// The clocks of the main module (WASI's clock_time_get/clock_res_get routed here): ids 0 and 1 are WASI's, 2 and 3 are the
+// CPU-time clocks of the process and the thread, which WASI does not have (wasmtime says EBADF) and the host reads. Any other
+// id is EINVAL, as in the glue (WASI's enum conversion would trap). Pyodide answers 2 and 3 with the monotonic clock: a
+// deliberate difference, the owner's decision.
+EXPORT("clock_time_get") i32 x_clock_time_get(i32 id, u64 precision, u64 *out) {
+    if ((u32)id > 3) return FE_INVAL;
+    return id < 2 ? w_clock_time_get(id, precision, out) : host_cpuclock(id, 0, out);
+}
+EXPORT("clock_res_get") i32 x_clock_res_get(i32 id, u64 *out) {
+    if ((u32)id > 3) return FE_INVAL;
+    return id < 2 ? w_clock_res_get(id, out) : host_cpuclock(id, 1, out);
+}
+
 #endif

@@ -218,6 +218,11 @@ static char *absdup(i32 dirfd, const char *path) {
 // A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
 static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot) {
     i32 fd = dirfd = rfd(dirfd);
+    if (path[0] != '/' && is_pre(dirfd)) {  // a preopen is no descriptor of the guest: WASI answers EBADF for -1
+        dot[0] = '.', dot[1] = 0;
+        *out = dot, *len = 1;
+        return -1;
+    }
     path = fixpath(dirfd, path);
     if (path[0] == '/' || dirfd == AT_FDCWD) {
         Pre *P = preopens();
@@ -448,6 +453,7 @@ EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
 }
 
 EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
+    if (is_pre(fd)) return -FE_BADF;
     const char *p = fd_base_path(fd);  // a directory opened by openat, or a preopen
     if (p) return sc_chdir(p);
     u8 st[24] __attribute__((aligned(8)));
@@ -514,6 +520,7 @@ EXPORT("__syscall_lstat64") i32 sc_lstat64(const char *path, void *buf) { return
 
 EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
     u64 fs[8];
+    if (is_pre(fd)) return -FE_BADF;
     if (is_sock(fd)) {  // a socket: S_IFSOCK
         for (i32 i = 0; i < 8; i++) fs[i] = 0;
         put_stat((u8 *)buf, (const u8 *)fs);
@@ -579,7 +586,7 @@ EXPORT("__syscall_faccessat") i32 sc_faccessat(i32 dirfd, const char *path, i32 
 // WASI dirents {d_next u64, d_ino u64, d_namlen u32, d_type u8, name} -> linux_dirent64
 // {d_ino u64, d_off i64, d_reclen u16, d_type u8, name\0, padded to 8}
 EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
-    if (fd < 0) return -EBADF;
+    if (fd < 0 || is_pre(fd)) return -EBADF;
     if (is_virt(fd)) return -FE_NOTDIR;
     fd = rfd(fd);
     u64 *ck = ckp(fd);
@@ -623,6 +630,7 @@ WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
 
 // the WASI filetype of an open descriptor (a socket is a stream socket), or -errno (EBADF)
 static i32 fd_type(i32 fd) {
+    if (is_pre(fd)) return -FE_BADF;
     if (is_virt(fd)) return 6;  // (a pipe is a stream too)
     u8 st[24] __attribute__((aligned(8)));
     i32 e = w_fd_fdstat_get(rfd(fd), st);
@@ -692,8 +700,14 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
 // lseek on a descriptor: a directory keeps its readdir cookie here (rewinddir is SEEK_SET 0, seekdir/telldir use the
 // d_off of the entries, getdents64 continues from it); the others go to WASI. Sockets can not seek.
 EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
+    if (off > (1ll << 53) || off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
+    if (is_pre(fd)) return FE_BADF;
     if (is_virt(fd)) return FE_SPIPE;
     fd = rfd(fd);
+    if ((u32)whence > 2) {  // WASI's enum conversion would trap
+        u8 st[24] __attribute__((aligned(8)));
+        return w_fd_fdstat_get(fd, st) ? FE_BADF : FE_INVAL;
+    }
     i32 e = w_fd_seek(fd, off, whence, newoff);
     if (e != FE_BADF) return e;  // WASI refuses a directory descriptor (EBADF): that one is ours
     u8 st[24] __attribute__((aligned(8)));

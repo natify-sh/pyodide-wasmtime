@@ -18,6 +18,8 @@ WASI_ROUTED = (
     "fd_pread",
     "fd_pwrite",
     "fd_sync",
+    "clock_time_get",
+    "clock_res_get",
 )  # the adapter's first: sockets, pipes, duplicated descriptors, directories
 TRAMP = "_PyEM_TrampolineCall_JS"
 

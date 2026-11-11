@@ -205,10 +205,10 @@ static i32 fd_dup(i32 old, i32 min, i32 exact, i32 cloexec) {
     T->o[p] = o, T->cloexec[p] = (u8)cloexec;
     return p;
 }
-EXPORT("__syscall_dup") i32 sc_dup(i32 fd) { return fd_dup(fd, 0, 0, 0); }
+EXPORT("__syscall_dup") i32 sc_dup(i32 fd) { return is_pre(fd) ? -EBADF : fd_dup(fd, 0, 0, 0); }
 EXPORT("__syscall_dup3") i32 sc_dup3(i32 oldfd, i32 newfd, i32 flags) {
     if (oldfd == newfd || (flags & ~02000000)) return -FE_INVAL;  // O_CLOEXEC only
-    if (newfd < 0 || newfd >= MAXFD) return -EBADF;
+    if (newfd < 0 || newfd >= MAXFD || is_pre(oldfd) || is_pre(newfd)) return -EBADF;
     return fd_dup(oldfd, newfd, 1, (flags & 02000000) != 0);
 }
 

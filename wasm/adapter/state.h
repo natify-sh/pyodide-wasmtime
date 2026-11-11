@@ -77,4 +77,14 @@ static Pre *preopens(void) {
     return r;
 }
 
+// Is the number one of the preopen directories (the root, a mount, /dev)? A guest never sees those descriptors: a call that
+// names one is EBADF, as for a free number (the adapter itself uses them through PREOPEN and preopens()).
+static i32 is_pre(i32 fd) {
+    if (fd < PREOPEN) return 0;
+    Pre *P = preopens();
+    for (i32 k = 0; k < P->n; k++)
+        if (P->fd[k] == fd) return 1;
+    return 0;
+}
+
 #endif

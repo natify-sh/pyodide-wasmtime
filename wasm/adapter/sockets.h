@@ -245,7 +245,7 @@ EXPORT("getprotobyname") u32 getprotobyname_(const char *name) { return net_prot
 // them); anything else is EINVAL.
 EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     u8 st[24] __attribute__((aligned(8)));
-    if (!is_sock(fd) && w_fd_fdstat_get(fd, st)) return -EBADF;
+    if (is_pre(fd) || (!is_sock(fd) && w_fd_fdstat_get(fd, st))) return -EBADF;
     i32 *argp = va ? *(i32 **)va : 0;  // va points at the variable arguments; the first is the argument's address
     if (is_pipe(fd) && (op == 0x541B || op == 0x5421)) {  // PIPEFS: FIONREAD is the bytes buffered, its other ioctls EINVAL
         if (op == 0x5421) return -28;
@@ -267,6 +267,10 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
 
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
+    if (is_pre(fd)) return FE_BADF;
+    i32 empty = 1;
+    for (i32 k = 0; k < n; k++) empty &= !iov[2 * k + 1];
+    if (empty && !is_virt(fd) && fd_std(rfd(fd))) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
     if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
     if (!is_sock(fd)) return w_fd_read(rfd(fd), iov, n, nread);
     if (would_block(fd, 0, 1)) return EAGAIN_;
@@ -286,6 +290,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
 
 WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
+    if (is_pre(fd)) return FE_BADF;
     if (is_pipe(fd)) return pipe_write(vobj(fd), iov, n, nw);
     if (!is_sock(fd)) return w_fd_write(rfd(fd), iov, n, nw);
     if (would_block(fd, 0, 4)) return EAGAIN_;
@@ -303,10 +308,11 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     return 0;
 }
 
-EXPORT("fd_close") i32 x_fd_close(i32 fd) { return fd_release(fd); }
+EXPORT("fd_close") i32 x_fd_close(i32 fd) { return is_pre(fd) ? FE_BADF : fd_release(fd); }
 
 WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
 EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
+    if (is_pre(fd)) return FE_BADF;
     if (!is_virt(fd)) return w_fd_fdstat_get(rfd(fd), buf);
     for (i32 i = 0; i < 24; i++) buf[i] = 0;
     if (is_pipe(fd)) {
@@ -321,11 +327,11 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
 // pread, pwrite and fsync of the main module: a socket or a pipe has no offset (ESPIPE), a pipe can not be synced (EINVAL)
 WASI("fd_sync") i32 w_fd_sync(i32 fd);
 EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
-    return is_virt(fd) ? FE_SPIPE : w_fd_pread(rfd(fd), iov, n, off, nread);
+    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pread(rfd(fd), iov, n, off, nread);
 }
 EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
-    return is_virt(fd) ? FE_SPIPE : w_fd_pwrite(rfd(fd), iov, n, off, nw);
+    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : w_fd_pwrite(rfd(fd), iov, n, off, nw);
 }
-EXPORT("fd_sync") i32 x_fd_sync(i32 fd) { return is_pipe(fd) ? FE_INVAL : is_sock(fd) ? 0 : w_fd_sync(rfd(fd)); }
+EXPORT("fd_sync") i32 x_fd_sync(i32 fd) { return is_pre(fd) ? FE_BADF : is_pipe(fd) ? FE_INVAL : is_sock(fd) ? 0 : w_fd_sync(rfd(fd)); }
 
 #endif

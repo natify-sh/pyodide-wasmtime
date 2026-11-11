@@ -19,6 +19,7 @@ WASI("fd_filestat_get") i32 w_fd_filestat_get(i32 fd, void *buf);
 WASI("path_readlink") i32 w_path_readlink(i32 fd, const char *p, i32 n, char *buf, i32 len, i32 *used);
 WASI("fd_readdir") i32 w_fd_readdir(i32 fd, void *buf, i32 len, u64 cookie, i32 *used);
 WASI("clock_time_get") i32 w_clock_time_get(i32 id, u64 precision, u64 *out);
+WASI("clock_res_get") i32 w_clock_res_get(i32 id, u64 *out);
 
 WASI("fd_prestat_get") i32 w_fd_prestat_get(i32 fd, u32 *buf);
 WASI("fd_prestat_dir_name") i32 w_fd_prestat_dir_name(i32 fd, char *path, i32 len);
@@ -79,6 +80,7 @@ LOADER("tzset") void host_tzset(i32 *timezone, i32 *daylight, char *std_name, ch
 LOADER("sigcell") u32 *host_sigcell(void);  // the word where the host posts a signal for Python
 LOADER("depth") i32 host_depth(void);       // how many NEEDED libraries may nest (the wasm stack in force decides)
 LOADER("runtime") u32 host_runtime(void);   // a malloc'd string naming the runtime
+LOADER("cpuclock") i32 host_cpuclock(i32 id, i32 res, u64 *out);  // the host's CPU time of the process (2) or thread (3), in ns; res: its resolution. -> an errno
 
 #define AT_FDCWD (-100)
 #define PREOPEN 3

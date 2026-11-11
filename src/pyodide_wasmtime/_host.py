@@ -49,16 +49,21 @@ PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited consta
 FLAVORS = ("fused", "dynamic")
 DATA = Path(__file__).resolve().parent / "data"
 
+# The guest's whole environment (the host's is never passed unless `inherit_env`): what Pyodide has on Node
+# (Emscripten's USER, LOGNAME, PATH, PWD, LANG; HOME from its loader), and LD_LIBRARY_PATH (where NEEDED are sought).
 BASE_ENV = [
-    ("PYTHONHOME", "/"),
-    ("LANG", "C.UTF-8"),
-    ("PYTHONPATH", f"/lib/python{PYVER}/site-packages"),
-    (
-        "LD_LIBRARY_PATH",
-        f"/usr/lib:/lib/python{PYVER}/site-packages",
-    ),  # as Pyodide sets it: where NEEDED are looked for
-    ("PYTHONDONTWRITEBYTECODE", "1"),
+    ("USER", "web_user"),
+    ("LOGNAME", "web_user"),
+    ("PATH", "/"),
+    ("PWD", "/"),
+    ("HOME", "/home/pyodide"),
+    ("LANG", "en_US.UTF-8"),
+    ("LD_LIBRARY_PATH", f"/usr/lib:/lib/python{PYVER}/site-packages"),
 ]
+# What the interpreter reads at start only: removed from os.environ once it runs, as in Pyodide (which sets them in its
+# configuration). Never taken from the host's environment.
+INIT_ENV = [("PYTHONHOME", "/"), ("PYTHONDONTWRITEBYTECODE", "1")]
+GUEST_OWN_ENV = {"PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH"}  # `inherit_env` does not override these
 
 MAX_MEMORY = 4 << 30  # the main module's memory: 65536 pages
 MAX_TABLE = 10_000_000  # the glue's WebAssembly.Table limit in V8
@@ -116,6 +121,14 @@ def guest_errno(code: int | None) -> int:
 
 class GuestFault(Exception):
     """A guest pointer or length outside its memory: EFAULT, never a trap of the host."""
+
+
+class GuestExit(Exception):
+    """The guest called proc_exit (exit(), os._exit(), a signal's default action): the status, 0-255."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
 
 
 MSG_FLAGS = {
@@ -209,8 +222,18 @@ SERVICES = {
 }
 
 
-# Run at every start: /tmp is 0o777 in Pyodide, and the guest's modes are the adapter's own records, not the host's.
-_AT_START = "__import__('os').chmod('/tmp', 0o777)\n"
+# Run at every start: /tmp and /home/pyodide are 0o777 in Pyodide, and the guest's modes are the adapter's own
+# records, not the host's; stdout is line buffered, as Pyodide's (a line printed before a trap or os._exit is kept);
+# sys.path as Pyodide has it (the stdlib zip, lib-dynload, then site-packages; no /lib/python3.15, which is not there).
+_AT_START = (
+    "def _start(gone):\n"  # a function: nothing of it stays in __main__
+    "    import os, sys\n"
+    "    for d in ('/tmp', '/home/pyodide'): os.chmod(d, 0o777)\n"
+    "    sys.stdout.reconfigure(line_buffering=True)\n"
+    f"    sys.path[:] = [''] + [p for p in sys.path if p not in ('', '/lib/python{PYVER}')]\n"
+    f"    sys._stdlib_dir = '/lib/python{PYVER.replace('.', '')}.zip'\n"
+    "    for k in gone: os.environ.pop(k, None)\n"
+)
 
 # What the guest runs for one `run()`: the user's code in __main__, SystemExit as an exit status (the interpreter must
 # survive it: Emscripten's exit() ends in `unreachable`), any other error as a traceback and status 1.
@@ -222,10 +245,14 @@ try:
 except SystemExit as _e:
     _c = _e.code
     if _c is None: _rc = 0
-    elif isinstance(_c, int): _rc = _c
+    elif isinstance(_c, int): _rc = int(_c) if -2**63 <= _c < 2**63 else -1
     else: print(_c, file=_s.stderr); _rc = 1
 except BaseException:
-    _t.print_exc(); _rc = 1
+    _rc = 1
+    if _s.excepthook is _s.__excepthook__: _t.print_exc()
+    else:
+        try: _s.excepthook(*_s.exc_info())
+        except BaseException: _t.print_exc()
 _s.stdout.flush(); _s.stderr.flush()
 open({rc!r}, "w").write(str(_rc))
 del _s, _m, _t, _rc
@@ -441,6 +468,8 @@ class Pyodide:
     ``site``: a folder (or several) copied into the guest's ``site-packages`` (a wheel unpacked, ``micropip``...);
     ``mounts``: ``{guest path: host folder}`` preopened as they are (the guest can write there);
     ``preopen_dev``: the host's ``/dev`` (OpenSSL reads ``/dev/urandom``); ``env``: more environment variables.
+    The guest is isolated: its environment is Pyodide's minimal one (``BASE_ENV``) plus ``env``, never the host's,
+    unless ``inherit_env`` passes the host's variables too (``env`` wins).
     The guest's ``/`` is a temporary folder (stdlib zip, site-packages); it is not a sandbox against the host's own
     network: ``socket`` and the host's fetch are real.
 
@@ -460,6 +489,7 @@ class Pyodide:
         mounts: dict[str, str | os.PathLike[str]] | None = None,
         preopen_dev: bool | None = None,
         env: dict[str, str] | None = None,
+        inherit_env: bool = False,
         data: str | os.PathLike[str] | None = None,
         wasm_opt: str | os.PathLike[str] | None = None,
         preload: str | None = None,
@@ -496,6 +526,7 @@ class Pyodide:
         self.mounts = {k: str(v) for k, v in (mounts or {}).items()}
         self.preopen_dev = bool(os.environ.get("PREOPEN_DEV")) if preopen_dev is None else preopen_dev
         self.env = dict(env or {})
+        self.inherit_env = inherit_env
         self.preload = preload
         self.restored = False  # the guest came from a snapshot
         self._net_slots: tuple[int, int] = (0, 0)
@@ -556,6 +587,7 @@ class Pyodide:
             shutil.copytree(s, sp, dirs_exist_ok=True)
         for guest in self.mounts:  # a placeholder, so that a directory listing of the parent shows the mount
             (root / guest.lstrip("/")).mkdir(parents=True, exist_ok=True)
+        (root / "home" / "pyodide").mkdir(parents=True, exist_ok=True)  # HOME
         (root / "tmp").mkdir(exist_ok=True)  # Pyodide has /tmp (mode 0o777, set at start by _boot): tempfile's default
         (root / "etc" / "ssl").mkdir(parents=True)
         (root / "etc" / "ssl" / "cert.pem").write_bytes(ca_bundle())
@@ -848,11 +880,22 @@ class Pyodide:
         except Exception as exc:
             return self._dl_fail("LinkError: WebAssembly.Instance()", exc)
 
+    def _define_exit(self, linker: Any) -> None:
+        """proc_exit as a process has it: any status, masked to 8 bits (wasmtime's own refuses 126 and above)."""
+        wt = self._wt
+        linker.allow_shadowing = True
+
+        def proc_exit(code: int) -> None:
+            raise GuestExit(code & 255)
+
+        linker.define_func("wasi_snapshot_preview1", "proc_exit", wt.FuncType([wt.ValType.i32()], []), proc_exit)
+
     def _wasi_func(self, name: str) -> Any:
         wt = self._wt
         if self._wasi_linker is None:
             self._wasi_linker = wt.Linker(_engine.engine())
             self._wasi_linker.define_wasi()
+            self._define_exit(self._wasi_linker)
         return self._wasi_linker.get(self.cur[-1], "wasi_snapshot_preview1", name)
 
     def _dl_scope(self, id_: int, scope: int) -> None:
@@ -1538,6 +1581,7 @@ class Pyodide:
                 cur = self._down(cur, size, align)
                 self._wr(cur, self._rd(ap, size))
                 self._wr(target, struct.pack("<I", cur))
+        cur &= ~15  # the stack pointer stays 16-aligned (WASI wants out structures aligned to 8)
         if cur == orig:  # nothing on the stack: stackRestore(cur) is a no-op
             res = self._js_call(fn, args)
         else:
@@ -1721,7 +1765,7 @@ class Pyodide:
             varargs += 4
         if nargs:
             self._wr(args_ptr, struct.pack(f"<{nargs}I", *(slots[c] for c in range(nargs))))
-        sp.set_value(ctx, cur)
+        sp.set_value(ctx, cur & ~15)  # 16-aligned, as the compiled code expects
         try:
             self._table_func(fun)(ctx, *(_to_wasm(x, "i32") for x in (cif, ret_ptr, args_ptr, user_data)))
         finally:
@@ -1870,6 +1914,20 @@ class Pyodide:
             self._wr(self._cell, struct.pack("<I", signum))
         else:
             self._pending = signum
+
+    def _cpu_clock(self, cid: int, res: int, out: int) -> int:
+        """clock_gettime(CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID): the host's own CPU time, in nanoseconds
+        (or the clock's resolution). EINVAL where the host has no such clock."""
+        name = "process_time" if cid == 2 else "thread_time"
+        try:
+            if res:
+                v = max(1, round(time.get_clock_info(name).resolution * 1e9))
+            else:
+                v = time.process_time_ns() if cid == 2 else time.thread_time_ns()
+        except (AttributeError, OSError, ValueError):
+            return GUEST_ERRNO["INVAL"]
+        self._wr(out, struct.pack("<Q", v))
+        return 0
 
     def _runtime_name(self) -> int:
         """`sys._emscripten_info.runtime`: a string from the guest's malloc, as stringToNewUTF8 gives."""
@@ -2134,6 +2192,7 @@ class Pyodide:
             "sigcell": (self._sigcell, ft(0)),
             "runtime": (self._runtime_name, ft(0)),
             "depth": (self._dl_depth, ft(0)),
+            "cpuclock": (self._cpu_clock, ft(3)),
             "error": (self._dl_error, ft(5, 0)),
         }
         net = {
@@ -2215,6 +2274,7 @@ class Pyodide:
             main_mod = _engine.load_module(self.data / "pyodide_fused.wasm")
             linker = wt.Linker(engine)
             linker.define_wasi()
+            self._define_exit(linker)
             define_ops(linker)
             self.ex = _engine.LazyExports(store, linker.instantiate(store, main_mod), main_mod)
             self.memory, self.table = self.ex["memory"], self.ex["__indirect_function_table"]
@@ -2262,7 +2322,7 @@ class Pyodide:
 
             linker = wt.Linker(engine)
             linker.define_wasi()
-            linker.allow_shadowing = True
+            self._define_exit(linker)
             for n in _wasm.WASI_ROUTED:
                 if n in fwd:
                     linker.define(store, "wasi_snapshot_preview1", n, shim["wasi:" + n])
@@ -2284,6 +2344,7 @@ class Pyodide:
 
             al = wt.Linker(engine)
             al.define_wasi()
+            self._define_exit(al)
             al.define(store, "env", "memory", self.memory)
             al.define(store, "env", "__indirect_function_table", self.table)
             al.define(store, "env", "__stack_pointer", self.ex["__stack_pointer"])
@@ -2318,11 +2379,18 @@ class Pyodide:
         self._boot(slots)
 
     def _wasi_env(self) -> list[tuple[str, str]]:
-        return [
-            *BASE_ENV,
-            ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
-            ("REQUESTS_CA_BUNDLE", "/etc/ssl/cert.pem"),
-        ] + list(self.env.items())
+        env = dict(BASE_ENV)
+        if self.inherit_env:
+            env.update((k, v) for k, v in os.environ.items() if k and "=" not in k and k not in GUEST_OWN_ENV)
+        env.update(INIT_ENV)
+        env.update(SSL_CERT_FILE="/etc/ssl/cert.pem", REQUESTS_CA_BUNDLE="/etc/ssl/cert.pem")
+        env.update(self.env)
+        return list(env.items())
+
+    def _at_start(self) -> str:
+        """Run at every start: the variables only the interpreter's start needed go (unless the user gave them)."""
+        gone = [k for k, _ in INIT_ENV if k not in self.env]
+        return _AT_START + f"_start({gone!r})\ndel _start\n"
 
     # ------------------------------------------------------------------ snapshot of the memory after `preload`
     def _snapshot_path(self) -> Path:
@@ -2378,13 +2446,13 @@ class Pyodide:
             if self._restore(path, slots):
                 self.restored = self._started = True
                 # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
-                self.run(_AT_START + 'import sys; "random" in sys.modules and __import__("random").seed()')
+                self.run(self._at_start() + 'import sys; "random" in sys.modules and __import__("random").seed()')
                 return
         self.ex["emscripten_stack_init"](store)
         self.ex["__wasm_call_ctors"](store)
         self.ex["Py_Initialize"](store)
         self._started = True
-        self.run(_AT_START)
+        self.run(self._at_start())
         if self.preload is not None and self.run(self.preload) == 0 and path is not None:
             self._save(path)
 
@@ -2440,6 +2508,7 @@ class Pyodide:
             self.flavor,
             preopen_dev=self.preopen_dev,
             env=self.env,
+            inherit_env=self.inherit_env,
             data=self.data,
             asm_wasm=self.asm_wasm,
             stdlib=self.stdlib,
@@ -2502,9 +2571,10 @@ class Pyodide:
         self._wr(p, src)
         try:
             rc = self.ex["PyRun_SimpleString"](store, p)
-        except self._wt.ExitTrap as e:  # the process ended (exit(), os._exit()): this interpreter is gone
-            self._exited = e.code
-            rc = e.code
+        except (
+            GuestExit
+        ) as e:  # the process ended (exit(), os._exit(), a signal's default action): this interpreter is gone
+            self._exited = rc = e.status
         except self._wt.Trap as e:  # abort(), a failed assert, an unreachable: the guest is dead
             first = str(e).strip().splitlines()[0] if str(e).strip() else "trap"
             print(f"pyodide-wasmtime: the guest trapped: {first}", file=sys.stderr)
