@@ -35,7 +35,6 @@ NET("ioctl") i32 net_ioctl(i32 h, i32 op, i32 *argp);  // FIONREAD
 NET("resolve") i32 net_resolve(const char *name, i32 n, u8 *addr4);  // -> 0, or -errno
 NET("getaddrinfo") i32 net_getaddrinfo(const char *node, const char *service, const i32 *hint, u32 *out);
 NET("getnameinfo") i32 net_getnameinfo(const u8 *sa, i32 salen, char *node, i32 nodelen, char *serv, i32 servlen, i32 flags);
-NET("protobyname") u32 net_protobyname(const char *name);
 
 // A socket takes a real WASI descriptor number (a directory opened as a placeholder, vfd.h), so that numbers stay small
 // (select() takes less than 1024) and never clash with files; its object (handle, O_NONBLOCK) is shared by the dups.
@@ -242,7 +241,37 @@ EXPORT("getnameinfo") i32 getnameinfo_(const u8 *sa, i32 salen, char *node, i32 
     return net_getnameinfo(sa, salen, node, nodelen, serv, servlen, flags);
 }
 
-EXPORT("getprotobyname") u32 getprotobyname_(const char *name) { return net_protobyname(name); }
+// getprotobyname as Pyodide's glue answers it, from a fixed table that is not the host's: "tcp" and "6", "udp" and "17"
+// (case matters, any other name is NULL), the same struct protoent each time. The two entries are one calloc'd block
+// (name, aliases [alias, NULL], proto; the strings after them), built on first use; no data section holds them.
+__asm__(".globaltype proto_state, i32\nproto_state:\n");
+EXPORT("getprotobyname") u32 getprotobyname_(const char *name) {
+    u32 key = 0;
+    for (i32 i = 0; i < 4; i++) {  // up to 3 characters, packed as bytes; a longer name gets a key no case has
+        u8 c = (u8)name[i];
+        if (!c) break;
+        key |= (u32)c << (8 * i);
+        if (i == 3) key = 0xffffffffu;
+    }
+    i32 e = key == 0x706374u || key == 0x36u ? 0 : key == 0x706475u || key == 0x3731u ? 1 : -1;  // "tcp" "6", "udp" "17"
+    if (e < 0) return 0;
+    u32 *t;
+    __asm__ volatile("global.get proto_state\n\tlocal.set %0" : "=r"(t));
+    if (!t) {
+        t = (u32 *)calloc(1, 64);
+        if (!t) return 0;
+        for (i32 j = 0; j < 2; j++) {
+            u32 *pe = t + 8 * j;  // 32 bytes: protoent (12), alias list (8), name (4), alias (4)
+            char *nm = (char *)(pe + 5);
+            u32 up = j ? 0x504455u : 0x504354u;  // "UDP" "TCP"
+            u32 lo = j ? 0x706475u : 0x706374u;  // "udp" "tcp"
+            pe[0] = (u32)nm, pe[1] = (u32)(pe + 3), pe[2] = j ? 17 : 6, pe[3] = (u32)(nm + 4);
+            *(u32 *)nm = lo, *(u32 *)(nm + 4) = up;
+        }
+        __asm__ volatile("local.get %0\n\tglobal.set proto_state" : : "r"(t));
+    }
+    return (u32)(t + 8 * e);
+}
 
 // ioctl as Pyodide's JavaScript answers: a descriptor that is not open is EBADF; FIONREAD and FIONBIO belong to
 // sockets (a file has no ioctl: ENOTTY; a pipe: FIONREAD is the bytes buffered, FIONBIO is EINVAL); the terminal

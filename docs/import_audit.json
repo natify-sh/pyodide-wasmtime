@@ -1344,8 +1344,8 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c getprotobyname_ -> _host.py _n_protobyname: a struct protoent {name, aliases [NULL], proto} from the host's protocols table (tcp 6, udp 17, icmp 1...; tcp and udp even where the host has no table), built once per name and kept as Pyodide keeps its two; NULL for an unknown name. Pyodide: tcp/udp only. getprotobynumber is not an import (libc internal).",
-  "tested": "tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups"
+  "evidence": "adapter.c getprotobyname_: a fixed table, no host operation (as Pyodide's glue answers from its Protocols object, not from /etc/protocols): \"tcp\" and \"6\" give one struct protoent {tcp, [TCP], 6}, \"udp\" and \"17\" one {udp, [UDP], 17}, built once in a calloc'd block (no data section; the name is compared as integer constants); any other name (upper case, empty, icmp, ip) is NULL. Probe on real Pyodide and ours: 13 names and the numbers 6, 17, 1, line for line the same. getprotobynumber is not an import (libc internal).",
+  "tested": "tests/test_sockets.py::test_getprotobyname_answers_as_pyodide_does, tests/test_sockets.py::test_names_services_protocols_and_reverse_lookups"
  },
  {
   "name": "getaddrinfo",

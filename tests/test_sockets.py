@@ -374,14 +374,14 @@ def test_services_protocols_and_numeric_names(guest: Guest, port: int):
     out = run(
         guest,
         port,
-        "print(socket.getprotobyname('tcp'), socket.getprotobyname('udp'), socket.getprotobyname('icmp'))\n"
+        "print(socket.getprotobyname('tcp'), socket.getprotobyname('udp'))\n"
         "print(socket.getprotobyname('udp'), socket.getprotobyname('tcp'))\n"
         "try: socket.getprotobyname('nosuchproto')\nexcept OSError: print('unknown protocol')\n"
         "print(socket.getservbyname('http'), socket.getservbyname('domain', 'udp'), socket.getservbyport(443))\n"
         "print(socket.getnameinfo(('127.0.0.1', 80), socket.NI_NUMERICHOST | socket.NI_NUMERICSERV))\n"
         "print(socket.gethostbyname('localhost'))\n",
     )
-    assert out == ["6 17 1", "17 6", "unknown protocol", "80 53 https", "('127.0.0.1', '80')", "127.0.0.1"]
+    assert out == ["6 17", "17 6", "unknown protocol", "80 53 https", "('127.0.0.1', '80')", "127.0.0.1"]
 
 
 @pytest.mark.network  # the reverse lookups and NI_NAMEREQD ask a resolver
@@ -547,6 +547,21 @@ def test_a_wild_string_pointer_is_a_name_error(guest: Guest, port: int):
     assert out == ["past the end: -11", "flow label: 0 b'::1'"]
 
 
+def test_getprotobyname_answers_as_pyodide_does(guest: Guest, port: int):
+    # a fixed table in the adapter, not the host's: what the real Pyodide prints for the same names (case matters, a
+    # number is a name too, icmp is not there even where the host's table has it)
+    names = ["tcp", "udp", "TCP", "UDP", "6", "17", "icmp", "", "ip", "0", "tcp ", "xyz", "toString"]
+    out = run(
+        guest,
+        port,
+        f"for n in {names!r}:\n"
+        "    try: print(repr(n), socket.getprotobyname(n))\n"
+        "    except OSError as e: print(repr(n), 'OSError', e)\n",
+    )
+    known = {"tcp": 6, "udp": 17, "6": 6, "17": 17}
+    assert out == [f"{n!r} {known[n]}" if n in known else f"{n!r} OSError protocol not found" for n in names]
+
+
 def test_a_second_run_on_one_object_sees_a_fresh_guest(flavor: str, capfd: pytest.CaptureFixture[str]):
     from pyodide_nojs import Pyodide
 
@@ -610,7 +625,6 @@ def test_the_net_wrapper_turns_every_exception_into_an_errno():
     assert call("bind", IndexError) == -29
     assert call("bind", OSError) == -29  # an OSError without an errno is EIO
     assert call("getaddrinfo", GuestFault) == -11 and call("getaddrinfo", KeyError) == -4
-    assert call("protobyname", GuestFault) == 0
     assert py.cur == []
 
 

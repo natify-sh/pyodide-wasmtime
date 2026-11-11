@@ -517,7 +517,6 @@ class Pyodide:
         self._listening: set[socket.socket] = set()  # listen() was called: SO_ACCEPTCONN (macOS refuses to say it)
         self._connecting: set[socket.socket] = set()  # a non-blocking connect that has not been looked at yet
         self._pending_err: dict[socket.socket, int] = {}  # SO_ERROR read by poll for POLLERR, kept for the guest's read
-        self.protoents: dict[str, int] = {}  # getprotobyname's answers, by name (guest addresses)
         self.lazy: list[str] = []
         self.converted = 0  # modules whose legacy exceptions the loader converted at dlopen
         self.summary = ""
@@ -2059,28 +2058,9 @@ class Pyodide:
                 self._wr(ptr, b + b"\0")
         return 0
 
-    def _n_protobyname(self, name_p: int) -> int:
-        """getprotobyname: a struct protoent {name, aliases, proto} from the host's protocols table (tcp and udp
-        even where the host has none), built once per name and kept, as Pyodide keeps its two. 0: unknown."""
-        name = self._cstr(name_p) or ""
-        if name not in self.protoents:
-            try:
-                num = socket.getprotobyname(name)
-            except OSError:
-                num = {"tcp": 6, "udp": 17}.get(name, -1)
-            if num < 0:
-                return 0
-            b = name.encode() + b"\0"
-            p = self._malloc(16 + len(b))
-            if not p:
-                return 0
-            self._wr(p, struct.pack("<4I", p + 16, p + 12, num, 0) + b)  # aliases: [NULL]
-            self.protoents[name] = p
-        return self.protoents[name]
-
     # what a net operation answers when the guest gave it a pointer outside its memory, or the host failed in a way
     # nobody foresaw: -EFAULT and -EIO, but the name functions answer in EAI_* (or a NULL pointer)
-    NET_FAILS = {"getaddrinfo": (-11, -4), "getnameinfo": (-11, -4), "protobyname": (0, 0)}
+    NET_FAILS = {"getaddrinfo": (-11, -4), "getnameinfo": (-11, -4)}
 
     def _wrap_net(self, name: str, fn):
         """No exception of a net operation reaches the wasm (it would be a trap that ends the interpreter): a pointer
@@ -2189,7 +2169,6 @@ class Pyodide:
             "resolve": (self._n_resolve, ft(3)),
             "getaddrinfo": (self._n_getaddrinfo, ft(4)),
             "getnameinfo": (self._n_getnameinfo, ft(7)),
-            "protobyname": (self._n_protobyname, ft(1)),
         }
         fs = {"statvfs": (self._fs_statvfs, ft(2))}
         return loader, net, fs
@@ -2620,7 +2599,6 @@ class Pyodide:
         for s in self.socks.values():
             s.close()
         self.socks.clear()
-        self.protoents.clear()  # guest addresses, and the guest is gone: so are the table slots and instances
         self.slots.clear()
         self.instances = [None]
         if self.root is not None:
