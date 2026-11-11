@@ -138,6 +138,32 @@ def test_key_changes_with_stdlib_stamp_and_dev(flavor, cache, monkeypatch):
     assert Pyodide(flavor, preload=PRE)._snapshot_path() != base
 
 
+def test_key_covers_every_host_module(flavor, cache, monkeypatch, tmp_path):
+    """The host is several modules: touching or adding any of them (not `_version.py`, made at build time) changes the
+    digest that is part of the key, and the key takes that digest."""
+    from pyodide_nojs import _consts, _host
+
+    pkg = Path(_host.__file__).resolve().parent
+    mods = sorted(pkg.glob("*.py"))
+    assert {"_host.py", "_consts.py", "_sockaddr.py", "_cif.py", "_timecalc.py"} <= {m.name for m in mods}
+    copy = tmp_path / "pkg"
+    copy.mkdir()
+    for m in mods:
+        (copy / m.name).write_bytes(m.read_bytes())
+    base = _consts.code_hash(copy)
+    assert base == _consts.code_hash(pkg)
+    for m in mods:
+        touched = copy / m.name
+        touched.write_bytes(m.read_bytes() + b"\n# touched\n")
+        assert (_consts.code_hash(copy) == base) == (m.name == "_version.py"), m.name
+        touched.write_bytes(m.read_bytes())
+    (copy / "_new_module.py").write_bytes(b"")
+    assert _consts.code_hash(copy) != base
+    first = Pyodide(flavor, preload=PRE)._snapshot_path()
+    monkeypatch.setattr(_host, "code_hash", lambda folder: "another digest")
+    assert Pyodide(flavor, preload=PRE)._snapshot_path() != first
+
+
 @pytest.mark.parametrize(
     "pre",
     [

@@ -62,6 +62,7 @@ from ._consts import (
     _s32,
     _to_wasm,
     available_flavors,
+    code_hash,
     data_dir,
     guest_errno,
     override_warnings,
@@ -1556,7 +1557,7 @@ class Pyodide:
                     [_engine._stamp(f.resolve()).decode() for f in files],
                     PYVER,
                     self.preload,
-                    hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    code_hash(Path(__file__).resolve().parent),
                     hashlib.sha256(
                         b"".join(
                             g.name.encode() + b"\0" + g.read_bytes()

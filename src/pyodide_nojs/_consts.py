@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import os
 import re
@@ -177,6 +178,16 @@ def _num(v: Any, bits: int) -> int:
 
 
 _U32 = 0xFFFFFFFF
+
+
+def code_hash(folder: Path) -> str:
+    """A digest of the host's Python: every module directly in `folder` (the package) but `_version.py` (made at
+    build time), by name and content. Part of a snapshot's key: a change of any host module invalidates snapshots."""
+    return hashlib.sha256(
+        b"".join(
+            f.name.encode() + b"\0" + f.read_bytes() for f in sorted(folder.glob("*.py")) if f.name != "_version.py"
+        )
+    ).hexdigest()
 
 
 def data_dir(path: str | os.PathLike[str] | None = None) -> Path:
