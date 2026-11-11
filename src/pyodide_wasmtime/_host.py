@@ -13,6 +13,7 @@ Two builds of the same sources, one `Pyodide` class:
 
 from __future__ import annotations
 
+import calendar
 import contextlib
 import ctypes
 import errno
@@ -1748,9 +1749,16 @@ class Pyodide:
     def _gmtoff(t: int) -> int:
         """Seconds east of UTC at the instant t."""
         try:
-            return time.localtime(t).tm_gmtoff or 0
+            lt = time.localtime(t)
         except (OverflowError, OSError, ValueError):  # a C library with a narrow time_t (Windows): the nearest it has
-            return time.localtime(min(max(t, 0), 32535215999)).tm_gmtoff or 0
+            t = min(max(t, 0), 32535215999)
+            lt = time.localtime(t)
+        off = lt.tm_gmtoff
+        if (
+            off is None or abs(off) > 2 * 86400
+        ):  # not an offset (Windows gives one at 2**31 and beyond): from the fields
+            off = calendar.timegm(lt[:6]) - t
+        return off
 
     def _minutes(self, t: int) -> int:
         """-Date.getTimezoneOffset() at the instant t: minutes east, cut towards zero."""
