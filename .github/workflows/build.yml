@@ -39,8 +39,9 @@ jobs:
       - name: Build wasm-opt.wasm (wasi-sdk 34, Binaryen version_132)
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q cmake ninja-build
-          OUT="$PWD/wasm-opt.wasm" sh tools/build_binaryen.sh pyo-build
+          # cmake and ninja from PyPI wheels: the runner image's apt mirrors are not always reachable
+          python3 -m venv "$RUNNER_TEMP/buildtools" && "$RUNNER_TEMP/buildtools/bin/pip" install -q cmake ninja
+          PATH="$RUNNER_TEMP/buildtools/bin:$PATH" OUT="$PWD/wasm-opt.wasm" sh tools/build_binaryen.sh pyo-build
 
       - uses: actions/upload-artifact@v7
         with:
