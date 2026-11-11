@@ -5,6 +5,7 @@ same scripts (tests/checks/ffi_*.py, cffi_callbacks.py)."""
 from __future__ import annotations
 
 import struct
+import sys
 from typing import Any
 
 import pytest
@@ -181,8 +182,11 @@ def test_closures_reuse_their_wasmtime_functions(flavor: str) -> None:
     except ImportError:  # Windows: no ru_maxrss; the pool checks below still run
         resource = None
 
-    def maxrss() -> int:
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else 0
+    def maxrss() -> int:  # in KiB: ru_maxrss is KiB on Linux and BYTES on macOS
+        if resource is None:
+            return 0
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak // 1024 if sys.platform == "darwin" else peak
 
     code = """
 import ctypes as c
