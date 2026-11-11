@@ -41,11 +41,11 @@ def test_fused_imports_only_wasi_loader_net():
     m = Module(_engine.engine(), need("pyodide_fused.wasm").read_bytes())
     assert sorted({i.module for i in m.imports}) == ["fs", "loader", "net", "wasi_snapshot_preview1"]
     counts = {mod: sum(i.module == mod for i in m.imports) for mod in ("wasi_snapshot_preview1", "loader", "net", "fs")}
-    # the WASI imports (the main module's own and the adapter's: files, links, times, dup, fcntl, exit, pread,
-    # pwrite), the loader's 17 operations (7 of the loader itself, the depth cap among them, 5 of libffi and the
-    # trampoline's fallback, 3 of local time, the signal word and the runtime's name), the 21 of the host's sockets
-    # and names, and the 1 of its files (statvfs)
-    assert counts == {"wasi_snapshot_preview1": 38, "loader": 17, "net": 21, "fs": 1}
+    # the WASI imports (the adapter's: files, links, times, renumbering, exit, pread, pwrite, sync; the main module's
+    # own that the adapter answers first are the adapter's now), the loader's 17 operations (7 of the loader itself,
+    # the depth cap among them, 5 of libffi and the trampoline's fallback, 3 of local time, the signal word and the
+    # runtime's name), the 21 of the host's sockets and names, and the 1 of its files (statvfs)
+    assert counts == {"wasi_snapshot_preview1": 35, "loader": 17, "net": 21, "fs": 1}
 
 
 def test_the_package_carries_what_the_run_time_needs():

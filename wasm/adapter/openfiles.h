@@ -6,10 +6,10 @@
 #include "state.h"
 #include "cwd.h"
 #include "metadata.h"
+#include "vfd.h"
 
-// ---- the open files: the absolute guest path and the open flags of each descriptor opened by openat, so that dup()
-// (which WASI 0.1 lacks) can open the same file again: a directory (fdopendir, fwalk, rmtree) or a file. Standard
-// streams, sockets and pipes have no path: they are not duplicated.
+// ---- the open files: the absolute guest path and the open flags of each descriptor opened by openat (indexed by the
+// WASI descriptor that holds the file, see vfd.h): the paths that ".." and fstatfs need, and mmap's reopen.
 typedef struct {
     char *path[MAXFD];
     i32 flags[MAXFD];
@@ -25,6 +25,7 @@ static Fds *fds(void) {
     return r;
 }
 static const char *fd_base_path(i32 fd) {  // the path of a directory descriptor, including the preopens
+    fd = rfd(fd);
     if (fd >= 0 && fd < MAXFD && fds()->path[fd]) return fds()->path[fd];
     Pre *P = preopens();
     for (i32 k = 0; k < P->n; k++)
@@ -37,6 +38,15 @@ static void fd_forget(i32 fd) {
         free(fds()->path[fd]);
         fds()->path[fd] = 0;
     }
+}
+// the WASI descriptor `from` is renumbered to `to` (vfd.h): its records follow it
+static void fd_move_meta(i32 from, i32 to) {
+    if (from < 0 || from >= MAXFD || to < 0 || to >= MAXFD) return;
+    fd_forget(to);
+    fds()->path[to] = fds()->path[from], fds()->flags[to] = fds()->flags[from];
+    fds()->path[from] = 0;
+    u64 *a = ckp(from), *b = ckp(to);
+    if (a && b) *b = *a, *a = 0;
 }
 // is a descriptor (other than `skip`) that this adapter opened still open on the file (dev, ino)?
 static i32 fd_open_inode(u64 dev, u64 ino, i32 skip) {
@@ -118,6 +128,7 @@ static i32 lead_dots_only(const char *s) {  // every ".." comes before the first
     return 1;
 }
 static const char *fixpath(i32 dirfd, const char *path) {
+    dirfd = rfd(dirfd);
     Cwd *C = cwdst();
     i32 rel = path[0] != '/';
     i32 dd = has_dotdot(path);
@@ -206,7 +217,7 @@ static char *absdup(i32 dirfd, const char *path) {
 
 // A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
 static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot) {
-    i32 fd = dirfd;
+    i32 fd = dirfd = rfd(dirfd);
     path = fixpath(dirfd, path);
     if (path[0] == '/' || dirfd == AT_FDCWD) {
         Pre *P = preopens();
@@ -440,7 +451,7 @@ EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
     const char *p = fd_base_path(fd);  // a directory opened by openat, or a preopen
     if (p) return sc_chdir(p);
     u8 st[24] __attribute__((aligned(8)));
-    return (is_sock(fd) || !w_fd_fdstat_get(fd, st)) ? -FE_NOTDIR : -FE_BADF;  // a stream: not a directory
+    return (is_virt(fd) || !w_fd_fdstat_get(rfd(fd), st)) ? -FE_NOTDIR : -FE_BADF;  // a stream: not a directory
 }
 
 // nocheck: dup() opens the same file again, which no permission can forbid
@@ -498,42 +509,6 @@ EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags,
     return open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);
 }
 
-// dup(): the same file opened again, at the same position (a copy of it: WASI 0.1 can not share the offset)
-EXPORT("__syscall_dup") i32 sc_dup(i32 fd) {
-    if (fd < 0 || fd >= MAXFD) return -EBADF;
-    if (!fds()->path[fd]) {  // no path: a stream, a socket or a pipe (ENOSYS), unless it is no descriptor at all
-        u8 st[24] __attribute__((aligned(8)));
-        return !is_sock(fd) && w_fd_fdstat_get(fd, st) ? -EBADF : -52;
-    }
-    i32 flags = fds()->flags[fd] & ~(0100 | 0200 | 01000);       // not O_CREAT, O_EXCL, O_TRUNC again
-    i32 nfd = open_at(AT_FDCWD, fds()->path[fd], flags, 0, 1);  // (the new descriptor's record is another one)
-    if (nfd < 0) return nfd;
-    u64 pos = 0;
-    if (!(flags & 0200000) && !w_fd_tell(fd, &pos)) w_fd_seek(nfd, (i64)pos, 0, &pos);
-    return nfd;
-}
-
-EXPORT("__syscall_dup3") i32 sc_dup3(i32 oldfd, i32 newfd, i32 flags) {
-    (void)flags;
-    if (oldfd == newfd) return -28;  // EINVAL
-    i32 d = sc_dup(oldfd);
-    if (d < 0) return d;
-    i32 e = w_fd_renumber(d, newfd);  // closes newfd
-    if (e) {
-        w_fd_close(d);
-        fd_forget(d);
-        return -e;
-    }
-    fd_forget(newfd);
-    if (newfd >= 0 && ckp(newfd)) *ckp(newfd) = 0;  // the cookie of the descriptor that was there is stale
-    if (d < MAXFD && newfd >= 0 && newfd < MAXFD) {  // the record follows the number
-        fds()->path[newfd] = fds()->path[d];
-        fds()->flags[newfd] = fds()->flags[d];
-        fds()->path[d] = 0;
-    }
-    return newfd;
-}
-
 EXPORT("__syscall_stat64") i32 sc_stat64(const char *path, void *buf) { return stat_path(AT_FDCWD, path, buf, 1); }
 EXPORT("__syscall_lstat64") i32 sc_lstat64(const char *path, void *buf) { return stat_path(AT_FDCWD, path, buf, 0); }
 
@@ -545,10 +520,19 @@ EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
         *(u32 *)((u8 *)buf + 4) = 0140777;
         return 0;
     }
+    if (is_pipe(fd)) {  // PIPEFS's getattr: a FIFO, one link, dev 14, the times of its creation
+        Obj *o = vobj(fd);
+        for (i32 i = 0; i < 8; i++) fs[i] = 0;
+        fs[0] = 14, fs[1] = o->pipe->ino + (o->kind == K_PIPEW), fs[3] = 1, fs[5] = fs[6] = fs[7] = o->pipe->ts;
+        put_stat((u8 *)buf, (const u8 *)fs);
+        *(u32 *)((u8 *)buf + 4) = 010600;
+        return 0;
+    }
+    fd = rfd(fd);
     i32 e = w_fd_filestat_get(fd, fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
-    if (fd <= 2) *(u32 *)((u8 *)buf + 4) = 0020666;  // the standard streams are character devices (Pyodide's fstat(1))
+    if (fd_std(fd)) *(u32 *)((u8 *)buf + 4) = 0020666;  // the standard streams are character devices (Pyodide's fstat(1))
     return 0;
 }
 
@@ -596,6 +580,8 @@ EXPORT("__syscall_faccessat") i32 sc_faccessat(i32 dirfd, const char *path, i32 
 // {d_ino u64, d_off i64, d_reclen u16, d_type u8, name\0, padded to 8}
 EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
     if (fd < 0) return -EBADF;
+    if (is_virt(fd)) return -FE_NOTDIR;
+    fd = rfd(fd);
     u64 *ck = ckp(fd);
     if (!ck) return -ENOMEM;
     i32 cap = count + 512;
@@ -637,13 +623,13 @@ WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
 
 // the WASI filetype of an open descriptor (a socket is a stream socket), or -errno (EBADF)
 static i32 fd_type(i32 fd) {
-    if (is_sock(fd)) return 6;
+    if (is_virt(fd)) return 6;  // (a pipe is a stream too)
     u8 st[24] __attribute__((aligned(8)));
-    i32 e = w_fd_fdstat_get(fd, st);
+    i32 e = w_fd_fdstat_get(rfd(fd), st);
     return e ? -e : st[0];
 }
 // can the descriptor seek? The standard streams, sockets and character devices can not (Pyodide: stream.seekable)
-static i32 fd_seekable(i32 fd, i32 ft) { return fd > 2 && ft != 2 && ft != 5 && ft != 6; }
+static i32 fd_seekable(i32 fd, i32 ft) { return !fd_std(rfd(fd)) && ft != 2 && ft != 5 && ft != 6; }
 
 // fcntl: the flags are WASI's fdflags (append, nonblock) and rights; an invalid descriptor is EBADF for every command (as
 // Pyodide's getStreamFromFD). The lock commands of this ABI are F_GETLK 12, F_SETLK 13, F_SETLKW 14: there is one process,
@@ -651,13 +637,16 @@ static i32 fd_seekable(i32 fd, i32 ft) { return fd > 2 && ft != 2 && ft != 5 && 
 EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
     if (fd_type(fd) < 0) return -FE_BADF;
     switch (cmd) {
-        case 1:  // F_GETFD: FD_CLOEXEC is not kept (there is no exec)
+        case 1:  // F_GETFD: FD_CLOEXEC is kept per number (there is no exec: only the answer is real)
+            return fd < MAXFD ? vt()->cloexec[fd] : 0;
         case 2:  // F_SETFD
+            if (fd < MAXFD) vt()->cloexec[fd] = (*(const i32 *)va & 1) != 0;
             return 0;
         case 3: {  // F_GETFL
             if (is_sock(fd)) return 2 | (sock_nb(fd) ? 04000 : 0);  // O_RDWR, O_NONBLOCK
+            if (is_pipe(fd)) return (vobj(fd)->kind == K_PIPEW) | vobj(fd)->fl;  // O_WRONLY / O_RDONLY, and what F_SETFL set
             u8 st[24] __attribute__((aligned(8)));
-            i32 e = w_fd_fdstat_get(fd, st);
+            i32 e = w_fd_fdstat_get(rfd(fd), st);
             if (e) return -e;
             u16 ff = *(u16 *)(st + 2);
             u64 rights = *(u64 *)(st + 8);
@@ -673,9 +662,13 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
                 return 0;
             }
             i32 flags = *(const i32 *)va, ff = 0;  // va points at the variable arguments
+            if (is_pipe(fd)) {  // PIPEFS keeps the bits of Emscripten's mask: append, nonblock, async, direct, noatime
+                vobj(fd)->fl = (vobj(fd)->fl & ~289792) | (flags & 289792);
+                return 0;
+            }
             if (flags & 02000) ff |= 1;
             if (flags & 04000) ff |= 4;
-            i32 e = w_fd_fdstat_set_flags(fd, ff);
+            i32 e = w_fd_fdstat_set_flags(rfd(fd), ff);
             return e ? -e : 0;
         }
         case 12: {  // F_GETLK: nobody else holds a lock -> l_type = F_UNLCK
@@ -686,9 +679,11 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
         case 13:  // F_SETLK
         case 14:  // F_SETLKW
             return 0;
-        case 0:     // F_DUPFD (the minimum number is not honoured)
-        case 1030:  // F_DUPFD_CLOEXEC
-            return sc_dup(fd);
+        case 0:     // F_DUPFD: the lowest free number from the argument on
+        case 1030: {  // F_DUPFD_CLOEXEC
+            i32 min = *(const i32 *)va;  // va points at the variable arguments
+            return min < 0 || min >= MAXFD ? -FE_INVAL : fd_dup(fd, min, 0, cmd == 1030);
+        }
         default:
             return -FE_INVAL;
     }
@@ -697,7 +692,8 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
 // lseek on a descriptor: a directory keeps its readdir cookie here (rewinddir is SEEK_SET 0, seekdir/telldir use the
 // d_off of the entries, getdents64 continues from it); the others go to WASI. Sockets can not seek.
 EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
-    if (is_sock(fd)) return FE_SPIPE;
+    if (is_virt(fd)) return FE_SPIPE;
+    fd = rfd(fd);
     i32 e = w_fd_seek(fd, off, whence, newoff);
     if (e != FE_BADF) return e;  // WASI refuses a directory descriptor (EBADF): that one is ours
     u8 st[24] __attribute__((aligned(8)));

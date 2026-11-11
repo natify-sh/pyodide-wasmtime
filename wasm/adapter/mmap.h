@@ -78,7 +78,7 @@ EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset,
         u32 iov[2];
         iov[0] = (u32)(ptr + got), iov[1] = len - got < MM_CHUNK ? len - got : MM_CHUNK;  // wasmtime refuses a big read
         i32 r = 0;
-        e = w_fd_pread(fd, iov, 1, (u64)offset + got, &r);
+        e = w_fd_pread(rfd(fd), iov, 1, (u64)offset + got, &r);
         if (e) {
             free(ptr);
             return -e;
@@ -106,7 +106,8 @@ EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset,
 // the bytes of a mapping back to the file: the whole length, as MEMFS's msync writes it (a truncated file grows again).
 // A descriptor without write rights (a read-only shared mapping) is opened again for writing by its path.
 static i32 mm_write_back(u32 addr, u32 len, i32 fd, i64 offset, u64 rights) {
-    i32 wfd = fd, e = 0;
+    i32 wfd = rfd(fd), e = 0;
+    fd = wfd;
     if (!(rights & (1ull << 6)) && fd < MAXFD && fds()->path[fd]) {
         wfd = open_at(AT_FDCWD, fds()->path[fd], (fds()->flags[fd] & ~(3 | 0100 | 0200 | 01000)) | 2, 0, 1);
         if (wfd < 0) return wfd;

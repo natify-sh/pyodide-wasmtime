@@ -129,11 +129,9 @@ def test_chdir_symlink_and_honest_enosys(guest: Guest):
         "os.makedirs('/a/b'); os.chdir('/a'); os.chdir('b'); print(os.getcwd())\n"
         "open('f', 'w').write('x')\n"
         + ("" if win else "os.symlink('f', 'ln'); print(os.readlink('ln'), os.path.exists('/a/b/ln'))\n")
-        + "for name, call in (('pipe', os.pipe), ('dup(1)', lambda: os.dup(1))):\n"
-        "    try: call()\n    except OSError as e: print(name, errno.errorcode[e.errno])"
     )
     assert p.returncode == 0, p.stderr
-    assert p.stdout.splitlines() == ["/a/b", *([] if win else ["f True"]), "pipe ENOSYS", "dup(1) ENOSYS"]
+    assert p.stdout.splitlines() == ["/a/b", *([] if win else ["f True"])]
 
 
 def test_exit_codes(guest: Guest):

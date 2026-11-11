@@ -27,9 +27,9 @@ EXPORT("__syscall_fchownat") i32 sc_fchownat(i32 dirfd, const char *path, i32 ui
 
 EXPORT("__syscall_fchown32") i32 sc_fchown32(i32 fd, i32 uid, i32 gid) {
     u64 fs[8];
-    i32 e = w_fd_filestat_get(fd, fs);
+    i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
-    return is_sock(fd) ? 0 : set_owner(fs, uid, gid);
+    return is_virt(fd) ? 0 : set_owner(fs, uid, gid);
 }
 
 // mknod: a regular file (made like open(O_CREAT|O_EXCL), with the mode and the umask); FIFOs, devices and sockets can not

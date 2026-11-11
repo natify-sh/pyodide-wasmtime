@@ -6,6 +6,7 @@
 #include "state.h"
 #include "metadata.h"
 #include "openfiles.h"
+#include "vfd.h"
 
 // ================================================================== sockets: Emscripten's socket calls over the host's
 // WASI preview1 cannot create or connect a socket, so the host gives a few operations; a socket is a guest
@@ -36,26 +37,21 @@ NET("getaddrinfo") i32 net_getaddrinfo(const char *node, const char *service, co
 NET("getnameinfo") i32 net_getnameinfo(const u8 *sa, i32 salen, char *node, i32 nodelen, char *serv, i32 servlen, i32 flags);
 NET("protobyname") u32 net_protobyname(const char *name);
 
-// A socket takes a real WASI descriptor number (a directory opened as a placeholder), so that numbers stay small
-// (select() takes less than 1024) and never clash with files; the table is indexed by that number.
-typedef struct {
-    i32 h[MAXFD];  // the host's handle + 1; 0: not a socket
-    u8 nb[MAXFD];  // O_NONBLOCK: SOCK_NONBLOCK, ioctl(FIONBIO), fcntl(F_SETFL), set by the program
-} Socks;
-__asm__(".globaltype sock_state, i32\nsock_state:\n");
-static Socks *socks(void) {
-    Socks *r;
-    __asm__ volatile("global.get sock_state\n\tlocal.set %0" : "=r"(r));
-    if (!r) {
-        r = (Socks *)calloc(1, sizeof(Socks));
-        __asm__ volatile("local.get %0\n\tglobal.set sock_state" : : "r"(r));
+// A socket takes a real WASI descriptor number (a directory opened as a placeholder, vfd.h), so that numbers stay small
+// (select() takes less than 1024) and never clash with files; its object (handle, O_NONBLOCK) is shared by the dups.
+static void sock_close(i32 h) { net_close(h); }
+static i32 sock_new(i32 fd, i32 h, i32 nb) {  // 0, or -ENOMEM (the host's socket is closed, and the placeholder)
+    Obj *o = (Obj *)calloc(1, sizeof(Obj));
+    if (!o || !vt()) {
+        free(o);
+        net_close(h);
+        w_fd_close(fd);
+        return -ENOMEM;
     }
-    return r;
+    o->kind = K_SOCK, o->ref = 1, o->w = h, o->nb = (u8)nb;
+    vt()->o[fd] = o;
+    return 0;
 }
-static i32 is_sock(i32 fd) { return fd >= 0 && fd < MAXFD && socks()->h[fd]; }
-static i32 hof(i32 fd) { return socks()->h[fd] - 1; }
-static i32 sock_nb(i32 fd) { return socks()->nb[fd]; }
-static void sock_set_nb(i32 fd, i32 on) { socks()->nb[fd] = (u8)(on != 0); }
 
 #define EAGAIN_ 6
 #define ENOTSOCK_ 57
@@ -74,21 +70,6 @@ static i32 would_block(i32 fd, i32 flags, i32 events) {
     return !(net_poll(hof(fd), events, 0) & (events | 8 | 16));
 }
 
-// a placeholder descriptor for a new socket: a directory opened, so the number is a real WASI one. -errno
-static i32 sock_fd(void) {
-    u64 all = (1ull << 30) - 1, writes = (1ull << 6) | (1ull << 0) | (1ull << 8) | (1ull << 22);
-    i32 fd = -1;
-    char dot[2];  // "." built on the stack: a string literal would be a data section
-    dot[0] = '.', dot[1] = 0;
-    i32 e = w_path_open(PREOPEN, 1, dot, 1, 2 /* O_DIRECTORY */, all & ~writes, 0, 0, &fd);
-    if (e) return -33;  // EMFILE
-    if (fd < 0 || fd >= MAXFD) {
-        w_fd_close(fd);
-        return -33;
-    }
-    return fd;
-}
-
 EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
     i32 fd = sock_fd();
@@ -98,9 +79,8 @@ EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a,
         w_fd_close(fd);
         return h;
     }
-    socks()->h[fd] = h + 1;
-    socks()->nb[fd] = (type & 04000) != 0;  // SOCK_NONBLOCK
-    return fd;
+    i32 e = sock_new(fd, h, (type & 04000) != 0);  // SOCK_NONBLOCK
+    return e ? e : fd;
 }
 
 EXPORT("__syscall_bind") i32 sc_bind(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
@@ -127,9 +107,8 @@ EXPORT("__syscall_accept4") i32 sc_accept4(i32 fd, u8 *sa, u32 *lenp, i32 flags,
         w_fd_close(nfd);
         return h;
     }
-    socks()->h[nfd] = h + 1;
-    socks()->nb[nfd] = (flags & 04000) != 0;
-    return nfd;
+    i32 e = sock_new(nfd, h, (flags & 04000) != 0);
+    return e ? e : nfd;
 }
 
 EXPORT("__syscall_connect") i32 sc_connect(i32 fd, const u8 *sa, i32 len, i32 a, i32 b, i32 c) {
@@ -214,6 +193,9 @@ static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
         if (fd >= 0 && is_sock(fd)) {
             hs[nsock] = hof(fd), evs[nsock] = ev & 7, revs[nsock] = 0;  // POLLIN, POLLPRI, POLLOUT
             nsock++;
+        } else if (is_pipe(fd)) {  // PIPEFS's poll: ready from its buffer, now
+            rev = (i16)(pipe_mask(vobj(fd)) & (ev | 8 | 16 | POLLNVAL));
+            if (rev) immediate = 1;
         } else if (fd >= 0) {
             u8 st[24] __attribute__((aligned(8)));
             if (w_fd_fdstat_get(fd, st)) rev = POLLNVAL;
@@ -265,6 +247,12 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     u8 st[24] __attribute__((aligned(8)));
     if (!is_sock(fd) && w_fd_fdstat_get(fd, st)) return -EBADF;
     i32 *argp = va ? *(i32 **)va : 0;  // va points at the variable arguments; the first is the argument's address
+    if (is_pipe(fd) && (op == 0x541B || op == 0x5421)) {  // PIPEFS: FIONREAD is the bytes buffered, its other ioctls EINVAL
+        if (op == 0x5421) return -28;
+        if (!argp) return -21;
+        *argp = (i32)vobj(fd)->pipe->size;
+        return 0;
+    }
     if (op == 0x5421 || op == 0x541B) {  // FIONBIO, FIONREAD
         if (!is_sock(fd)) return -ENOTTY;
         if (!argp) return -21;  // EFAULT
@@ -279,7 +267,8 @@ EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
 
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
-    if (!is_sock(fd)) return w_fd_read(fd, iov, n, nread);
+    if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
+    if (!is_sock(fd)) return w_fd_read(rfd(fd), iov, n, nread);
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
@@ -297,7 +286,8 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
 
 WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
-    if (!is_sock(fd)) return w_fd_write(fd, iov, n, nw);
+    if (is_pipe(fd)) return pipe_write(vobj(fd), iov, n, nw);
+    if (!is_sock(fd)) return w_fd_write(rfd(fd), iov, n, nw);
     if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
@@ -313,25 +303,29 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     return 0;
 }
 
-EXPORT("fd_close") i32 x_fd_close(i32 fd) {
-    if (!is_sock(fd)) {
-        if (mt()->norphan) meta_closing(fd);
-        fd_forget(fd);
-        return w_fd_close(fd);
-    }
-    net_close(hof(fd));
-    socks()->h[fd] = 0;
-    socks()->nb[fd] = 0;
-    return w_fd_close(fd);  // the placeholder
-}
+EXPORT("fd_close") i32 x_fd_close(i32 fd) { return fd_release(fd); }
 
 WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
 EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
-    if (!is_sock(fd)) return w_fd_fdstat_get(fd, buf);
+    if (!is_virt(fd)) return w_fd_fdstat_get(rfd(fd), buf);
     for (i32 i = 0; i < 24; i++) buf[i] = 0;
+    if (is_pipe(fd)) {
+        buf[0] = 4;  // as Pyodide's: a regular file, no flags, no rights
+        return 0;
+    }
     buf[0] = 6;  // SOCKET_STREAM
     *(u64 *)(buf + 8) = (1ull << 30) - 1, *(u64 *)(buf + 16) = (1ull << 30) - 1;
     return 0;
 }
+
+// pread, pwrite and fsync of the main module: a socket or a pipe has no offset (ESPIPE), a pipe can not be synced (EINVAL)
+WASI("fd_sync") i32 w_fd_sync(i32 fd);
+EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
+    return is_virt(fd) ? FE_SPIPE : w_fd_pread(rfd(fd), iov, n, off, nread);
+}
+EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
+    return is_virt(fd) ? FE_SPIPE : w_fd_pwrite(rfd(fd), iov, n, off, nw);
+}
+EXPORT("fd_sync") i32 x_fd_sync(i32 fd) { return is_pipe(fd) ? FE_INVAL : is_sock(fd) ? 0 : w_fd_sync(rfd(fd)); }
 
 #endif
