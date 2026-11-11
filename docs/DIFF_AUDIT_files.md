@@ -15,7 +15,7 @@ It runs a probe on the real Pyodide and on ours (fused, dynamic; stdin is `/dev/
 directory (`/tmp/dp_<digits>`), `0x...` addresses and uv's warning lines, and prints a unified diff per flavor
 (`-` Pyodide, `+` ours); exit status 0 when there is no difference. A probe prints one line per case,
 `case-id | result` (`ERR ERRNO_NAME` for an `OSError`, `EXC Name` for another exception). A probe without its own
-`def case(` (or a `# standalone` comment) gets `tools/diff_probes/_prelude.py` put in front (`case`, `w`, `tree()` = the
+`def case(` (or a `# standalone` comment) gets `tools/diff_probes/_prelude_files.py` put in front (`case`, `w`, `tree()` = the
 common tree of files/dirs/links/modes, `NAMES` = about 40 argument classes, `fresh()`, `op()`).
 `files_crash_*.py` are standalone one-shot programs for a trap, hang or fatal error: one case ends the process, so they
 cannot share a run (run them by hand with `pyo_run.sh` and `python -m pyodide_wasmtime --flavor ...`).
