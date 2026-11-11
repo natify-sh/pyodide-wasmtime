@@ -58,6 +58,7 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 * The package has **no run-time Python dependency**; wasmtime-py is the `[wasmtime]` extra (and a dev dependency). Python 3.10+.
 * **Node is a build tool only**; one toolchain, **wasi-sdk 34's clang**, builds every wasm we build.
 * **Both packagings** (fused, dynamic) are tested everywhere a test runs, **including Pyodide's official suite**.
+* **The guest is isolated** from the host's environment and files (D13), with two named exceptions: `--inherit-env` hands over ALL the host's variables, secrets included (and then no snapshot is written), and the CA bundle for TLS is read from the host (`SSL_CERT_FILE`, Python's, the system's: a file with a private key in it would put the key into the guest's `/etc/ssl/cert.pem`; the CA bundle is still open under D13).
 * Measure, do not guess: a claim about what runs has a command or a CI run behind it; say plainly what was not run (a network check in a sandbox, Windows, macOS).
 
 ## Map of the documents

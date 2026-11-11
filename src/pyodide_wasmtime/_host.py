@@ -18,7 +18,6 @@ import contextlib
 import ctypes
 import errno
 import hashlib
-import importlib.metadata
 import json
 import logging
 import os
@@ -226,12 +225,25 @@ SERVICES = {
 # records, not the host's; stdout is line buffered, as Pyodide's (a line printed before a trap or os._exit is kept);
 # sys.path as Pyodide has it (the stdlib zip, lib-dynload, then site-packages; no /lib/python3.15, which is not there).
 _AT_START = (
-    "def _start(gone):\n"  # a function: nothing of it stays in __main__
+    "def _start(gone, site_first):\n"  # a function: nothing of it stays in __main__
     "    import os, sys\n"
     "    for d in ('/tmp', '/home/pyodide'): os.chmod(d, 0o777)\n"
     "    sys.stdout.reconfigure(line_buffering=True)\n"
-    f"    sys.path[:] = [''] + [p for p in sys.path if p not in ('', '/lib/python{PYVER}')]\n"
-    f"    sys._stdlib_dir = '/lib/python{PYVER.replace('.', '')}.zip'\n"
+    "    first = [] if sys.flags.safe_path else ['']\n"  # PYTHONSAFEPATH: no '' first
+    f"    sp = '/lib/python{PYVER}/site-packages'\n"
+    # with site= the user's packages come before the stdlib zip (a real _ssl over the zip's stub, as before)
+    f"    rest = [p for p in sys.path if p not in ('', '/lib/python{PYVER}', sp)]\n"
+    "    sys.path[:] = first + ([sp] if site_first else []) + rest + ([] if site_first else [sp])\n"
+    "    sys.executable = '/home/pyodide/this.program'\n"  # the web's value (Node's: a script path); not a file
+    "    old = sys._stdlib_dir\n"
+    f"    new = sys._stdlib_dir = '/lib/python{PYVER.replace('.', '')}.zip'\n"
+    # the frozen modules were laid out under the old stdlib dir at init: they follow it (importlib asserts it)
+    "    for m in list(sys.modules.values()):\n"
+    "        st = getattr(getattr(m, '__spec__', None), 'loader_state', None)\n"
+    "        fn = getattr(st, 'filename', None)\n"
+    "        if isinstance(fn, str) and fn.startswith(old + '/'):\n"
+    "            st.filename = new + fn[len(old):]\n"
+    "            if getattr(m, '__file__', None) == fn: m.__file__ = st.filename\n"
     "    for k in gone: os.environ.pop(k, None)\n"
 )
 
@@ -240,12 +252,14 @@ _AT_START = (
 _WRAPPER = """\
 import sys as _s, __main__ as _m, traceback as _t
 _rc = 0
+_f = _k = None
 try:
-    exec(compile(open({src!r}).read(), "<string>", "exec"), _m.__dict__)
+    with open({src!r}) as _f: _k = compile(_f.read(), "<string>", "exec")
+    exec(_k, _m.__dict__)
 except SystemExit as _e:
     _c = _e.code
     if _c is None: _rc = 0
-    elif isinstance(_c, int): _rc = int(_c) if -2**63 <= _c < 2**63 else -1
+    elif isinstance(_c, int): _rc = int(_c) & 255 if -2**63 <= _c < 2**63 else 255
     else: print(_c, file=_s.stderr); _rc = 1
 except BaseException:
     _rc = 1
@@ -254,8 +268,8 @@ except BaseException:
         try: _s.excepthook(*_s.exc_info())
         except BaseException: _t.print_exc()
 _s.stdout.flush(); _s.stderr.flush()
-open({rc!r}, "w").write(str(_rc))
-del _s, _m, _t, _rc
+with open({rc!r}, "w") as _f: _f.write(str(_rc))
+del _s, _m, _t, _rc, _f, _k
 """
 
 
@@ -469,7 +483,7 @@ class Pyodide:
     ``mounts``: ``{guest path: host folder}`` preopened as they are (the guest can write there);
     ``preopen_dev``: the host's ``/dev`` (OpenSSL reads ``/dev/urandom``); ``env``: more environment variables.
     The guest is isolated: its environment is Pyodide's minimal one (``BASE_ENV``) plus ``env``, never the host's,
-    unless ``inherit_env`` passes the host's variables too (``env`` wins).
+    unless ``inherit_env`` passes the host's variables too, secrets included (``env`` wins; no snapshot then).
     The guest's ``/`` is a temporary folder (stdlib zip, site-packages); it is not a sandbox against the host's own
     network: ``socket`` and the host's fetch are real.
 
@@ -478,7 +492,7 @@ class Pyodide:
     (``$PYODIDE_WASMTIME_SNAPSHOT=0`` turns that off). The preload must only import and compute: it must not print (it
     prints at snapshot time only); opening files or sockets, ``chdir``, writing files, ``dlopen``, ``ctypes`` symbol
     lookups or callbacks, and signals or timers make the snapshot be skipped (a normal start,
-    the preload run once); with ``site=`` or ``mounts=`` there is no snapshot at all.
+    the preload run once); with ``site=`` or ``mounts=`` or ``inherit_env`` there is no snapshot at all.
     """
 
     def __init__(
@@ -974,7 +988,12 @@ class Pyodide:
     def _dl_call(self, id_: int, p: int, n: int) -> int:
         e = self.instances[id_]["exports"].get(self._rd(p, n).decode())
         if isinstance(e, self._wt.Func):
-            e(self.cur[-1])
+            try:
+                e(self.cur[-1])
+            except GuestExit:  # exit() in a constructor: the glue's catch makes it a failed load (text: JS's `${e}`)
+                return self._dl_reason("[object Object]")
+            except self._wt.Trap as exc:
+                return self._dl_fail("RuntimeError", exc)
             return 1
         return 0
 
@@ -1926,18 +1945,17 @@ class Pyodide:
                 v = time.process_time_ns() if cid == 2 else time.thread_time_ns()
         except (AttributeError, OSError, ValueError):
             return GUEST_ERRNO["INVAL"]
-        self._wr(out, struct.pack("<Q", v))
+        try:
+            self._wr(out, struct.pack("<Q", v))
+        except Exception:  # a pointer outside the memory
+            return GUEST_ERRNO["FAULT"]
         return 0
 
     def _runtime_name(self) -> int:
         """`sys._emscripten_info.runtime`: a string from the guest's malloc, as stringToNewUTF8 gives."""
-        try:
-            wv = importlib.metadata.version("wasmtime")
-        except importlib.metadata.PackageNotFoundError:
-            wv = "unknown"
         from . import __version__
 
-        b = f"wasmtime-py {wv} (pyodide-wasmtime {__version__})".encode() + b"\0"
+        b = f"pyodide-wasmtime {__version__}".encode() + b"\0"
         p = self.ex["malloc"](self.cur[-1], len(b))
         self._wr(p, b)
         return p
@@ -2381,7 +2399,16 @@ class Pyodide:
     def _wasi_env(self) -> list[tuple[str, str]]:
         env = dict(BASE_ENV)
         if self.inherit_env:
-            env.update((k, v) for k, v in os.environ.items() if k and "=" not in k and k not in GUEST_OWN_ENV)
+            for k, v in os.environ.items():
+                if not k or "=" in k or k in GUEST_OWN_ENV:
+                    continue
+                try:
+                    k.encode()
+                    v.encode()
+                except UnicodeEncodeError:  # not UTF-8 (a surrogate-escaped byte): WASI's environment is text
+                    log.warning("--inherit-env: %r is not valid UTF-8 and is not passed to the guest", k)
+                    continue
+                env[k] = v
         env.update(INIT_ENV)
         env.update(SSL_CERT_FILE="/etc/ssl/cert.pem", REQUESTS_CA_BUNDLE="/etc/ssl/cert.pem")
         env.update(self.env)
@@ -2390,7 +2417,7 @@ class Pyodide:
     def _at_start(self) -> str:
         """Run at every start: the variables only the interpreter's start needed go (unless the user gave them)."""
         gone = [k for k, _ in INIT_ENV if k not in self.env]
-        return _AT_START + f"_start({gone!r})\ndel _start\n"
+        return _AT_START + f"_start({gone!r}, {bool(self.site)!r})\ndel _start\n"
 
     # ------------------------------------------------------------------ snapshot of the memory after `preload`
     def _snapshot_path(self) -> Path:
@@ -2440,6 +2467,7 @@ class Pyodide:
             self.preload is not None
             and not self.site
             and not self.mounts
+            and not self.inherit_env  # the snapshot is a file: the host's variables (secrets) must not get into it
             and os.environ.get("PYODIDE_WASMTIME_SNAPSHOT") != "0"
         ):
             path = self._snapshot_path()
@@ -2537,8 +2565,8 @@ class Pyodide:
             buf = (ctypes.c_char * (pages * 65536)).from_address(ctypes.addressof(fresh.memory.data_ptr(st).contents))
             tmp = path.with_suffix(f".tmp{os.getpid()}")
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with open(tmp, "wb") as f:
+                _engine.private_dir(path.parent)
+                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
                     f.write(json.dumps(hdr).encode() + b"\n")
                     f.write(buf)
                 os.replace(tmp, path)

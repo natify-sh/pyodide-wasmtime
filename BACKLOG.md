@@ -18,7 +18,7 @@ Order inside a section is not a priority; the order of work is at the end.
 | D8 | Windows symlink fix needs a Windows run to isolate (hypothesis: wasmtime resolves the target from the root); skipped on win32 | documented in the audit |
 | D9 | Policy for the license/size of Pyodide artifacts in the wheel (carried now; alternative: download at first run); the owner opens the pull request | BRIEF.md |
 | D10 | The official suite stays red until fixed; what cannot be fixed becomes `xfail` with a reason | decided, see S1 |
-| D14 | Decided 2026-11-11: the guest STARTS in `/home/pyodide` (as Pyodide), not in `/`; the tests that assume `/` are fixed with it (snapshots too); `--mount-cwd` mounts at `/host` (one constant `CWD_MOUNT` in `_cli.py`); `inherit_env` protects only `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`; `sys.executable` stays `''` (Pyodide's value is a Node artifact: the `_` variable of its process): a documented difference, no work | decided; the cwd change is in batch B2 |
+| D14 | Decided 2026-11-11: the guest STARTS in `/home/pyodide` (as Pyodide), not in `/`; the tests that assume `/` are fixed with it (snapshots too); `--mount-cwd` mounts at `/host` (one constant `CWD_MOUNT` in `_cli.py`); `inherit_env` protects only `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`; `sys.executable` is `'/home/pyodide/this.program'` (the web's value; Node's is a script path; hardcoded in `_AT_START`, done) | decided; the cwd change is in batch B2 |
 | D11 | When Pyodide 315 is released (now 315.0.0-alpha.2): bump the pin (tools/fetch.sh sha, `PYODIDE_VERSION`/`ABI`, `PYVER`) | later |
 
 Decided and written in BRIEF.md (do not reopen without a reason): dynamic is the default, fused stays in the wheel; sockets follow the host's kernel;
@@ -52,7 +52,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 * Files: done (`docs/DIFF_AUDIT_files.md`). Runtime: done (`docs/DIFF_AUDIT_runtime.md`, 12 probe files, about 7500 cases per TZ-run; time functions show NO difference in 7 zones x 4509 cases). Loader/io: the agent is still running.
 * **R-rows from the runtime audit (new differences, each with `tools/diff_probes/runtime_repro.py` as the acceptance probe):**
-  * R7/R8 left: `sys.executable` is empty (Pyodide has the host process's `_` variable, a Node artifact) and `sys.flags.inspect` is 0 (`PYTHONINSPECT=1` is not mirrored); `/home` has no `web_user` folder (Pyodide has both).
+  * R7/R8 left: `sys.flags.inspect` is 0 (`PYTHONINSPECT=1` is not mirrored); `/home` has no `web_user` folder (Pyodide has both).
   * R9 19 glue library functions that no wasm of the build calls (`emscripten_get_now_res`, `emscripten_random`, `emscripten_console_*`, `emscripten_run_script`, `emscripten_force_exit` ...) are missing from dlsym and not in `import_audit.json` (`audit_imports.py` should list the glue's library too); R10 `__assert_fail` with a pointer outside memory traps while printing; R11 `mktime((-271821, 6, 15, ...))` returns a value where Pyodide raises OverflowError.
   * Known and re-observed: `_setitimer_js` fires in a busy loop (deliberate), a struct nested 100 deep traps in `ffi_call_js`, `emscripten_resize_heap`, `os.system` -1, progname, the JS bridge.
   * Not probed: Windows/macOS TZ, `interrupt()` from another thread, a side module importing an `emscripten_*` function, `resource` (cannot be imported on either side).
@@ -60,7 +60,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 * **L-rows from the loader/io audit** (`docs/DIFF_AUDIT_loader_io.md` in branch `worktree-agent-a77fde6b06071244a`, commit 59ebf9f, NOT merged yet: it has its own `tools/diff_pyodide.py` and `_prelude.py` that must be unified with the two merged ones; about 2750 cases; numpy 2.4.3 loads all 13 extension modules and 78 cases agree; mmap 616 of 624; loader chains, rpaths, globals, V8 LinkError texts equal):
   * L1 `os.read(0, 0)`, `os.readv(0, [])`, `sys.stdin.buffer.raw.read(0)` hang (= files N2: in fix batch 1); L2 closing fds 3-5 (the preopens) kills every later path call and the first `os.open` is 6 (= files N3: batch 1 hides the preopens; W5 renumbers).
   * L3 multi-buffer `readv`/`writev` use only the first buffer (= W4); L4 `os.fsync` on fds 0-2 and on a directory fd gives EBADF (Pyodide: ok); L5 `FIONBIO`, `F_SETFL(O_NONBLOCK)`, `os.set_blocking` on fds 0-2 and directories give EBADF (and `os.get_blocking(0..2)` is True where Pyodide says False: ours is POSIX-right).
-  * L6 a trap in a side module's `__wasm_call_ctors`: Pyodide raises OSError and the library stays unloaded; ours succeeds in `CDLL` and prints a 40-line traceback (`_dl_call` in `_host.py`). L7 lower: `ftruncate` on std streams (EBADF vs EINVAL), `mmap` of fd 0/1/pipe (ENOSYS vs ENODEV/EACCES), `line_buffering` False on stdout and stdin (batch 1 does stdout), cosmetic dlerror texts.
+  * L6 done (a trap or exit in a constructor is an OSError at dlopen). L7 lower: `ftruncate` on std streams (EBADF vs EINVAL), `mmap` of fd 0/1/pipe (ENOSYS vs ENODEV/EACCES), `line_buffering` False on stdout and stdin (batch 1 does stdout), cosmetic dlerror texts.
   * Pyodide bugs where ours is right (D3, the owner decides): `select`/`poll` ignore the timeout and return at once (`___syscall_poll`), `poll(NULL, 2**30, 0)` and `socket.socketpair()` are fatal on Pyodide, an mmap flush at offset 2**40 is a fatal RangeError, a dylink.0 memsize above 2 GiB kills it or loads with an unchecked malloc.
   * Seen again, known: `emscripten_dlopen` callback timing, the hidden bridge, the dup'd mmap descriptor, `os.system`, the log stack flags. Host-dependent: `/dev`, `/proc`, `/home`, `/etc`, the environment and `cwd` (`/` instead of `/home/pyodide`: part of D13: set the guest's cwd to `/home/pyodide`?), permission bits.
 * `tools/diff_pyodide.py` needs `PYO_RUN` (a script running a Python file in the real Pyodide on Node); make a real tool of it (a node script on the npm `pyodide` package, a build-time tool) instead of a scratchpad script.
@@ -68,7 +68,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 ## 6. Work: reviews not done yet (CLAUDE.md: a `reviewer` reads high-stakes diffs)
 
-* the virtual descriptor layer (`wasm/adapter/vfd.h`, 308 lines, a new table, placeholders, `fd_renumber`, routed WASI imports);
+* the virtual descriptor layer (`wasm/adapter/vfd.h`): two independent reviews are done and their fixes are in (the batch after cb1f608); what is left of them is the numbering (W5): a `fd_alloc`/`sock_fd` that opens placeholders until the wanted number comes (about 1000 opens per `dup` after a `dup2` to 1000), a mmap's hidden dup that the guest can name, `os.set_inheritable(fd, True)` and `os.pipe()` (the libc answers FIOCLEX/FIONCLEX itself, CPython has no pipe2 here);
 * the override feature (`asm_wasm`/`stdlib`, conversion of a legacy-exception main module, snapshot key);
 * the Windows/macOS host changes (`_poll`, pending errors, `SO_ACCEPTCONN`, localtime guards);
 * the new tests were not all run against the old build to show "fails before" (say which in each report).
@@ -98,7 +98,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 Done: the three differential audits, the first fix batch (B1: crashes, exit status, CPU clock, environment, preopens), the descriptor layer, the harness.
 Running: independent reviews of the descriptor layer (`vfd.h`) and of B1 (section 6); their findings become fixes before anything else touches those files.
 Next, one batch at a time (they touch the same adapter and host files: no two in parallel), each with a `reviewer` pass on the diff:
-1. B2 (stdio, small): `close(1)` and the other standard descriptors (N5), `fsync` on 0-2 and directories (L4), `FIONBIO`/`set_blocking` on 0-2 and directories (L5), `ftruncate` on std (EINVAL), the guest's cwd `/home/pyodide` and the tests that assume `/` (D14), a trap in a side module's `__wasm_call_ctors` (L6).
+1. B2 (stdio, small): `close(1)` and the other standard descriptors (N5), `fsync` on 0-2 and directories (L4), `FIONBIO`/`set_blocking` on 0-2 and directories (L5), `ftruncate` on std (EINVAL), the guest's cwd `/home/pyodide` and the tests that assume `/` (D14), (L6 done: a trap or exit in a constructor is an OSError at dlopen).
 2. B3 (directories and multiple buffers): W4 (`readv`/`writev`/`preadv`/`pwritev` loop, `pread` above 64 KiB), W7 (the `getdents` snapshot), N20.
 3. B4 (`/dev` and paths): W2 virtual `/dev`, `/proc/self/fd`, W3 (empty path, trailing slash on `rmdir`, the errno sweep of N10/N11/N23/N32-N34/N36), `os.devnull`; then the suite items they fix (`test_logging`, `test_shutil`, `test_os.test_posix`).
 4. B5 (numbering, the biggest): W5/D5 decoupled descriptor numbers (first fd 3, lowest free, `dup2` to any number, 4096 descriptors, preopens hidden for good), plain `open` returns the lowest free number, N17-N19.

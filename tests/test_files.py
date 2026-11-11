@@ -449,7 +449,7 @@ for call in (
 ):
     assert err(call) == 'EBADF', call
 assert err(fcntl.fcntl, fd, 9999) == 'EINVAL'
-assert fcntl.fcntl(fd, fcntl.F_GETFD) == 0
+assert fcntl.fcntl(fd, fcntl.F_GETFD) == 1  # kept per number, and Python opens O_CLOEXEC (Pyodide: always 0)
 """,
     )
 

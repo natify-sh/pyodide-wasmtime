@@ -48,15 +48,19 @@ def test_exit_status(guest: Guest, code: str, status: int) -> None:
 
 
 def test_cpu_time_clocks_are_the_hosts(guest: Guest) -> None:
-    """N3 (and D12): the CPU-time clocks answer with the host's CPU time, where wasmtime says EBADF."""
+    """N3 (and D12): the CPU-time clocks answer with the host's CPU time (where wasmtime says EBADF and Pyodide gives
+    the monotonic clock): a busy loop advances them, a sleep does not."""
     code = """
 import time, ctypes, errno
-a = time.process_time()
-t0 = time.clock_gettime(time.CLOCK_PROCESS_CPUTIME_ID)
-t1 = time.clock_gettime(time.CLOCK_THREAD_CPUTIME_ID)
-sum(i * i for i in range(300000))
-b = time.process_time()
-print(b > a, time.clock_gettime(time.CLOCK_PROCESS_CPUTIME_ID) > t0, t1 >= 0)
+def burn(clock):  # until the clock itself has advanced 0.1 s (a clock that does not advance ends at 5 s)
+    t0, end = clock(), time.monotonic() + 5
+    while clock() - t0 < 0.1 and time.monotonic() < end: pass
+    return clock() - t0 >= 0.1
+TH, PR, ck = time.CLOCK_THREAD_CPUTIME_ID, time.CLOCK_PROCESS_CPUTIME_ID, time.clock_gettime
+print(burn(time.process_time), burn(lambda: ck(TH)), burn(lambda: ck(PR)))
+p, t = time.process_time(), ck(TH)
+time.sleep(0.5)  # the guest's sleep spends about half of it as CPU time; Pyodide's monotonic clock would say 0.5
+print(time.process_time() - p < 0.4, ck(TH) - t < 0.4)
 print(time.clock_getres(time.CLOCK_PROCESS_CPUTIME_ID) > 0, time.clock_getres(time.CLOCK_THREAD_CPUTIME_ID) > 0)
 print(ctypes.CDLL(None).clock() > 0)
 for cid in (4, 99, -1):
@@ -67,7 +71,8 @@ for cid in (4, 99, -1):
 """
     r = guest.run(code)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.splitlines() == ["True True True", "True True", "True", "4 EINVAL", "99 EINVAL", "-1 EINVAL"]
+    want = ["True True True", "True True", "True True", "True", "4 EINVAL", "99 EINVAL", "-1 EINVAL"]
+    assert r.stdout.splitlines() == want
 
 
 def test_excepthook_is_called_for_an_uncaught_exception(guest: Guest) -> None:
@@ -143,12 +148,16 @@ def test_mount_cwd(guest: Guest, tmp_path: Path) -> None:
     assert (tmp_path / "new.txt").read_text() == "x"
 
 
-def test_inherit_env_is_an_api_option(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inherit_env_is_an_api_option(monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setenv("WASMHOST_TEST_SECRET", "hunter2")
     isolated = dict(Pyodide(inherit_env=False)._wasi_env())
     inherited = dict(Pyodide(inherit_env=True, env={"HOME": "/h"})._wasi_env())
     assert "WASMHOST_TEST_SECRET" not in isolated and isolated["HOME"] == "/home/pyodide"
     assert inherited["WASMHOST_TEST_SECRET"] == "hunter2" and inherited["HOME"] == "/h"
+
+    with Pyodide(inherit_env=True, env={"HOME": "/h"}) as py:  # and the guest sees it
+        assert py.run("import os; print(os.environ['WASMHOST_TEST_SECRET'], os.environ['HOME'])") == 0
+    assert capfd.readouterr().out == "hunter2 /h\n"
 
 
 # ------------------------------------------------------------------------------------------------------- files
@@ -210,9 +219,10 @@ for fd in (3, 4):
     c('fcntl', lambda: __import__('fcntl').fcntl(fd, 1))
 print(os.listdir('/') != [], os.path.exists('/lib'), os.close(os.open('/tmp', 0)) is None)
 """
-    r = guest.run(code, None, "--dev")
+    # descriptor 4 is a preopen only with --dev (the root is 3), and Windows has no /dev to give: there only 3 is one
+    r = guest.run(code.replace("(3, 4)", "(3,)"), None) if sys.platform == "win32" else guest.run(code, None, "--dev")
     assert r.returncode == 0, r.stderr
     lines = r.stdout.splitlines()
     assert lines[-1] == "True True True"
-    # descriptor 4 is a preopen only with --dev (the root is 3): the others are as for a free number
+    # the others are as for a free number
     assert all(ln.endswith("EBADF") for ln in lines[:-1]), lines

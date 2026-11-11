@@ -128,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--inherit-env",
         action="store_true",
-        help="pass the host's environment variables to the guest (by default it has Pyodide's minimal one)",
+        help="pass ALL the host's environment variables, secrets included, to the guest (it can print or send them); "
+        "by default it has Pyodide's minimal environment",
     )
     ap.add_argument("--data", metavar="DIR", help="the wasm files (default: the package's, or $PYODIDE_WASMTIME_DATA)")
     ap.add_argument(
@@ -160,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
             "--asm-wasm and --stdlib replace files of the dynamic build: the fused module is built for one Pyodide"
         )
     flavor = ns.flavor or ("dynamic" if ns.asm_wasm or ns.stdlib else None)
+    for opt, items in (("--mount", ns.mount), ("--env", ns.env)):
+        for item in items:
+            if "=" not in item:
+                ap.error(f"{opt} {item!r}: expected {'GUEST=HOST' if opt == '--mount' else 'K=V'}")
     mounts = dict(m.split("=", 1) for m in ns.mount)
     if ns.mount_cwd:
         mounts[CWD_MOUNT] = os.getcwd()

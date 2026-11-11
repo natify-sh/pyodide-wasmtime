@@ -1,0 +1,272 @@
+"""Offline: what the two independent reviews of the descriptor layer and of the first fix batch found, on both
+packagings. Each test says which finding it is; the ones that need the new adapter fail on the build before."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import sidemod
+from conftest import Guest
+from wasmtime import wat2wasm
+
+from pyodide_wasmtime import Pyodide
+
+POSIX = sys.platform != "win32"
+
+# ---------------------------------------- inherit_env and the snapshot
+
+
+def test_inherit_env_makes_no_snapshot_and_no_file_holds_the_secret(
+    flavor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Batch 1 M1: the snapshot is the guest's whole memory, environment included: with `inherit_env` it would be the
+    host's secrets in a file."""
+    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path))
+    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("WASMHOST_TEST_SECRET", "hunter2-needle")
+    for _ in range(2):
+        with Pyodide(flavor, preload="import json\nvalue = 41", inherit_env=True) as py:
+            assert py.run("import os; print(os.environ['WASMHOST_TEST_SECRET'], value)") == 0
+            assert not py.restored
+        assert capfd.readouterr().out == "hunter2-needle 41\n"
+    for f in tmp_path.rglob("*"):
+        if f.is_file():
+            assert b"hunter2-needle" not in f.read_bytes(), f
+    assert not list(tmp_path.glob("snapshot-*.mem"))
+
+
+@pytest.mark.skipif(not POSIX, reason="file modes")
+def test_snapshot_and_cache_are_private(flavor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(cache))
+    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    with Pyodide(flavor, preload="import json") as py:
+        py.run("pass")
+    assert cache.stat().st_mode & 0o777 == 0o700
+    files = list(cache.glob("snapshot-*.mem")) + list(cache.glob("*.cwasm"))
+    assert files
+    assert all(f.stat().st_mode & 0o777 == 0o600 for f in files), [oct(f.stat().st_mode) for f in files]
+
+
+# ---------------------------------------- exit in a constructor
+
+
+def ctor_module(body: str) -> bytes:
+    wat = f"""(module (import "env" "memory" (memory 0)) (import "env" "exit" (func $exit (param i32)))
+      (func (export "__wasm_call_ctors") {body}) (func (export "f") (result i32) i32.const 1))"""
+    return sidemod.with_dylink(bytes(wat2wasm(wat)))
+
+
+@pytest.mark.parametrize("body", ["(call $exit (i32.const 205))", "unreachable"])
+def test_exit_or_trap_in_a_constructor_is_a_failed_load(guest: Guest, tmp_path: Path, body: str) -> None:
+    """Batch 1 M2: the glue's try/catch turns it into `OSError: could not load dynamic lib`; here dlopen succeeded and
+    the exit was swallowed with a traceback."""
+    (tmp_path / "ctor.so").write_bytes(ctor_module(body))
+    code = (
+        "import ctypes\n"
+        "try:\n    ctypes.CDLL('/s/ctor.so')\n    print('loaded')\n"
+        "except OSError as e:\n    print('OSError', str(e).splitlines()[0])\n"
+        "print('alive')\n"
+    )
+    r = guest.run(code, None, "--mount", f"/s={tmp_path}")
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["OSError could not load dynamic lib: /s/ctor.so", "alive"])
+    assert "Traceback" not in r.stderr, r.stderr
+
+
+# ---------------------------------------- poll, pread
+
+
+def test_poll_and_select_of_a_preopen_number_are_invalid(guest: Guest) -> None:
+    """Batch 1 L3: the root's descriptor number is no descriptor of the guest: POLLNVAL, and select says EBADF."""
+    code = """
+import os, select, errno
+p = select.poll(); p.register(3, select.POLLIN | select.POLLOUT)
+print(p.poll(0))
+try: select.select([3], [], [], 0)
+except OSError as e: print(errno.errorcode[e.errno])
+r, w = os.pipe()
+print(select.select([r], [w], [], 0) == ([], [w], []))
+"""
+    r = guest.run(code)
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["[(3, 32)]", "EBADF", "True"]), r.stderr
+
+
+def test_pread_and_pwrite_check_the_offset(guest: Guest) -> None:
+    """Batch 1 L5: an offset above 2**53 is EFBIG (the glue's bigintToI53Checked), as lseek has it."""
+    code = """
+import os, errno
+fd = os.open('/tmp/f', os.O_RDWR | os.O_CREAT); os.write(fd, b'0123456789')
+def c(f, *a):
+    try: return f(*a)
+    except OSError as e: return errno.errorcode[e.errno]
+print(c(os.pread, fd, 1, 2**62), c(os.pread, fd, 0, 2**62), c(os.pread, fd, 1, 2**53 + 8), c(os.pread, fd, 2, 3))
+print(c(os.pwrite, fd, b'x', 2**62), c(os.pwrite, fd, b'x', 1))
+"""
+    r = guest.run(code)
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["EFBIG EFBIG EFBIG b'34'", "EFBIG 1"]), r.stderr
+
+
+# ---------------------------------------- the environment and run()
+
+
+def test_inherit_env_skips_what_is_not_utf8(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Batch 1 L6: a host variable that is not UTF-8 crashed the start with UnicodeEncodeError."""
+    if not POSIX:
+        pytest.skip("Windows has no undecodable variables")
+    monkeypatch.setenv("WASMHOST_BAD", "\udcff")
+    monkeypatch.setenv("WASMHOST_GOOD", "ok")
+    with caplog.at_level("WARNING", logger="pyodide_wasmtime"):
+        env = dict(Pyodide(inherit_env=True)._wasi_env())
+    assert env["WASMHOST_GOOD"] == "ok" and "WASMHOST_BAD" not in env
+    assert "WASMHOST_BAD" in caplog.text
+
+
+@pytest.mark.parametrize("opt", ["--env", "--mount"])
+def test_cli_option_without_an_equals_sign_is_a_usage_error(opt: str) -> None:
+    r = subprocess.run(
+        [sys.executable, "-m", "pyodide_wasmtime", opt, "NOEQUALS", "-c", "pass"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert r.returncode == 2 and "expected" in r.stderr and "Traceback" not in r.stderr, r.stderr
+
+
+def test_hostile_python_variables_do_not_break_the_host(guest: Guest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Batch 1 L7, L8: PYTHONWARNINGS=error turned the host's own unclosed files into errors, and PYTHONSAFEPATH was
+    defeated by the '' that the start put first in sys.path."""
+    monkeypatch.setenv("PYTHONWARNINGS", "error")
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    r = guest.run("import sys; print('' in sys.path, sys.flags.safe_path)", None, "--inherit-env")
+    assert (r.returncode, r.stdout.strip()) == (0, "False True"), r.stderr
+    assert "Warning" not in r.stderr and "Traceback" not in r.stderr, r.stderr
+
+
+def test_sys_executable_is_the_web_pyodides(guest: Guest) -> None:
+    r = guest.run("import sys; print(sys.executable); print(sys._emscripten_info.runtime)")
+    out = r.stdout.splitlines()
+    assert r.returncode == 0 and out[0] == "/home/pyodide/this.program", r.stderr
+    assert out[1].startswith("pyodide-wasmtime"), out
+
+
+def test_run_returns_the_status_as_a_process_exit_would(flavor: str) -> None:
+    """Batch 1 L9: `sys.exit(256)` returned 256 and `os._exit(256)` returned 0."""
+    codes = ["sys.exit(256)", "sys.exit(256 + 5)", "sys.exit(-1)", "sys.exit(2**70)", "sys.exit(3)", "os._exit(256)"]
+    with Pyodide(flavor) as py:
+        got = [py.run(f"import sys, os; {c}") for c in codes]
+    assert got == [0, 5, 255, 255, 3, 0]
+
+
+def test_realtime_clock_resolution_is_pyodides(guest: Guest) -> None:
+    """Batch 1 L9: `clock_getres(CLOCK_REALTIME)` is 1 ms in the glue (Date.now()), WASI says 1 ns."""
+    r = guest.run("import time; print(time.clock_getres(time.CLOCK_REALTIME))")
+    assert (r.returncode, r.stdout.strip()) == (0, "0.001"), r.stderr
+
+
+# ---------------------------------------- descriptors
+
+
+def test_cloexec_is_kept_for_every_descriptor(guest: Guest) -> None:
+    """Descriptor review 3: Python opens everything O_CLOEXEC (PEP 446) and F_SETFD must stick: a bit per number for
+    plain descriptors and sockets too (a deliberate difference from Pyodide, whose F_GETFD is always 0).
+    os.set_inheritable(fd, True) is a no-op: the libc answers FIONCLEX itself."""
+    code = """
+import os, fcntl, socket, ctypes
+def fd_flag(fd): return fcntl.fcntl(fd, fcntl.F_GETFD)
+f = os.open('/tmp', os.O_RDONLY)                      # CPython adds O_CLOEXEC
+print(fd_flag(f), os.get_inheritable(f))
+fcntl.fcntl(f, fcntl.F_SETFD, 0); print(fd_flag(f), os.get_inheritable(f))
+fcntl.fcntl(f, fcntl.F_SETFD, 1); print(fd_flag(f), os.get_inheritable(f))
+print(fd_flag(os.open('/tmp', os.O_RDONLY | os.O_CLOEXEC)), fd_flag(os.open('/tmp', os.O_RDONLY)))
+s = socket.socket(); print(s.get_inheritable())
+fcntl.fcntl(s, fcntl.F_SETFD, 0); print(s.get_inheritable(), fd_flag(s.fileno()))
+print(fd_flag(os.dup(f)), fd_flag(ctypes.CDLL(None).dup(f)))  # Python's dup is O_CLOEXEC, libc's dup clears it
+print(fd_flag(fcntl.fcntl(f, fcntl.F_DUPFD_CLOEXEC, 0)))
+os.close(f); g = os.open('/tmp', os.O_RDONLY); print(g == f or True, fd_flag(g))   # a closed number starts again
+fcntl.fcntl(g, fcntl.F_SETFD, 0); os.close(g)
+h = os.open('/tmp', os.O_RDONLY, dir_fd=None); print(fd_flag(h))
+"""
+    r = guest.run(code)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == [
+        "1 False", "0 True", "1 False", "1 1", "False", "True 0", "1 0", "1", "True 1", "1",
+    ]  # fmt: skip
+
+
+def test_descriptors_work_after_many_files_were_opened_and_closed(guest: Guest) -> None:
+    """Descriptor review 1: after 1200 files were opened and closed WASI hands out numbers above 1024, and every dup,
+    pipe and socket failed with EMFILE."""
+    code = """
+import os, socket
+open('/tmp/g.txt', 'w').close()
+L = [os.open('/tmp/g.txt', os.O_RDONLY) for _ in range(1200)]
+for x in L: os.close(x)
+print(os.dup(2) > 2, len(os.pipe()), socket.socket().fileno() > 2)
+"""
+    r = guest.run(code)
+    assert (r.returncode, r.stdout.strip()) == (0, "True 2 True"), r.stderr
+
+
+def test_moving_the_holder_of_a_directory_keeps_its_listing(guest: Guest) -> None:
+    """Descriptor review 4: the holder of a directory's WASI descriptor moves when its number is closed while a dup
+    lives; the readdir cookie follows it (the cookie table may grow in between: a number above 256)."""
+    code = """
+import os
+os.mkdir('/tmp/dd')
+for n in 'abc': open('/tmp/dd/' + n, 'w').close()
+f = os.open('/tmp/dd', os.O_RDONLY | os.O_DIRECTORY)
+want = sorted(os.listdir(f))
+os.dup2(f, 600); os.close(f)
+print(sorted(os.listdir(600)) == want, sorted(e.name for e in os.scandir(600)) == want)
+os.dup2(600, 900); os.close(600)
+print(sorted(os.listdir(900)) == want)
+"""
+    r = guest.run(code)
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["True True", "True"]), r.stderr
+
+
+def test_a_file_opened_on_a_closed_standard_number_is_a_file(guest: Guest) -> None:
+    """Descriptor review 7: `fd_std` went by the number: after close(1) the next file opened onto 1 stat'ed as a
+    character device and could not seek."""
+    code = """
+import os, stat, sys
+open('/tmp/g.txt', 'w').write('abc')
+s = os.dup(1); os.close(1)
+fd = os.open('/tmp/g.txt', os.O_RDONLY)
+res = (fd == 1, stat.S_ISREG(os.fstat(fd).st_mode), os.lseek(fd, 0, 2))
+os.close(fd); os.dup2(s, 1); os.close(s)
+print(*res)
+print(stat.S_ISCHR(os.fstat(1).st_mode))
+"""
+    r = guest.run(code)
+    assert (r.returncode, r.stdout.splitlines()) == (0, ["True True 3", "True"]), r.stderr
+
+
+# ------------------------------------------------------------------------------------------ sys.path and the stdlib dir
+
+
+def test_site_folders_come_before_the_stdlib_zip(guest: Guest, tmp_path: Path) -> None:
+    """CI of cb1f608: a `site=` folder's real `_ssl` lost to the stub `_ssl.py` of the stdlib zip when site-packages
+    was last. With `site=` they come first (as before); without it the order is Pyodide's."""
+    (tmp_path / "colorsys.py").write_text("MARK = 'from the site folder'\n")
+    code = "import sys, colorsys; print(sys.path[1:3]); print(getattr(colorsys, 'MARK', None))"
+    r = guest.run(code, None, "--site", str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["['/lib/python3.15/site-packages', '/lib/python315.zip']", "from the site folder"]
+    r = guest.run(code)
+    assert r.stdout.splitlines() == ["['/lib/python315.zip', '/lib/python3.15/lib-dynload']", "None"], r.stderr
+
+
+def test_frozen_modules_follow_the_stdlib_dir(guest: Guest) -> None:
+    """CI of cb1f608: `sys._stdlib_dir` is the zip (as Pyodide's), but the frozen modules were laid out under
+    /lib/python3.15 at init; a fresh import of importlib (the tests of importlib do it) asserted they agree."""
+    code = """
+import sys, zipimport
+st = zipimport.__spec__.loader_state.filename
+print(sys._stdlib_dir, zipimport.__file__ == st == sys._stdlib_dir + '/zipimport.py')
+"""
+    r = guest.run(code)
+    assert (r.returncode, r.stdout.strip()) == (0, "/lib/python315.zip True"), r.stderr
