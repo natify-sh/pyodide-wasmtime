@@ -139,7 +139,7 @@ def test_key_changes_with_stdlib_stamp_and_dev(flavor, cache, monkeypatch):
 
 
 def test_the_code_hash_ignores_an_editors_dangling_lock_symlink(tmp_path):
-    """Review of the split: `.#_host.py` (an Emacs lock, a dangling symlink) in the package folder must not break the key."""
+    """Review of the split: `.#_host.py` (an Emacs lock: a dangling symlink) in the package folder must not break it."""
     from pyodide_nojs._consts import code_hash
 
     (tmp_path / "a.py").write_text("x = 1\n")
