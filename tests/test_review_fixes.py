@@ -293,6 +293,7 @@ def test_moving_the_holder_of_a_directory_keeps_its_listing(guest: Guest) -> Non
     lives; the readdir cookie follows it (the cookie table may grow in between: a number above 256)."""
     code = """
 import os
+import re
 os.mkdir('/tmp/dd')
 for n in 'abc': open('/tmp/dd/' + n, 'w').close()
 f = os.open('/tmp/dd', os.O_RDONLY | os.O_DIRECTORY)
@@ -346,6 +347,24 @@ def test_a_site_folders_own_sitecustomize_runs_beside_ours(guest: Guest, tmp_pat
     code = "import sitecustomize, socket; print(sitecustomize.MARK, socket.SO_REUSEADDR)"
     r = guest.run(code, None, "--site", str(tmp_path))
     assert (r.returncode, r.stdout.splitlines()) == (0, ["user sitecustomize 2"]), r.stderr
+
+
+def test_tracebacks_show_only_the_users_frames(guest: Guest) -> None:
+    """The run wrapper's own frame is not in a traceback (the old one added just `File "<string>"`)."""
+    for code in ("1/0\n", "def f():\n    raise ValueError('x')\nf()\n", "def (:\n"):
+        r = guest.run(code)
+        assert r.returncode == 1 and "Error" in r.stderr, r.stderr
+        assert "pyodide_nojs" not in r.stderr and "exec(code" not in r.stderr, r.stderr
+    r = guest.run("1/0\n")
+    assert re.findall(r'File "[^"]*", line \d+, in <?\w+>?', r.stderr) == ['File "<string>", line 2, in <module>'], (
+        r.stderr
+    )
+
+
+def test_a_site_folders_pyodide_nojs_run_does_not_hijack_the_run(guest: Guest, tmp_path: Path) -> None:
+    (tmp_path / "pyodide_nojs_run.py").write_text("x = 1\n")
+    r = guest.run("import sys; sys.exit(3)", None, "--site", str(tmp_path))
+    assert r.returncode == 3, r.stderr
 
 
 def test_frozen_modules_follow_the_stdlib_dir(guest: Guest) -> None:

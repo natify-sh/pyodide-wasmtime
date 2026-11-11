@@ -1,8 +1,8 @@
 """Pyodide's package lock for micropip, with no JavaScript (guest side).
 
 Outside the browser micropip's compatibility layer has an empty lock and a `loadPackage` that does nothing, so
-`micropip.install("numpy")` (a package of Pyodide's own lock, not on PyPI) finds nothing. `hook` (called from
-sitecustomize) waits for `micropip._compat` to be imported and then `patch`es its layer: the lock's packages,
+`micropip.install("numpy")` (a package of Pyodide's own lock, not on PyPI) finds nothing. `hook` (called by the
+`pyodide_nojs_start` module that `pyodide_nojs.pth` runs) waits for `micropip._compat` to be imported and then `patch`es its layer: the lock's packages,
 info and base URL, and a `loadPackage` that does what Pyodide's JavaScript does for a package of the lock:
 the dependencies from `depends`, the wheel from the base URL, its sha256 checked, unpacked into site-packages.
 """

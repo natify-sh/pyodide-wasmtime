@@ -48,6 +48,7 @@ PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited consta
 FLAVORS = ("fused", "dynamic")
 DATA = Path(__file__).resolve().parent / "data"
 GUEST = Path(__file__).resolve().parent / "guest"  # Python that runs in the guest: copied to its site-packages
+GUEST_SUFFIXES = (".py", ".pth")  # of the files copied, and of the files the snapshot key covers
 
 # The guest's whole environment (the host's is never passed unless `inherit_env`): what Pyodide has on Node
 # (Emscripten's USER, LOGNAME, PATH, PWD, LANG; HOME from its loader), and LD_LIBRARY_PATH (where NEEDED are sought).
@@ -550,14 +551,16 @@ class Pyodide:
         )
         sp = root / "lib" / f"python{PYVER}" / "site-packages"
         sp.mkdir()
-        for g in GUEST.iterdir():  # before the site= folders: a file of the same name there wins
-            if g.suffix in (".py", ".pth"):
+        guest_files = sorted(g for g in GUEST.iterdir() if g.suffix in GUEST_SUFFIXES)
+        for g in guest_files:  # before the site= folders: a file of the same name there wins (but not the run protocol)
+            if g.name != "pyodide_nojs_run.py":
                 shutil.copy(g, sp)
         lock = self.data / "pyodide-lock.json"  # Pyodide's package lock, for micropip (guest/pyodide_lock.py)
         if lock.exists():
             shutil.copy(lock, sp / "pyodide-lock.json")
         for s in self.site:  # inside the preopen: WASI does not follow a link out of it
             shutil.copytree(s, sp, dirs_exist_ok=True)
+        shutil.copy(GUEST / "pyodide_nojs_run.py", sp)  # the host's own protocol: ours always wins
         for guest in self.mounts:  # a placeholder, so that a directory listing of the parent shows the mount
             (root / guest.lstrip("/")).mkdir(parents=True, exist_ok=True)
         (root / "home" / "pyodide").mkdir(parents=True, exist_ok=True)  # HOME
@@ -2410,7 +2413,9 @@ class Pyodide:
                     hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     hashlib.sha256(
                         b"".join(
-                            g.name.encode() + b"\0" + g.read_bytes() for g in sorted(GUEST.iterdir()) if g.is_file()
+                            g.name.encode() + b"\0" + g.read_bytes()
+                            for g in sorted(GUEST.iterdir())
+                            if g.suffix in GUEST_SUFFIXES
                         )
                     ).hexdigest(),
                     hashlib.sha256(f.read_bytes()).hexdigest()

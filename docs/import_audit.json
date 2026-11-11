@@ -1935,7 +1935,7 @@
   "class": "runtime",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c get_progname: './this.program' (Pyodide's thisProgram when it is not run from a script file) cut to len-1 and always ended with a NUL (stringToUTF8); len <= 0 writes nothing; sys.executable: Pyodide computes it from argv[0] = thisProgram (getpath makes './this.program' absolute against the cwd), so it is '/home/pyodide/this.program' in the browser and a script's path on Node (the glue takes process.argv[1]); this host starts with Py_Initialize() and no argv, so getpath finds nothing (sys.executable and sys._base_executable are ''): _AT_START sets sys.executable to the web's value '/home/pyodide/this.program' (no such file; mirrors the browser, not Node)",
+  "evidence": "adapter.c get_progname: './this.program' (Pyodide's thisProgram when it is not run from a script file) cut to len-1 and always ended with a NUL (stringToUTF8); len <= 0 writes nothing; sys.executable: Pyodide computes it from argv[0] = thisProgram (getpath makes './this.program' absolute against the cwd), so it is '/home/pyodide/this.program' in the browser and a script's path on Node (the glue takes process.argv[1]); this host starts with Py_Initialize() and no argv, so getpath finds nothing (sys.executable and sys._base_executable are ''): `start` of guest/pyodide_nojs_run.py sets sys.executable to the web's value '/home/pyodide/this.program' (no such file; mirrors the browser, not Node)",
   "tested": "tests/test_runtime.py::test_progname_is_cut_and_ended, tests/test_review_fixes.py::test_sys_executable_is_the_web_pyodides"
  },
  {

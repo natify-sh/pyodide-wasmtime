@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import zipfile
+from pathlib import Path
 
 import pytest
 from conftest import Guest, check_file
@@ -216,8 +217,17 @@ def test_a_failed_hook_fails_the_import_every_time(guest: Guest):
 
 
 def test_the_lock_base_is_the_pinned_release():
+    import ast
+
+    import pyodide_nojs  # the guest module is not imported here: it patches _socket of the host
     from pyodide_nojs import PYODIDE_VERSION
-    from pyodide_nojs.guest.pyodide_nojs_start import LOCK_BASE
+
+    tree = ast.parse((Path(pyodide_nojs.__file__).parent / "guest" / "pyodide_nojs_start.py").read_text())
+    LOCK_BASE = next(
+        ast.literal_eval(n.value)
+        for n in tree.body
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "LOCK_BASE" for t in n.targets)
+    )
 
     assert LOCK_BASE == f"https://cdn.jsdelivr.net/pyodide/v{PYODIDE_VERSION.replace('-alpha.', 'a')}/full/"
 
