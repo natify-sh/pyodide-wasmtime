@@ -430,16 +430,16 @@ def test_ipv6_structures_are_written_and_read_right(guest: Guest, port: int):
 
 
 def test_sockaddr_translation_round_trips():
-    from pyodide_nojs._host import Pyodide
+    from pyodide_nojs import _sockaddr
 
     v6 = ("fe80::1", 8080, 7, 3)
-    raw = Pyodide._sockaddr_bytes(v6)
+    raw = _sockaddr.sockaddr_bytes(v6)
     assert len(raw) == 28 and raw[:2] == b"\x0a\x00" and raw[2:4] == b"\x1f\x90" and raw[24:] == b"\x03\0\0\0"
-    assert Pyodide._sockaddr_tuple(raw) == v6
+    assert _sockaddr.sockaddr_tuple(raw) == v6
     v4 = ("10.1.2.3", 80)
-    raw = Pyodide._sockaddr_bytes(v4)
+    raw = _sockaddr.sockaddr_bytes(v4)
     assert raw == b"\x02\x00\x00\x50\x0a\x01\x02\x03" + bytes(8)
-    assert Pyodide._sockaddr_tuple(raw) == v4
+    assert _sockaddr.sockaddr_tuple(raw) == v4
 
 
 # Winsock takes a whole 10 MB buffer into the kernel at once (CI run 42829422107: not "partial"): fine there

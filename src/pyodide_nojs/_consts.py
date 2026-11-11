@@ -7,13 +7,17 @@ import logging
 import os
 import re
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from . import _engine, _wasm
 
 log = logging.getLogger("pyodide_nojs")
+
+# the guest's memory, as the functions of the other modules are given it: read n bytes at a pointer, write at a pointer
+Reader = Callable[[int, int], bytes]
+Writer = Callable[[int, bytes], None]
 
 PYVER = "3.15"  # the Python of the pinned Pyodide (315.0.0-alpha.2 = 3.15.0rc1)
 PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited constant in the pinned pyodide.asm.wasm
