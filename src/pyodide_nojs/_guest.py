@@ -2,7 +2,7 @@
 table, the stack of call contexts, and the accessors of the guest's memory.
 
 One `Guest` per `Pyodide`; components hold it as a read-only handle. Only `bind` sets the wasm objects, and the stack of
-contexts (`cur`) is changed only here: `entered` pushes the Caller of a running host function and pops it again."""
+contexts (`cur`) is changed only here: `wrap` pushes the Caller of a running host function and pops it again."""
 
 from __future__ import annotations
 
@@ -13,22 +13,6 @@ from ._consts import GUEST_ERRNO, GuestFault
 from ._sockaddr import werr
 
 log = logging.getLogger("pyodide_nojs")
-
-
-class _Entered:
-    """`with guest.entered(ctx):` as a class (a generator-based context manager costs more on every host call)."""
-
-    __slots__ = ("cur", "ctx")
-
-    def __init__(self, cur: list, ctx: Any) -> None:
-        self.cur = cur
-        self.ctx = ctx
-
-    def __enter__(self) -> None:
-        self.cur.append(self.ctx)
-
-    def __exit__(self, *exc: object) -> None:
-        self.cur.pop()
 
 
 class Guest:
@@ -46,10 +30,25 @@ class Guest:
         self.memory, self.table = ex["memory"], ex["__indirect_function_table"]
         self.cur[:] = [store]
 
-    def entered(self, ctx: Any) -> _Entered:
-        """The host function called with `ctx` is running: its context is `cur[-1]` until the `with` ends (also by an
-        exception)."""
-        return _Entered(self.cur, ctx)
+    def wrap(self, fn, handle=None, void: bool = False):
+        """A host function for the wasm: the Caller is `cur[-1]` while `fn(*args)` runs, popped on every way out (the
+        push and pop are inline: this is the path of every host call). An `Exception` goes to `handle(exc)`, whose
+        result is the answer (none: it goes on); `void`: the answer is None whatever `fn` returns."""
+
+        def f(caller, *args):
+            cur = self.cur
+            cur.append(caller)
+            try:
+                r = fn(*args)
+            except Exception as e:
+                if handle is None:
+                    raise
+                r = handle(e)
+            finally:
+                cur.pop()
+            return None if void else r
+
+        return f
 
     def _span(self, a: int, n: int) -> int:
         """The guest address a (wasmtime passes i32 as SIGNED: -1 is 0xFFFFFFFF) after checking that [a, a+n) lies in
@@ -103,16 +102,12 @@ class Guest:
         outside the memory is EFAULT, a host error is its errno, anything else is logged and EIO."""
         fault, other = self.NET_FAILS.get(name, (-GUEST_ERRNO["FAULT"], -GUEST_ERRNO["IO"]))
 
-        def f(caller, *args):
-            with self.entered(caller):
-                try:
-                    return fn(*args)
-                except GuestFault:
-                    return fault
-                except OSError as e:
-                    return other if name in self.NET_FAILS else werr(e)
-                except Exception:
-                    log.exception("[net] %s failed", name)
-                    return other
+        def handle(e: Exception) -> int:
+            if isinstance(e, GuestFault):
+                return fault
+            if isinstance(e, OSError):
+                return other if name in self.NET_FAILS else werr(e)
+            log.exception("[net] %s failed", name)
+            return other
 
-        return f
+        return self.wrap(fn, handle)

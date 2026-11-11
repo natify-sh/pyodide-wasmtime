@@ -9,7 +9,8 @@ import sys
 from typing import Any
 
 import pytest
-from conftest import Guest, check_file, missing, testenv
+from conftest import Guest as GuestProc
+from conftest import check_file, missing, testenv
 
 from pyodide_nojs import Pyodide
 
@@ -18,7 +19,7 @@ def lines(out: str) -> list[str]:
     return [x for x in out.splitlines() if x]
 
 
-def test_ctypes_calls_take_any_signature(guest: Guest) -> None:
+def test_ctypes_calls_take_any_signature(guest: GuestProc) -> None:
     """A call tolerates what JavaScript's `wasmTable.get(fn)(...args)` tolerates: a void function with the default
     restype, an extra or a missing argument, more than 8 arguments, doubles with 5 arguments, a long double, a struct
     as argument and as result, variadic calls (nfixedargs)."""
@@ -27,7 +28,7 @@ def test_ctypes_calls_take_any_signature(guest: Guest) -> None:
     assert lines(r.stdout) == lines(check_file("ffi_calls.expected"))
 
 
-def test_ctypes_callbacks_of_every_kind(guest: Guest) -> None:
+def test_ctypes_callbacks_of_every_kind(guest: GuestProc) -> None:
     """int, double, float, int64, pointers, no arguments, void, a struct by value as argument, qsort and bsearch calling
     a comparator, a callback that raises, a callback inside a callback."""
     r = guest.run(check_file("ffi_callbacks.py"))
@@ -35,7 +36,7 @@ def test_ctypes_callbacks_of_every_kind(guest: Guest) -> None:
     assert lines(r.stdout) == lines(check_file("ffi_callbacks.expected"))
 
 
-def test_freed_closures_give_their_table_slots_back(guest: Guest) -> None:
+def test_freed_closures_give_their_table_slots_back(guest: GuestProc) -> None:
     """JavaScript's getEmptyTableSlot() takes the slot freed last; the slots do not grow with each created callback."""
     code = """
 import ctypes as c, gc
@@ -62,7 +63,7 @@ print([addr(q) - A for q in h])
     assert lines(r.stdout) == ["1 2", "reuse a 0", "[2, 1, 3]", "[4, 5, 6]"]
 
 
-def test_the_trampoline_calls_a_type_it_does_not_know(guest: Guest) -> None:
+def test_the_trampoline_calls_a_type_it_does_not_know(guest: GuestProc) -> None:
     """_PyEM_TrampolineCall_JS(f, a, b, c) on a table entry of another type than its ten (a double, a void function, 2
     parameters of f64 and i32): the call is made with the entry's own type, as JavaScript does, not `unreachable`."""
     code = """
@@ -80,7 +81,7 @@ print(*[tr(idx(f), a, b, 0) for f, a, b in calls])
     assert lines(r.stdout) == ["4 5 0 12"]
 
 
-def test_cffi_callbacks(guest: Guest) -> None:
+def test_cffi_callbacks(guest: GuestProc) -> None:
     """cffi's own wheel, loaded by dlopen: callback() makes a closure (it was SystemError 'bad user_data')."""
     site = testenv() / "site_cffi"
     if not (site / "cffi").is_dir() or not (site / "pycparser").is_dir():

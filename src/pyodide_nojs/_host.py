@@ -14,6 +14,7 @@ Two builds of the same sources, one `Pyodide` class:
 from __future__ import annotations
 
 import ctypes
+import functools
 import hashlib
 import json
 import logging
@@ -666,9 +667,7 @@ class Pyodide:
         else:
             state = []
 
-            def trampoline(caller: Any, *a: Any) -> Any:
-                with self.guest.entered(caller):
-                    return self._ffi_closure(state, a)
+            trampoline = self.guest.wrap(functools.partial(self._ffi_closure, state))
 
             try:
                 func = wt.Func(self.guest.store, wt.FuncType(params, results), trampoline, access_caller=True)
@@ -689,7 +688,7 @@ class Pyodide:
             state.clear()
             self.func_pool[key].append((func, state))
 
-    def _ffi_closure(self, state: list, a: tuple) -> Any:
+    def _ffi_closure(self, state: list, *a: Any) -> Any:
         rk = state[5]  # the closure's own entry may be released while it runs (`state` is then cleared)
         ctx = self.guest.cur[-1]
         sp = self.guest.ex["__stack_pointer"]
@@ -806,18 +805,14 @@ class Pyodide:
         outside the memory or an unforeseen host error is logged and answered with `fail` (0; -1 for instantiate).
         `fail=None`: the exception goes on."""
 
-        def f(caller, *args):
-            with self.guest.entered(caller):
-                try:
-                    r = fn(*args)
-                except Exception:
-                    if fail is None:
-                        raise
-                    log.exception("[loader] %s failed", fn.__name__)
-                    r = fail
-            return r if nres else None
+        if fail is None:
+            return self.guest.wrap(fn, None, not nres)
 
-        return f
+        def handle(_e: Exception) -> int:
+            log.exception("[loader] %s failed", fn.__name__)
+            return fail
+
+        return self.guest.wrap(fn, handle, not nres)
 
     def _ops(self) -> tuple[dict, dict, dict]:
         wt = self._wt

@@ -43,7 +43,6 @@ log = logging.getLogger("pyodide_nojs")
 class Net:
     def __init__(self, guest: Guest) -> None:
         self.guest = guest
-        self._rd, self._wr = guest.rd, guest.wr
         self._socks: dict = {}  # handle -> the host's socket
         self._netlog: list[str] = []  # what the verbose log says of the host's network, until flush_log
         self._shut_both: weakref.WeakSet[socket.socket] = weakref.WeakSet()  # shutdown(RDWR) was called: poll's HUP
@@ -98,8 +97,8 @@ class Net:
         malloc: JSON meta (status, reason, headers, url) and the body."""
         c = self.guest.cur[-1]
         try:
-            req = json.loads(self._rd(req_p, req_n))
-            body = self._rd(body_p, body_n) if body_n else None
+            req = json.loads(self.guest.rd(req_p, req_n))
+            body = self.guest.rd(body_p, body_n) if body_n else None
             r = urllib.request.Request(
                 req["url"], data=body, headers=req.get("headers") or {}, method=req.get("method") or "GET"
             )
@@ -122,9 +121,9 @@ class Net:
         blocks: list[int] = []
         for b in (json.dumps(meta).encode(), data):
             p = self.guest.ex["malloc"](c, max(1, len(b)))
-            self._wr(p, b)
+            self.guest.wr(p, b)
             blocks += [p, len(b)]
-        self._wr(out_p, struct.pack("<IIII", *blocks))
+        self.guest.wr(out_p, struct.pack("<IIII", *blocks))
         return 0
 
     def _new_handle(self, s: socket.socket) -> int:
@@ -151,7 +150,7 @@ class Net:
     def _n_bind(self, h: int, sa: int, n: int) -> int:
         s = self._socks[h]
         try:
-            s.bind(sockaddr(self._rd, s, sa, n))
+            s.bind(sockaddr(self.guest.rd, s, sa, n))
         except OSError as e:
             return werr(e)
         return 0
@@ -171,7 +170,7 @@ class Net:
             conn.setblocking(True)
         except OSError as e:
             return werr(e)
-        sockaddr_out(self._rd, self._wr, sa, lenp, addr)
+        sockaddr_out(self.guest.rd, self.guest.wr, sa, lenp, addr)
         return self._new_handle(conn)
 
     def _n_connect(self, h: int, sa: int, n: int, nb: int) -> int:
@@ -179,7 +178,7 @@ class Net:
         for POLLOUT, then SO_ERROR), as in the kernel. The host socket itself stays blocking."""
         s = self._socks[h]
         try:
-            addr = sockaddr(self._rd, s, sa, n)
+            addr = sockaddr(self.guest.rd, s, sa, n)
             if nb:
                 s.setblocking(False)
                 try:
@@ -202,10 +201,10 @@ class Net:
         s = self._socks[h]
         try:
             hf = msg_flags(flags)
-            data = self._rd(p, n)
+            data = self.guest.rd(p, n)
             with nonblocking(s, flags & 0x40):  # a partial count, or EAGAIN when nothing fits
                 if sa:
-                    return s.sendto(data, hf, sockaddr(self._rd, s, sa, salen))
+                    return s.sendto(data, hf, sockaddr(self.guest.rd, s, sa, salen))
                 return send(s, data, hf)
         except OSError as e:
             return werr(e)
@@ -215,40 +214,40 @@ class Net:
             data, addr, ret, _ = recv(self._socks[h], n, flags)
         except OSError as e:
             return werr(e)
-        self._wr(p, data)
-        sockaddr_out(self._rd, self._wr, sa, lenp, addr)
+        self.guest.wr(p, data)
+        sockaddr_out(self.guest.rd, self.guest.wr, sa, lenp, addr)
         return ret
 
     def _n_sendmsg(self, h: int, msg: int, flags: int) -> int:
         s = self._socks[h]
         try:
-            name, namelen, iovs, ctllen = msghdr(self._rd, msg)
+            name, namelen, iovs, ctllen = msghdr(self.guest.rd, msg)
             if ctllen:  # SCM_RIGHTS, SCM_CREDENTIALS...: nothing can carry them to the host
                 return -EOPNOTSUPP
             hf = msg_flags(flags)
-            data = b"".join(self._rd(b, n) for b, n in iovs)
+            data = b"".join(self.guest.rd(b, n) for b, n in iovs)
             with nonblocking(s, flags & 0x40):
                 if name:
-                    return s.sendto(data, hf, sockaddr(self._rd, s, name, namelen))
+                    return s.sendto(data, hf, sockaddr(self.guest.rd, s, name, namelen))
                 return send(s, data, hf)
         except OSError as e:
             return werr(e)
 
     def _n_recvmsg(self, h: int, msg: int, flags: int) -> int:
-        name, _namelen, iovs, _ctllen = msghdr(self._rd, msg)
+        name, _namelen, iovs, _ctllen = msghdr(self.guest.rd, msg)
         try:
             data, addr, ret, mflags = recv(self._socks[h], sum(n for _, n in iovs), flags)
         except OSError as e:
             return werr(e)
         pos = 0
         for b, n in iovs:  # every buffer, in order
-            self._wr(b, data[pos : pos + n])
+            self.guest.wr(b, data[pos : pos + n])
             pos += n
         if name:
-            sockaddr_out(self._rd, self._wr, name, msg + 4, addr)
+            sockaddr_out(self.guest.rd, self.guest.wr, name, msg + 4, addr)
         else:
-            self._wr(msg + 4, bytes(4))
-        self._wr(msg + 20, struct.pack("<II", 0, mflags))  # msg_controllen: no ancillary data; msg_flags
+            self.guest.wr(msg + 4, bytes(4))
+        self.guest.wr(msg + 20, struct.pack("<II", 0, mflags))  # msg_controllen: no ancillary data; msg_flags
         return ret
 
     def _poll(self, socks: list, events: list[int], timeout_ms: int) -> list[int]:
@@ -309,10 +308,10 @@ class Net:
             if timeout_ms > 0:
                 time.sleep(timeout_ms / 1000)
             return 0
-        handles = struct.unpack(f"<{n}i", self._rd(hp, 4 * n))
-        events = list(struct.unpack(f"<{n}i", self._rd(evp, 4 * n)))
+        handles = struct.unpack(f"<{n}i", self.guest.rd(hp, 4 * n))
+        events = list(struct.unpack(f"<{n}i", self.guest.rd(evp, 4 * n)))
         revents = self._poll([self._socks.get(h) for h in handles], events, timeout_ms)
-        self._wr(revp, struct.pack(f"<{n}i", *revents))
+        self.guest.wr(revp, struct.pack(f"<{n}i", *revents))
         return sum(1 for x in revents if x)
 
     def _n_close(self, h: int) -> int:
@@ -339,7 +338,7 @@ class Net:
             addr = s.getpeername() if peer else s.getsockname()
         except OSError as e:
             return werr(e)
-        sockaddr_out(self._rd, self._wr, sa, lenp, addr)
+        sockaddr_out(self.guest.rd, self.guest.wr, sa, lenp, addr)
         return 0
 
     def _n_setopt(self, h: int, level: int, opt: int, valp: int, ln: int) -> int:
@@ -350,7 +349,7 @@ class Net:
             return -GUEST_ERRNO["NOPROTOOPT"]
         if not 0 <= ln <= 1024:
             return -GUEST_ERRNO["INVAL"]
-        raw = self._rd(valp, ln)
+        raw = self.guest.rd(valp, ln)
         if (level, opt) == (1, 2) and os.name != "posix":
             return 0  # SO_REUSEADDR means "steal the port" on Windows: not what a POSIX program asks
         try:
@@ -362,7 +361,7 @@ class Net:
     def _n_getopt(self, h: int, level: int, opt: int, valp: int, lenp: int) -> int:
         """getsockopt: the option is found by name in the host's socket module; an unknown one is ENOPROTOOPT."""
         s = self._socks[h]
-        cap = int.from_bytes(self._rd(lenp, 4), "little")
+        cap = int.from_bytes(self.guest.rd(lenp, 4), "little")
         if level == 1 and opt in (3, 30, 38, 39):  # SO_TYPE, SO_ACCEPTCONN, SO_PROTOCOL, SO_DOMAIN: musl's numbers
             stream = s.type == socket.SOCK_STREAM
             val = {
@@ -393,8 +392,8 @@ class Net:
                 err := int.from_bytes(raw[:4], "little")
             ):  # SO_ERROR: an errno, in the guest's numbers
                 raw = (-werr(OSError(err, ""))).to_bytes(4, "little")
-        self._wr(valp, raw[:cap])
-        self._wr(lenp, min(len(raw), cap).to_bytes(4, "little"))
+        self.guest.wr(valp, raw[:cap])
+        self.guest.wr(lenp, min(len(raw), cap).to_bytes(4, "little"))
         return 0
 
     def _n_ioctl(self, h: int, op: int, argp: int) -> int:
@@ -417,17 +416,17 @@ class Net:
                 s.setblocking(True)
         except OSError as e:
             return werr(e)
-        self._wr(argp, n.to_bytes(4, "little"))
+        self.guest.wr(argp, n.to_bytes(4, "little"))
         return 0
 
     def _n_resolve(self, np_: int, n: int, ap: int) -> int:
-        name = self._rd(np_, n).decode()
+        name = self.guest.rd(np_, n).decode()
         try:
             ip = socket.gethostbyname(name)
         except OSError:
             return -GUEST_ERRNO["NOENT"]
         self._netlog.append(f"resolve {name} -> {ip}")
-        self._wr(ap, socket.inet_aton(ip))
+        self.guest.wr(ap, socket.inet_aton(ip))
         return 0
 
     def _n_getaddrinfo(self, node_p: int, service_p: int, hint_p: int, out_p: int) -> int:
@@ -437,7 +436,7 @@ class Net:
         node, service = self.guest.cstr(node_p), self.guest.cstr(service_p)
         flags = family = type_ = proto = 0
         if hint_p:
-            flags, family, type_, proto = struct.unpack("<4i", self._rd(hint_p, 16))
+            flags, family, type_, proto = struct.unpack("<4i", self.guest.rd(hint_p, 16))
         found = resolve_addrinfo(node, service, flags, family, type_, proto)
         if isinstance(found, int):
             return found
@@ -451,20 +450,20 @@ class Net:
                     self.guest.ex["free"](c, q)
             return -10  # EAI_MEMORY
         at = block + 32 * len(entries)
-        self._wr(at, canon)
+        self.guest.wr(at, canon)
         canon_p, at = (at if canon else 0), at + len(canon)
         for k, (fam, _c, sa) in enumerate(entries):
             sa_p = head_sa if k == 0 else at
             at += 0 if k == 0 else len(sa)
-            self._wr(sa_p, sa)
+            self.guest.wr(sa_p, sa)
             nxt = block + 32 * (k + 1) if k + 1 < len(entries) else 0
             ai = struct.pack("<8I", 0, fam, type_, proto, len(sa), sa_p, canon_p if k == 0 else 0, nxt)
-            self._wr(block + 32 * k, ai)
-        self._wr(out_p, block.to_bytes(4, "little"))
+            self.guest.wr(block + 32 * k, ai)
+        self.guest.wr(out_p, block.to_bytes(4, "little"))
         return 0
 
     def _n_getnameinfo(self, sa: int, salen: int, node: int, nodelen: int, serv: int, servlen: int, flags: int) -> int:
-        raw = self._rd(sa, min(salen, 28)) if sa and salen >= 2 else b""
+        raw = self.guest.rd(sa, min(salen, 28)) if sa and salen >= 2 else b""
         found = nameinfo(raw, flags)
         if isinstance(found, int):
             return found
@@ -474,5 +473,5 @@ class Net:
                 b = text.encode()
                 if len(b) >= cap:
                     return -12  # EAI_OVERFLOW
-                self._wr(ptr, b + b"\0")
+                self.guest.wr(ptr, b + b"\0")
         return 0
