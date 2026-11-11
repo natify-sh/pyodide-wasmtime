@@ -11,7 +11,7 @@ Order inside a section is not a priority; the order of work is at the end.
 | D1 | `emscripten_dlopen` callback: now a pending call of the interpreter (before the next statement); option C = at sleep/poll/end of `run()` | B kept, documented in BRIEF.md |
 | D2 | Pyodide's own pipe quirks we copy: unbounded buffer, no EPIPE for a write with no reader | copied; may change |
 | D3 | Which Pyodide bugs to mirror (trailing slash on a file works there, `umask` ignored, `chown` a no-op, `st_nlink` of an unlinked file, ms-rounded `utimensat`, `O_CREAT|O_EXCL` on a dangling symlink, libc `linkat` gives EMLINK) | after the files audit: recommendation is NOT to copy |
-| D4 | The guest's root: files on the host's disk (now, so host-OS differences show) or an in-memory root with `mounts` for host folders (Pyodide's way, uniform on every OS) or more emulation in the adapter | open; decide with the numbers of the differential audit |
+| D4 | The guest's root: files on the host's disk (now) or an in-memory root ported from Pyodide's MEMFS (+ a host API to move files in and out, mounts as real host folders, maybe a lazy overlay) | PARKED (owner, 2026-11-11: no win seen for now): the root stays on the host's disk. Revisit if there is a real need: many Windows users, identical results without mounts, isolation from the disk. A scope study (docs/MEMFS_SCOPE.md when it arrives) records the cost: do not start the port without a new reason |
 | D5 | Guest fd numbers decoupled from WASI's (fd 3 is the root preopen now: first new fd is 4; WASI gives the last freed number, not the lowest) | proposed (see W5), not decided |
 | D6 | `wasm-opt.wasm` (12.5 MB, 12-minute build): keep the CI cache, or publish it as a release asset fetched by sha256 (not committed) | asked, not answered |
 | D7 | Ctrl-C in the CLI mapped to `Pyodide.interrupt()` | asked, not answered |
@@ -99,7 +99,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 1. Wait for the two audits (runtime, loader/io); triage their tables here (new rows, known, host-dependent).
 2. W1 crashes and hangs and R1/R2 (crash and exit status); W2 `/dev`; R3 process time; W4 multiple buffers; the small suite items.
-3. D4/D5 (root in memory? decoupled fd numbers) decided with the audit's numbers, then W3/W5.
+3. W2, W3, W4, W5 on the host root now (D4 is parked: nothing waits for it); D5 (decoupled fd numbers) with W5.
 4. A `reviewer` on the descriptor layer and the override feature (section 6).
 5. T1 terminal, then S1 (xfail for what is left).
 6. Section 9 last.
