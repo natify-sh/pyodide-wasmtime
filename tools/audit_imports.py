@@ -31,7 +31,7 @@ KINDS = [  # (kind, tokens of the JavaScript source that make it that kind), fir
 
 def wasm_imports(wasm: Path) -> list[tuple[str, list[str], list[str]]]:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-    from pyodide_wasmtime import _engine, _wasm
+    from pyodide_nojs import _engine, _wasm
 
     module = _engine.load_module(wasm)
     return [(n, ps, rs) for mod, n, ps, rs in _wasm.func_imports(module) if mod == "env"]
@@ -111,7 +111,7 @@ if __name__ == "__main__" and "--markdown" not in sys.argv:
     wasm = (
         Path(args[1])
         if len(args) > 1
-        else Path(__file__).resolve().parent.parent / "src/pyodide_wasmtime/data/pyodide.asm.wasm"
+        else Path(__file__).resolve().parent.parent / "src/pyodide_nojs/data/pyodide.asm.wasm"
     )
     rows = audit(package, wasm)
     if "--json" in sys.argv:

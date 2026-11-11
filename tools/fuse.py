@@ -23,8 +23,8 @@ import tempfile
 
 from wasmtime import FuncType, Module, wat2wasm
 
-from pyodide_wasmtime import _engine  # noqa: E402
-from pyodide_wasmtime import _wasm as R  # noqa: E402, N812  (the WAT generators and the import list)
+from pyodide_nojs import _engine  # noqa: E402
+from pyodide_nojs import _wasm as R  # noqa: E402, N812  (the WAT generators and the import list)
 
 VT = {0x7F: "i32", 0x7E: "i64", 0x7D: "f32", 0x7C: "f64", 0x7B: "v128", 0x70: "funcref", 0x6F: "externref"}
 

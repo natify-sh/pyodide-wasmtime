@@ -577,7 +577,7 @@ def test_the_preopen_of_a_path_picks_the_host_folder(flavor: str, tmp_path, monk
 
     import pytest
 
-    from pyodide_wasmtime import Pyodide
+    from pyodide_nojs import Pyodide
 
     if not hasattr(os, "statvfs"):
         pytest.skip("no os.statvfs (Windows): the numbers come from shutil.disk_usage")
@@ -619,7 +619,7 @@ def test_the_host_operation_has_no_trap_without_statvfs_or_on_any_error(flavor: 
     import os
     import shutil
 
-    from pyodide_wasmtime import Pyodide
+    from pyodide_nojs import Pyodide
 
     usage = collections.namedtuple("usage", "total used free")
     with Pyodide(flavor) as py:

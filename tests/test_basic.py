@@ -6,7 +6,7 @@ import sys
 
 from conftest import Guest
 
-import pyodide_wasmtime as pw
+import pyodide_nojs as pw
 
 
 def test_versions():

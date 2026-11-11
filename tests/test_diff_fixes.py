@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from conftest import Guest
 
-from pyodide_wasmtime import Pyodide
-from pyodide_wasmtime._host import BASE_ENV
+from pyodide_nojs import Pyodide
+from pyodide_nojs._host import BASE_ENV
 
 # ----------------------------------------------------------------------------------------------------- runtime
 
@@ -139,7 +139,7 @@ def test_mount_cwd(guest: Guest, tmp_path: Path) -> None:
     (tmp_path / "hello.txt").write_text("hi")
     import subprocess
 
-    cmd = [sys.executable, "-m", "pyodide_wasmtime", "--flavor", guest.flavor, "--mount-cwd", "-c"]
+    cmd = [sys.executable, "-m", "pyodide_nojs", "--flavor", guest.flavor, "--mount-cwd", "-c"]
     r = subprocess.run(
         [*cmd, "import os; print(os.getcwd(), open('hello.txt').read()); open('new.txt', 'w').write('x')"],
         capture_output=True,

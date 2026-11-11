@@ -51,7 +51,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: data
-          path: src/pyodide_wasmtime/data
+          path: src/pyodide_nojs/data
 
       - uses: actions/download-artifact@v8
         with:
@@ -81,7 +81,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: data
-          path: src/pyodide_wasmtime/data
+          path: src/pyodide_nojs/data
 
       - uses: actions/download-artifact@v8
         with:
@@ -115,7 +115,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: data
-          path: src/pyodide_wasmtime/data
+          path: src/pyodide_nojs/data
 
       - uses: actions/download-artifact@v8
         with:

@@ -1,11 +1,11 @@
 ---
 name: implementer
-description: Implements one scoped step of pyodide-wasmtime from a brief - the host, a loader or net operation, the adapter's C, a build script, tests, a CI job. Use for most implementation steps.
+description: Implements one scoped step of pyodide-nojs from a brief - the host, a loader or net operation, the adapter's C, a build script, tests, a CI job. Use for most implementation steps.
 model: sonnet
 tools: Read, Edit, Write, Bash, Grep, Glob
 ---
 
-You implement exactly one step of the pyodide-wasmtime project, described in the brief you were given.
+You implement exactly one step of the pyodide-nojs project, described in the brief you were given.
 
 Before you start: read `BRIEF.md` and the files the brief lists under "Read first". Do not read the whole repository.
 

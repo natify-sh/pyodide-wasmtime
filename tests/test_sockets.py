@@ -430,7 +430,7 @@ def test_ipv6_structures_are_written_and_read_right(guest: Guest, port: int):
 
 
 def test_sockaddr_translation_round_trips():
-    from pyodide_wasmtime._host import Pyodide
+    from pyodide_nojs._host import Pyodide
 
     v6 = ("fe80::1", 8080, 7, 3)
     raw = Pyodide._sockaddr_bytes(v6)
@@ -548,7 +548,7 @@ def test_a_wild_string_pointer_is_a_name_error(guest: Guest, port: int):
 
 
 def test_a_second_run_on_one_object_sees_a_fresh_guest(flavor: str, capfd: pytest.CaptureFixture[str]):
-    from pyodide_wasmtime import Pyodide
+    from pyodide_nojs import Pyodide
 
     code = "import socket; print(socket.getprotobyname('udp'), socket.getprotobyname('tcp'))"
     with Pyodide(flavor) as py:
@@ -559,7 +559,7 @@ def test_a_second_run_on_one_object_sees_a_fresh_guest(flavor: str, capfd: pytes
 
 
 def test_the_accessors_check_the_memory():
-    from pyodide_wasmtime._host import GuestFault, Pyodide
+    from pyodide_nojs._host import GuestFault, Pyodide
 
     class Memory:
         def __init__(self) -> None:
@@ -592,7 +592,7 @@ def test_the_accessors_check_the_memory():
 
 
 def test_the_net_wrapper_turns_every_exception_into_an_errno():
-    from pyodide_wasmtime._host import GuestFault, Pyodide
+    from pyodide_nojs._host import GuestFault, Pyodide
 
     py = Pyodide.__new__(Pyodide)
     py.cur = []
@@ -615,7 +615,7 @@ def test_the_net_wrapper_turns_every_exception_into_an_errno():
 
 
 def test_host_errors_are_translated_by_name_on_every_os():
-    from pyodide_wasmtime._host import guest_errno
+    from pyodide_nojs._host import guest_errno
 
     expect = {10035: "EAGAIN", 10036: "EINPROGRESS", 10061: "ECONNREFUSED", 10054: "ECONNRESET", 10053: "ECONNABORTED",
               10060: "ETIMEDOUT", 10048: "EADDRINUSE", 10049: "EADDRNOTAVAIL", 10051: "ENETUNREACH",

@@ -1,6 +1,6 @@
 #!/bin/sh
 # The run time's wasm-opt: Binaryen version_132 as a wasm32-wasip1 module, with wasi-sdk 34:
-#   sh tools/build_binaryen.sh WORKDIR   -> src/pyodide_wasmtime/data/wasm-opt.wasm (or $OUT)
+#   sh tools/build_binaryen.sh WORKDIR   -> src/pyodide_nojs/data/wasm-opt.wasm (or $OUT)
 # ~12 min on 2 cores; wasi-sdk 34 (tools/fetch.sh) is the one toolchain. The loader runs it in-process under
 # wasmtime-py (_tools.py) to convert a wheel's legacy exceptions at dlopen; the build itself uses npm's Binaryen.
 #   - C++ exceptions: Binaryen uses them (Precompute, the parsers), so -fwasm-exceptions in the exnref form
@@ -9,11 +9,11 @@
 #   - BUILD_LLVM_DWARF stays ON: with it OFF, version_132's Outlining pass still includes llvm/Support headers
 #   - then DWARF and names are stripped (25.3 MB -> 12.5 MB; the code is unchanged)
 set -e
-# OUT: where wasm-opt.wasm goes (default: next to this script's parent, src/pyodide_wasmtime/data)
+# OUT: where wasm-opt.wasm goes (default: next to this script's parent, src/pyodide_nojs/data)
 sh "$(dirname "$0")/fetch.sh" "$1" >/dev/null
 H=$(cd "$(dirname "$0")/.." && pwd)
 W=$(cd "$1" && pwd)
-OUT=${OUT:-$H/src/pyodide_wasmtime/data/wasm-opt.wasm}
+OUT=${OUT:-$H/src/pyodide_nojs/data/wasm-opt.wasm}
 mkdir -p "$W/ref" && cd "$W/ref"
 SDK=wasi-sdk-34.0-x86_64-linux
 [ -d binaryen ] || git clone -q --depth 1 --branch version_132 https://github.com/WebAssembly/binaryen 2>/dev/null

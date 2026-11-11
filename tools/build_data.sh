@@ -1,5 +1,5 @@
 #!/bin/sh
-# The wasm the package carries, into src/pyodide_wasmtime/data (or $DATA), from pinned sources:
+# The wasm the package carries, into src/pyodide_nojs/data (or $DATA), from pinned sources:
 #   sh tools/build_data.sh WORKDIR
 #   pyodide.asm.wasm      Pyodide 315.0.0-alpha.2's, with libc's setsockopt stub made an import (tools/patch_main.mjs), legacy exceptions -> exnref (Binaryen 132 from npm: a BUILD tool)
 #   python_stdlib.zip     the same release's
@@ -13,7 +13,7 @@ set -e
 H=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "${1:-pyo-build}"
 W=$(cd "${1:-pyo-build}" && pwd)
-DATA=${DATA:-$H/src/pyodide_wasmtime/data}
+DATA=${DATA:-$H/src/pyodide_nojs/data}
 mkdir -p "$DATA"
 sh "$H/tools/fetch.sh" "$W" >/dev/null
 # wasm-opt.wasm (the slow, mostly serial-link build) needs only the fetched sources: it runs beside the steps below

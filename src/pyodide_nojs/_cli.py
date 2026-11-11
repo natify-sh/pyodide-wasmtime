@@ -1,4 +1,4 @@
-"""pyodide-wasmtime [-c CODE | FILE] [ARGS...]: run Python in Pyodide on wasmtime; with no code, a REPL on a terminal or
+"""pyodide-nojs [-c CODE | FILE] [ARGS...]: run Python in Pyodide on wasmtime; with no code, a REPL on a terminal or
 the script on stdin."""
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def repl(py: Pyodide) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="pyodide-wasmtime", description=__doc__)
+    ap = argparse.ArgumentParser(prog="pyodide-nojs", description=__doc__)
     ap.add_argument("-c", dest="code", help="program text")
     ap.add_argument("file", nargs="?", help="a script (a host file)")
     ap.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the program (sys.argv[1:])")
@@ -131,16 +131,16 @@ def main(argv: list[str] | None = None) -> int:
         help="pass ALL the host's environment variables, secrets included, to the guest (it can print or send them); "
         "by default it has Pyodide's minimal environment",
     )
-    ap.add_argument("--data", metavar="DIR", help="the wasm files (default: the package's, or $PYODIDE_WASMTIME_DATA)")
+    ap.add_argument("--data", metavar="DIR", help="the wasm files (default: the package's, or $PYODIDE_NOJS_DATA)")
     ap.add_argument(
         "--asm-wasm",
         metavar="FILE",
-        help="a pyodide.asm.wasm instead of the package's (implies --flavor dynamic; or $PYODIDE_WASMTIME_ASM_WASM)",
+        help="a pyodide.asm.wasm instead of the package's (implies --flavor dynamic; or $PYODIDE_NOJS_ASM_WASM)",
     )
     ap.add_argument(
         "--stdlib",
         metavar="FILE",
-        help="a python_stdlib.zip instead of the package's (implies --flavor dynamic; or $PYODIDE_WASMTIME_STDLIB)",
+        help="a python_stdlib.zip instead of the package's (implies --flavor dynamic; or $PYODIDE_NOJS_STDLIB)",
     )
     ap.add_argument("--dev", action="store_true", help="give the guest the host's /dev (OpenSSL reads /dev/urandom)")
     ap.add_argument(
@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--version", action="store_true", help="print the versions and exit")
     ns = ap.parse_args(argv)
     if ns.version:
-        print(f"pyodide-wasmtime {__version__} (Pyodide {PYODIDE_VERSION}, {PYODIDE_ABI})")
+        print(f"pyodide-nojs {__version__} (Pyodide {PYODIDE_VERSION}, {PYODIDE_ABI})")
         return 0
     if ns.verbose:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)

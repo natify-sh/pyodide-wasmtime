@@ -24,7 +24,7 @@ import pytest
 from boot_modules import BOOT_MODULES
 from conftest import missing, testenv
 
-from pyodide_wasmtime import FLAVORS
+from pyodide_nojs import FLAVORS
 
 pytestmark = pytest.mark.suite
 
@@ -120,7 +120,7 @@ def test_cpython_core(suite_flavor: str, module: tuple[str, dict[str, Any]]):
     cmd = [
         sys.executable,
         "-m",
-        "pyodide_wasmtime",
+        "pyodide_nojs",
         "--flavor",
         suite_flavor,
         "--site",

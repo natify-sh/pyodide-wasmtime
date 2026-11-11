@@ -73,13 +73,13 @@ for p in ["/nonexistent.so", "nonexistent.so", "/t/empty.so", "/t/junk.so", "/t/
 def test_a_failed_load_prints_nothing_on_stderr(flavor: str):
     from conftest import missing
 
-    from pyodide_wasmtime import available_flavors, data_dir
+    from pyodide_nojs import available_flavors, data_dir
 
     if flavor not in available_flavors(data_dir()):
         missing(f"the {flavor} build is not in {data_dir()}")
     code = "import ctypes\ntry:\n    ctypes.CDLL('/nonexistent.so')\nexcept OSError as e:\n    print('failed')\n"
     p = subprocess.run(
-        [sys.executable, "-m", "pyodide_wasmtime", "--flavor", flavor, "-c", code], capture_output=True, text=True
+        [sys.executable, "-m", "pyodide_nojs", "--flavor", flavor, "-c", code], capture_output=True, text=True
     )
     assert p.returncode == 0 and p.stdout.strip() == "failed", p.stderr
     assert "instantiate failed" not in p.stderr and "[loader]" not in p.stderr
@@ -417,7 +417,7 @@ print("cycle", x.x(), ctypes.CDLL("/y/y.so").y())
     # "RangeError: Maximum call stack size exceeded" from 2200); here 1500 below the first one is the cap
     # (_engine.depth_cap of the wasm stack in force: 1 MiB, or 800 with the default one): deliberate difference,
     # the text is V8's
-    from pyodide_wasmtime import _engine
+    from pyodide_nojs import _engine
 
     cap = _engine.depth_cap(
         _engine._wasm_stack()
@@ -441,7 +441,7 @@ for d in ("/d", "/e"):
 
 
 def test_the_wasm_stack_and_the_depth_cap_follow_the_native_stack():
-    from pyodide_wasmtime import _engine
+    from pyodide_nojs import _engine
 
     big, small = _engine.BIG_WASM_STACK, _engine.DEFAULT_WASM_STACK
     ws = _engine.wasm_stack

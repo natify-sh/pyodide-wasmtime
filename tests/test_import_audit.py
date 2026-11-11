@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from wasmtime import FuncType
 
-from pyodide_wasmtime import _engine, _wasm, data_dir
+from pyodide_nojs import _engine, _wasm, data_dir
 
 AUDIT = Path(__file__).resolve().parent.parent / "docs" / "import_audit.json"
 VERDICTS = {"full", "partial", "enosys", "stub", "n/a"}

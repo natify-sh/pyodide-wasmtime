@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from wasmtime import FuncType, Module
 
-from pyodide_wasmtime import _engine, _wasm, available_flavors, data_dir
+from pyodide_nojs import _engine, _wasm, available_flavors, data_dir
 
 ALLOWED_ENV = {
     "memory",

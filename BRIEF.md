@@ -4,9 +4,9 @@ The briefing for anyone (person or agent) who starts work on this repository. Ev
 
 ## What this project is, in one paragraph
 
-**pyodide-wasmtime runs Pyodide's CPython, and its wheels, on wasmtime with no JavaScript.** Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**
+**pyodide-nojs runs Pyodide's CPython, and its wheels, on Wasmtime (through wasmtime-py) with no JavaScript.** Pyodide's `pyodide.asm.wasm` imports 263 functions from `env`: Emscripten's JavaScript glue. Here the glue is **wasm**
 (`wasm/adapter.c`, built with wasi-sdk 34's clang, after the shape of Wasmtime's preview1 adapter: no data section, no stack of its own): system calls over WASI, the dynamic loader (`dlopen` of a wheel), libffi calls, sockets,
-time, the trampoline. The Python host (`src/pyodide_wasmtime/_host.py`, class `Pyodide`) gives what a wasm module cannot do: wasmtime's WASI, the loader operations, libffi's calls and callbacks, the host's time zone, the host's sockets and `statvfs`. Pyodide is **not rebuilt**: its wasm is the npm
+time, the trampoline. The Python host (`src/pyodide_nojs/_host.py`, class `Pyodide`) gives what a wasm module cannot do: wasmtime's WASI, the loader operations, libffi's calls and callbacks, the host's time zone, the host's sockets and `statvfs`. Pyodide is **not rebuilt**: its wasm is the npm
 package's, with the legacy wasm exceptions converted once to `exnref`. The package is an **alpha** and meant to be a ready solution for anything Pyodide runs without the browser's JavaScript, not for numpy only.
 
 ## What it is NOT
@@ -27,7 +27,7 @@ data/ (in the wheel):  pyodide.asm.wasm (exnref) + adapter.wasm  -> "dynamic": l
                        pyodide_fused.wasm (tools/fuse.py, wasm-merge) -> "fused": one core module, only instantiated
                        python_stdlib.zip, wasm-opt.wasm (Binaryen 132 as wasm32-wasip1: converts a wheel's legacy exceptions at dlopen, in-process)
 _host.py (Pyodide)  WASI = wasmtime's own; loader ops (instantiate/scope/sym/got_set/call/error); net ops (sockets); fs op (statvfs); the host's fetch; run() = PyRun_SimpleString
-_engine.py          the engine, the machine-code cache (~/.cache/pyodide-wasmtime), wasm-opt.wasm run in-process
+_engine.py          the engine, the machine-code cache (~/.cache/pyodide-nojs), wasm-opt.wasm run in-process
 tests/              offline + network + Pyodide's official CPython suite, each on BOTH builds;  CI: build.yml -> tests.yml / publish.yml
 ```
 
@@ -72,7 +72,7 @@ tests/              offline + network + Pyodide's official CPython suite, each o
 | how the adapter works, what it answers, what was found | `docs/EXPERIMENT.md` |
 | WASI 0.2 over fusedwasi, the official test suite plan | `docs/NOTES-FUSEDWASI-AND-TESTSUITE.md` |
 | the adapter | `wasm/adapter.c` (includes the sections in `wasm/adapter/*.h`) |
-| the host | `src/pyodide_wasmtime/_host.py`, `_engine.py`, `_wasm.py`, `guest/hostnet.py` |
+| the host | `src/pyodide_nojs/_host.py`, `_engine.py`, `_wasm.py`, `guest/hostnet.py` |
 | the build | `tools/` (`fetch.sh`, `build_data.sh`, `build_adapter.sh`, `build_binaryen.sh`, `build_ssl.sh`, `prepare_testenv.sh`, `fuse.py`), `package.json` (the pinned versions) |
 | licenses of the bundled binaries | `licenses/NOTICE` |
 

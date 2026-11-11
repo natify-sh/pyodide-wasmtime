@@ -41,7 +41,7 @@ from typing import Any
 
 from . import _engine, _wasm
 
-log = logging.getLogger("pyodide_wasmtime")
+log = logging.getLogger("pyodide_nojs")
 
 PYVER = "3.15"  # the Python of the pinned Pyodide (315.0.0-alpha.2 = 3.15.0rc1)
 PYVER_FULL = "3.15.0rc1"  # CPython's own version string, a NUL-delimited constant in the pinned pyodide.asm.wasm
@@ -359,8 +359,8 @@ def _js_make(year: int, mon: int, mday: int, h: int, mi: int, s: int) -> int | N
 
 
 def data_dir(path: str | os.PathLike[str] | None = None) -> Path:
-    """Where the wasm files are: PATH, else $PYODIDE_WASMTIME_DATA, else the package's own `data`."""
-    return Path(path or os.environ.get("PYODIDE_WASMTIME_DATA") or DATA)
+    """Where the wasm files are: PATH, else $PYODIDE_NOJS_DATA, else the package's own `data`."""
+    return Path(path or _engine.env("PYODIDE_NOJS_DATA") or DATA)
 
 
 def available_flavors(data: Path) -> list[str]:
@@ -374,7 +374,7 @@ def available_flavors(data: Path) -> list[str]:
 
 def _override(path: str | os.PathLike[str] | None, var: str) -> Path | None:
     """The file PATH, else $VAR (an asm_wasm or stdlib that replaces the data directory's): None if neither is set."""
-    p = path or os.environ.get(var)
+    p = path or _engine.env(var)
     if not p:
         return None
     if not Path(p).is_file():
@@ -494,7 +494,7 @@ class Pyodide:
 
     ``preload``: Python source run once at start (as ``run(preload)``). The memory after it is cached in a snapshot file
     in the cache dir, so a next start with the same preload and settings restores it instead of booting Python
-    (``$PYODIDE_WASMTIME_SNAPSHOT=0`` turns that off). The preload must only import and compute: it must not print (it
+    (``$PYODIDE_NOJS_SNAPSHOT=0`` turns that off). The preload must only import and compute: it must not print (it
     prints at snapshot time only); opening files or sockets, ``chdir``, writing files, ``dlopen``, ``ctypes`` symbol
     lookups or callbacks, and signals or timers make the snapshot be skipped (a normal start,
     the preload run once); with ``site=`` or ``mounts=`` or ``inherit_env`` there is no snapshot at all.
@@ -518,15 +518,15 @@ class Pyodide:
         wt = _engine.require_wasmtime()
         self._wt = wt
         self.data = data_dir(data)
-        self.asm_wasm = _override(asm_wasm, "PYODIDE_WASMTIME_ASM_WASM")
-        self.stdlib = _override(stdlib, "PYODIDE_WASMTIME_STDLIB")
+        self.asm_wasm = _override(asm_wasm, "PYODIDE_NOJS_ASM_WASM")
+        self.stdlib = _override(stdlib, "PYODIDE_NOJS_STDLIB")
         self._override_checked = False
         have = available_flavors(self.data)
         overridden = self.asm_wasm is not None or self.stdlib is not None
         if self.asm_wasm is not None and "dynamic" not in have and (self.data / "adapter.wasm").exists():
             have.append("dynamic")  # the adapter is the package's, the main module is the given one
         if flavor is None:
-            flavor = os.environ.get("PYODIDE_WASMTIME_FLAVOR") or (
+            flavor = _engine.env("PYODIDE_NOJS_FLAVOR") or (
                 "dynamic" if overridden or "dynamic" in have else (have[0] if have else "dynamic")
             )
         if flavor == "fused" and overridden:
@@ -595,7 +595,7 @@ class Pyodide:
 
     # ------------------------------------------------------------------ the guest's root
     def _setup_root(self) -> None:
-        self.root = root = Path(tempfile.mkdtemp(prefix="pyodide_wasmtime_"))
+        self.root = root = Path(tempfile.mkdtemp(prefix="pyodide_nojs_"))
         (root / "lib" / f"python{PYVER}" / "lib-dynload").mkdir(parents=True)  # CPython looks for it at start
         shutil.copy(
             self.stdlib or self.data / "python_stdlib.zip", root / "lib" / f"python{PYVER.replace('.', '')}.zip"
@@ -1962,7 +1962,7 @@ class Pyodide:
         """`sys._emscripten_info.runtime`: a string from the guest's malloc, as stringToNewUTF8 gives."""
         from . import __version__
 
-        b = f"pyodide-wasmtime {__version__}".encode() + b"\0"
+        b = f"pyodide-nojs {__version__}".encode() + b"\0"
         p = self.ex["malloc"](self.cur[-1], len(b))
         self._wr(p, b)
         return p
@@ -2254,9 +2254,9 @@ class Pyodide:
             self._override_checked = True
             warn, detail = override_warnings(self.asm_wasm, self.stdlib, self.data)
             for w in warn:
-                log.warning("pyodide-wasmtime: %s", w)
+                log.warning("pyodide-nojs: %s", w)
             for d in detail:
-                log.info("pyodide-wasmtime: %s", d)
+                log.info("pyodide-nojs: %s", d)
         self._setup_root()
         assert self.root is not None
         self.store = store = wt.Store(engine)
@@ -2339,7 +2339,7 @@ class Pyodide:
             done: list[Path] = []
             main_mod = _engine.load_module(main_path, wasm_opt=self.wasm_opt if self.asm_wasm else None, converted=done)
             if done:
-                log.warning("pyodide-wasmtime: %s: converted from legacy exceptions at start; cached", main_path)
+                log.warning("pyodide-nojs: %s: converted from legacy exceptions at start; cached", main_path)
             imports = _wasm.func_imports(main_mod)
             got = [i.name for i in main_mod.imports if i.module == "GOT.func"]
             shim_mod = wt.Module(engine, wt.wat2wasm(_wasm.shim_wat(imports, fwd, got)))
@@ -2475,7 +2475,7 @@ class Pyodide:
             and not self.site
             and not self.mounts
             and not self.inherit_env  # the snapshot is a file: the host's variables (secrets) must not get into it
-            and os.environ.get("PYODIDE_WASMTIME_SNAPSHOT") != "0"
+            and _engine.env("PYODIDE_NOJS_SNAPSHOT") != "0"
         ):
             path = self._snapshot_path()
             if self._restore(path, slots):
@@ -2612,7 +2612,7 @@ class Pyodide:
             self._exited = rc = e.status
         except self._wt.Trap as e:  # abort(), a failed assert, an unreachable: the guest is dead
             first = str(e).strip().splitlines()[0] if str(e).strip() else "trap"
-            print(f"pyodide-wasmtime: the guest trapped: {first}", file=sys.stderr)
+            print(f"pyodide-nojs: the guest trapped: {first}", file=sys.stderr)
             self._exited = 134  # 128 + SIGABRT, as a process that aborts
             rc = 134
         except (
@@ -2620,7 +2620,7 @@ class Pyodide:
         ) as e:  # a host function failed on purpose (JavaScript's TypeError, a pointer outside the memory)
             tb = traceback.extract_tb(e.__traceback__)[-1]  # where, for a host that can not be reached to debug
             print(
-                f"pyodide-wasmtime: a host function failed, the guest is dead: {type(e).__name__}: {e}"
+                f"pyodide-nojs: a host function failed, the guest is dead: {type(e).__name__}: {e}"
                 f" (at {Path(tb.filename).name}:{tb.lineno}, in {tb.name})",
                 file=sys.stderr,
             )

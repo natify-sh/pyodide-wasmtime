@@ -14,14 +14,14 @@ from typing import Any
 import pytest
 from conftest import Guest, missing
 
-from pyodide_wasmtime import Pyodide, available_flavors, data_dir
-from pyodide_wasmtime._cli import main
-from pyodide_wasmtime._host import override_warnings
+from pyodide_nojs import Pyodide, _engine, available_flavors, data_dir
+from pyodide_nojs._cli import main
+from pyodide_nojs._host import override_warnings
 
 
 @pytest.fixture(autouse=True)
 def dynamic(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("PYODIDE_WASMTIME_ASM_WASM", "PYODIDE_WASMTIME_STDLIB", "PYODIDE_WASMTIME_FLAVOR"):
+    for var in ("PYODIDE_NOJS_ASM_WASM", "PYODIDE_NOJS_STDLIB", "PYODIDE_NOJS_FLAVOR"):
         monkeypatch.delenv(var, raising=False)  # these tests set their own
     if "dynamic" not in available_flavors(data_dir()):
         missing(f"the dynamic build is not in {data_dir()}")
@@ -57,8 +57,8 @@ def tiny_wasm(env_imports: list[str], text: bytes) -> bytes:
 def test_api_and_env(asm: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     py = Pyodide(asm_wasm=asm)  # an override and no flavor: dynamic
     assert (py.flavor, py.asm_wasm, py.stdlib) == ("dynamic", asm, None)
-    monkeypatch.setenv("PYODIDE_WASMTIME_ASM_WASM", str(asm))
-    monkeypatch.setenv("PYODIDE_WASMTIME_STDLIB", str(data_dir() / "python_stdlib.zip"))
+    monkeypatch.setenv("PYODIDE_NOJS_ASM_WASM", str(asm))
+    monkeypatch.setenv("PYODIDE_NOJS_STDLIB", str(data_dir() / "python_stdlib.zip"))
     py = Pyodide()
     assert (py.flavor, py.asm_wasm, py.stdlib) == ("dynamic", asm, data_dir() / "python_stdlib.zip")
     other = tmp_path / "x.wasm"
@@ -66,15 +66,24 @@ def test_api_and_env(asm: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert Pyodide(asm_wasm=other).asm_wasm == other  # the argument wins
     with pytest.raises(ValueError, match="fused module is built for one Pyodide"):
         Pyodide("fused")
-    monkeypatch.delenv("PYODIDE_WASMTIME_ASM_WASM")
-    monkeypatch.delenv("PYODIDE_WASMTIME_STDLIB")
+    monkeypatch.delenv("PYODIDE_NOJS_ASM_WASM")
+    monkeypatch.delenv("PYODIDE_NOJS_STDLIB")
     with pytest.raises(ValueError, match="use dynamic"):
         Pyodide("fused", stdlib=data_dir() / "python_stdlib.zip")
     with pytest.raises(FileNotFoundError, match="nope.wasm"):
         Pyodide(asm_wasm=tmp_path / "nope.wasm")
-    monkeypatch.setenv("PYODIDE_WASMTIME_STDLIB", str(tmp_path / "nope.zip"))
-    with pytest.raises(FileNotFoundError, match=r"nope.zip.*PYODIDE_WASMTIME_STDLIB"):
+    monkeypatch.setenv("PYODIDE_NOJS_STDLIB", str(tmp_path / "nope.zip"))
+    with pytest.raises(FileNotFoundError, match=r"nope.zip.*PYODIDE_NOJS_STDLIB"):
         Pyodide()
+
+
+def test_old_env_names_are_still_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PYODIDE_WASMTIME_* names of before the rename are read when the PYODIDE_NOJS_* one is not set."""
+    monkeypatch.delenv("PYODIDE_NOJS_CACHE", raising=False)
+    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path / "old"))
+    assert _engine.cache_dir() == tmp_path / "old"
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(tmp_path / "new"))
+    assert _engine.cache_dir() == tmp_path / "new"
 
 
 def test_stdlib_override_is_the_one_used(tmp_path: Path) -> None:
@@ -91,8 +100,8 @@ def test_stdlib_override_is_the_one_used(tmp_path: Path) -> None:
 def test_snapshot_key_follows_the_files_loaded(
     asm: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd
 ) -> None:
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path / "cache"))
-    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.delenv("PYODIDE_NOJS_SNAPSHOT", raising=False)
     b = tmp_path / "b.asm.wasm"
     shutil.copyfile(asm, b)
     touch(asm, 1_000_000_000)
@@ -159,7 +168,7 @@ def test_stdlib_of_another_python_warns(tmp_path: Path, caplog: pytest.LogCaptur
                 blob = blob.replace(b"'VERSION': '3.15'", b"'VERSION': '3.14'")
             dst.writestr(item, blob)
     assert override_warnings(None, data_dir() / "python_stdlib.zip", data_dir()) == ([], [])
-    with caplog.at_level(logging.WARNING, logger="pyodide_wasmtime"), Pyodide("dynamic", stdlib=z) as py:
+    with caplog.at_level(logging.WARNING, logger="pyodide_nojs"), Pyodide("dynamic", stdlib=z) as py:
         assert py.run("pass") == 0
         assert py.run("pass") == 0
     assert [r.getMessage() for r in caplog.records if "is for Python 3.14" in r.getMessage()] != []
@@ -167,7 +176,7 @@ def test_stdlib_of_another_python_warns(tmp_path: Path, caplog: pytest.LogCaptur
 
 
 def test_legacy_exceptions_are_converted_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from pyodide_wasmtime import _engine
+    from pyodide_nojs import _engine
 
     def sec(i: int, body: bytes) -> bytes:
         return bytes([i, len(body)]) + body
@@ -181,7 +190,7 @@ def test_legacy_exceptions_are_converted_once(tmp_path: Path, monkeypatch: pytes
         + sec(7, b"\1\1f\0\0")
         + sec(10, bytes([1, len(body)]) + body)
     )
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(tmp_path / "cache"))
     calls: list[int] = []
     real = _engine.translate_to_exnref
     monkeypatch.setattr(_engine, "translate_to_exnref", lambda d, w: (calls.append(1), real(d, w))[1])

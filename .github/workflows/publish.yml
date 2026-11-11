@@ -37,7 +37,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: data
-          path: src/pyodide_wasmtime/data
+          path: src/pyodide_nojs/data
 
       # Wheel only: the wasm is built, not committed, so an sdist (git-tracked files) could not rebuild this wheel.
       - name: Build the wheel
@@ -51,7 +51,7 @@ jobs:
           uv pip install -q --python /tmp/smoke "$(ls dist/*.whl)[wasmtime]"
           cd /tmp
           for f in fused dynamic; do
-            /tmp/smoke/bin/python -m pyodide_wasmtime --flavor $f -c "import sys; assert sum(range(10)) == 45; print('$f ok on', sys.platform)"
+            /tmp/smoke/bin/python -m pyodide_nojs --flavor $f -c "import sys; assert sum(range(10)) == 45; print('$f ok on', sys.platform)"
           done
 
       - uses: actions/upload-artifact@v7
@@ -96,6 +96,6 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
-            --title "pyodide-wasmtime ${{ github.ref_name }}" \
+            --title "pyodide-nojs ${{ github.ref_name }}" \
             --generate-notes \
             artifacts/dist/*

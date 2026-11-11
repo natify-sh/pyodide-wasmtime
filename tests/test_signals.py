@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from conftest import Guest
 
-from pyodide_wasmtime import Pyodide
+from pyodide_nojs import Pyodide
 
 RAISE = """
 import signal, os, time
@@ -121,4 +121,4 @@ def test_the_runtime_is_named(guest: Guest) -> None:
     """`sys._emscripten_info.runtime`: Pyodide on Node says 'node v22...'; here this package."""
     r = guest.run("import sys; print(sys._emscripten_info.runtime)")
     assert r.returncode == 0, r.stderr
-    assert r.stdout.startswith("pyodide-wasmtime ")
+    assert r.stdout.startswith("pyodide-nojs ")

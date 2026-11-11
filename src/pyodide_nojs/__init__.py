@@ -1,6 +1,6 @@
 """Pyodide's CPython run by wasmtime, with no JavaScript (alpha).
 
-    from pyodide_wasmtime import Pyodide
+    from pyodide_nojs import Pyodide
     with Pyodide() as py:
         py.run("import sys; print(sys.version)")
 

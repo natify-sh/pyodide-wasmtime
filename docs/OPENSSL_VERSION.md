@@ -1,7 +1,7 @@
 # The OpenSSL of the guest's TLS: where it stands and whether we can go higher
 
 Research report, 2026-11-11. No code of the repository was changed; everything measured was built in a scratch
-directory. Purpose: the argument for an upstream proposal to Pyodide when pyodide-wasmtime reaches alpha.
+directory. Purpose: the argument for an upstream proposal to Pyodide when pyodide-nojs reaches alpha.
 Sources are URLs, files, or the command that produced the number; what could not be verified is in the last section.
 
 ## Summary
@@ -79,7 +79,7 @@ Files fetched from `raw.githubusercontent.com/python/cpython/<tag>/...` (`v3.15.
   `SSLContext.get_groups()` (3.5), `SSLSocket.client_sigalg()/server_sigalg()` (3.5), `ssl.get_sigalgs()` (3.4), time of a session in
   64 bit (`SSL_SESSION_get_time_ex`, 3.3), EC curve setting through the provider API (`OPENSSL_VERSION_MAJOR < 3` uses the deprecated
   `EC_KEY` path), `x509_object_dup` is compiled in 1.1.1/3.0..3.2 only, error-code tables `_ssl_data_111.h`. `_hashopenssl.c` has `OPENSSL_VERSION_NUMBER >= 0x30000000L` branches (EVP_MD fetch).
-  Measured in our guest (`probe.py` through `python -m pyodide_wasmtime --site ...`): with 1.1.1w `get_groups()` raises
+  Measured in our guest (`probe.py` through `python -m pyodide_nojs --site ...`): with 1.1.1w `get_groups()` raises
   `NotImplementedError: ... requires OpenSSL 3.5 or later`, `get_sigalgs()` raises `... requires OpenSSL 3.4 or later`,
   `set_ecdh_curve("X25519MLKEM768")` raises `ValueError: unknown elliptic curve name`.
 * **Our `_ssl` 3.15.0rc1 against 1.1.1w headers** compiles (one `clang` call, `tools/build_ssl.sh`) and runs: `ssl.OPENSSL_VERSION ==
@@ -123,7 +123,7 @@ for its sockets in our case (it passes the fd through `SSL_set_fd`, and our gues
   `libcrypto.a` 6.2 MB, `libssl.a` 0.93 MB before linking. The full 3.x link is 1.8x the 1.1.1w set raw (1.4x gzipped): 3.x has the provider
   framework, ML-KEM/ML-DSA/SLH-DSA, QUIC off (`no-quic`), and a much bigger EVP layer. The trimmed row (second build: 202 s wall with `-j2`, 688 objects; same tests pass on it: local TLS server with hostname refusal, pypi.org handshake TLS 1.3, urllib, ML-KEM groups listed; `get_sigalgs()` still traps) removes algorithms nothing in a TLS
   client needs. Further trimming (`no-ec`-curves, `no-dh`, a stripped error-string table `no-err`) was not tried; the remaining 2.96 MB is mostly libcrypto's EVP/provider layer (a guess).
-* **Run, both packagings** (`python -m pyodide_wasmtime --flavor fused|dynamic --site <dir with ssl.py and the .so>`; no `libssl.so`/`libcrypto.so` NEEDED any more):
+* **Run, both packagings** (`python -m pyodide_nojs --flavor fused|dynamic --site <dir with ssl.py and the .so>`; no `libssl.so`/`libcrypto.so` NEEDED any more):
   * `ssl.OPENSSL_VERSION` = `OpenSSL 3.5.9 29 Sep 2026`, `OPENSSL_VERSION_INFO` = `(3, 5, 0, 9, 0)`; all `HAS_*` true except NPN, SSLv2/3.
   * `tests/checks/tls_check.py` (HTTPS to pypi.org by the guest's own sockets and TLS, urllib): `handshake TLSv1.3 TLS_AES_256_GCM_SHA384 | peer cert subject CN: pypi.org`, `raw response: HTTP/1.1 200 OK`, `urllib 200 six` (fused).
   * Local TLS server on 127.0.0.1 (host thread, self-signed cert with a SAN): handshake OK on fused (25 ms) and dynamic (56 ms), echo OK, and
@@ -260,7 +260,7 @@ Recommendation (a guess from the above): ship route (c) as the default real TLS 
 
 ## 7. Side findings
 
-* In this working tree (data built 2026-11-11 11:54, `testenv/site_tls` from 2026-11-10), `python -m pyodide_wasmtime --flavor fused --dev --site .../site_tls -c "import ssl; ..."` gives `OpenSSL (stub)` and `/lib/python315.zip/ssl.py`: the `--site` folder copied into `site-packages` comes **after** the stdlib zip on `sys.path` (`['', '/lib/python315.zip', '/lib/python3.15/lib-dynload', '/lib/python3.15/site-packages']`) while the zip now contains Pyodide's stub `ssl.py` and `_ssl.py`. `tests/test_checks.py::test_the_guests_own_tls` expects the real one, so this is either a stale `python_stdlib.zip` or a regression of the `build_ssl.sh` comment "a folder that comes before the stdlib zip"; I worked around it with `sys.path.insert(0, '/lib/python3.15/site-packages')` (not investigated, network tests were not run by me against the repository's test suite).
+* In this working tree (data built 2026-11-11 11:54, `testenv/site_tls` from 2026-11-10), `python -m pyodide_nojs --flavor fused --dev --site .../site_tls -c "import ssl; ..."` gives `OpenSSL (stub)` and `/lib/python315.zip/ssl.py`: the `--site` folder copied into `site-packages` comes **after** the stdlib zip on `sys.path` (`['', '/lib/python315.zip', '/lib/python3.15/lib-dynload', '/lib/python3.15/site-packages']`) while the zip now contains Pyodide's stub `ssl.py` and `_ssl.py`. `tests/test_checks.py::test_the_guests_own_tls` expects the real one, so this is either a stale `python_stdlib.zip` or a regression of the `build_ssl.sh` comment "a folder that comes before the stdlib zip"; I worked around it with `sys.path.insert(0, '/lib/python3.15/site-packages')` (not investigated, network tests were not run by me against the repository's test suite).
 * The sandbox's egress proxy presents a certificate for **any** SNI name, so `wrap_socket(..., server_hostname="wrong.example")` to pypi.org "succeeds" here with both builds (the peer certificate's SAN is the requested name). That is not a bug of the guest: the local-server test above (hostname mismatch refused by both 1.1.1w and 3.5.9) is the valid check; `tests/checks/tls_check.py`'s last step ("hostname check works") is not asserted by `tests/test_checks.py` (`TLS` patterns) and cannot pass through such a proxy.
 
 ## 8. What I could not verify

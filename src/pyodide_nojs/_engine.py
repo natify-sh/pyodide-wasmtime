@@ -37,17 +37,22 @@ def require_wasmtime() -> Any:
         import wasmtime
     except ImportError as e:  # pragma: no cover - the message is the point
         raise ImportError(
-            "pyodide-wasmtime runs on wasmtime-py, an optional dependency: pip install 'pyodide-wasmtime[wasmtime]'"
+            "pyodide-nojs runs on wasmtime-py, an optional dependency: pip install 'pyodide-nojs[wasmtime]'"
         ) from e
     return wasmtime
 
 
+def env(name: str) -> str | None:
+    """$PYODIDE_NOJS_X, else the old $PYODIDE_WASMTIME_X: the old names are accepted during the alpha."""
+    return os.environ.get(name) or os.environ.get("PYODIDE_WASMTIME_" + name.removeprefix("PYODIDE_NOJS_"))
+
+
 def cache_dir() -> Path:
-    base = os.environ.get("PYODIDE_WASMTIME_CACHE")
+    base = env("PYODIDE_NOJS_CACHE")
     if base:
         return Path(base)
     xdg = os.environ.get("XDG_CACHE_HOME")
-    return (Path(xdg) if xdg else Path.home() / ".cache") / "pyodide-wasmtime"
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "pyodide-nojs"
 
 
 def private_dir(path: Path) -> None:
@@ -252,5 +257,5 @@ def translate_to_exnref(data: bytes, wasm_opt: str | os.PathLike[str] | None) ->
         return Path(td, "out.wasm").read_bytes()
 
 
-if __name__ == "__main__":  # python -m pyodide_wasmtime._engine TOOL.wasm ARGS...: the tool, like on a shell
+if __name__ == "__main__":  # python -m pyodide_nojs._engine TOOL.wasm ARGS...: the tool, like on a shell
     sys.exit(run_tool(sys.argv[1], sys.argv[2:]))

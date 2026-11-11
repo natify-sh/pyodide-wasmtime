@@ -1,5 +1,5 @@
 > **History.** This is the write-up of the experiment (2026-11-10, from wasmhost) the package grew out of. It says "not in CI" and
-> names scripts (`prepare.sh`, `run_tests.py`, `run_pyodide_adapter.py`...) that are now `tools/*.sh`, `tests/` and `src/pyodide_wasmtime/`;
+> names scripts (`prepare.sh`, `run_tests.py`, `run_pyodide_adapter.py`...) that are now `tools/*.sh`, `tests/` and `src/pyodide_nojs/`;
 > see the README for the current state. The mechanics below are unchanged.
 
 # Pyodide without JavaScript: the Emscripten glue as wasm (experiment, 2026-11-10)

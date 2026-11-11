@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from conftest import Guest, check_file, missing, testenv
 
-from pyodide_wasmtime import Pyodide
+from pyodide_nojs import Pyodide
 
 
 def lines(out: str) -> list[str]:
@@ -106,7 +106,7 @@ class FakeMemory:
 
 
 def fake_host() -> Any:
-    from pyodide_wasmtime._host import Pyodide
+    from pyodide_nojs._host import Pyodide
 
     py = Pyodide.__new__(Pyodide)
     py.cur, py.memory = [None], FakeMemory()
@@ -123,7 +123,7 @@ def fake_host() -> Any:
 def test_pointers_of_the_operations_are_unsigned_and_checked() -> None:
     """wasmtime passes an i32 as a signed number: a pointer above 2 GiB is negative. It is read as the address it is
     (outside this memory: a GuestFault), never as an offset from the end of the memory."""
-    from pyodide_wasmtime._host import GuestFault
+    from pyodide_nojs._host import GuestFault
 
     py = fake_host()
     for call in (
@@ -138,7 +138,7 @@ def test_pointers_of_the_operations_are_unsigned_and_checked() -> None:
 
 
 def test_a_cif_from_the_guest_cannot_make_the_host_loop_or_copy_without_end() -> None:
-    from pyodide_wasmtime._host import GuestFault
+    from pyodide_nojs._host import GuestFault
 
     py = fake_host()
     mem = py.memory.data

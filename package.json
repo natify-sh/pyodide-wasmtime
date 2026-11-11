@@ -1,5 +1,5 @@
 {
-  "name": "pyodide-wasmtime-build",
+  "name": "pyodide-nojs-build",
   "private": true,
   "description": "Build-time tools and the pinned Pyodide only: Dependabot tracks these versions. The run time has no Node (see tools/fetch.sh).",
   "license": "MIT",

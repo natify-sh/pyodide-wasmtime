@@ -80,7 +80,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: data
-          path: src/pyodide_wasmtime/data
+          path: src/pyodide_nojs/data
           retention-days: 14
 
       - uses: actions/upload-artifact@v7

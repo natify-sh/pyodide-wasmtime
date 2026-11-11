@@ -9,14 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from pyodide_wasmtime import FLAVORS, available_flavors, data_dir
+from pyodide_nojs import FLAVORS, _engine, available_flavors, data_dir
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
 
 def work_dir() -> Path:
-    return Path(os.environ.get("PYODIDE_WASMTIME_WORK") or ROOT / "pyo-build")
+    return Path(os.environ.get("PYODIDE_NOJS_BUILD") or ROOT / "pyo-build")
 
 
 def testenv() -> Path:
@@ -34,10 +34,8 @@ def missing(what: str) -> None:
 @pytest.fixture(params=FLAVORS)
 def flavor(request: pytest.FixtureRequest) -> str:
     name = request.param
-    if name == "fused" and (os.environ.get("PYODIDE_WASMTIME_ASM_WASM") or os.environ.get("PYODIDE_WASMTIME_STDLIB")):
-        pytest.skip(
-            "PYODIDE_WASMTIME_ASM_WASM/STDLIB replace files of the dynamic build; the fused module cannot follow"
-        )
+    if name == "fused" and (_engine.env("PYODIDE_NOJS_ASM_WASM") or _engine.env("PYODIDE_NOJS_STDLIB")):
+        pytest.skip("PYODIDE_NOJS_ASM_WASM/STDLIB replace files of the dynamic build; the fused module cannot follow")
     if name not in available_flavors(data_dir()):
         missing(f"the {name} build is not in {data_dir()}")
     return name
@@ -52,7 +50,7 @@ class Guest:
     def run(
         self, code: str, site: str | None = None, *args: str, timeout: int = 1800
     ) -> subprocess.CompletedProcess[str]:
-        cmd = [sys.executable, "-m", "pyodide_wasmtime", "--flavor", self.flavor, "-v"]
+        cmd = [sys.executable, "-m", "pyodide_nojs", "--flavor", self.flavor, "-v"]
         if site:
             path = testenv() / site
             if not path.is_dir():

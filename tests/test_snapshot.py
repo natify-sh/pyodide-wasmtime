@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from pyodide_wasmtime import Pyodide
-from pyodide_wasmtime import _engine as engine
+from pyodide_nojs import Pyodide
+from pyodide_nojs import _engine as engine
 
 PRE = "import json, random\nvalue = 41\ndef f(x):\n    return x + value\n"
 CODE = "print(json.dumps(f(1)))\nraise ValueError('boom')"
@@ -17,8 +17,8 @@ CODE = "print(json.dumps(f(1)))\nraise ValueError('boom')"
 
 @pytest.fixture
 def cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path))
-    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(tmp_path))
+    monkeypatch.delenv("PYODIDE_NOJS_SNAPSHOT", raising=False)
     return tmp_path
 
 
@@ -98,7 +98,7 @@ def test_two_interpreters_restored_and_normal(flavor, cache, capfd):
 
 
 def test_snapshot_off(flavor, cache, monkeypatch):
-    monkeypatch.setenv("PYODIDE_WASMTIME_SNAPSHOT", "0")
+    monkeypatch.setenv("PYODIDE_NOJS_SNAPSHOT", "0")
     with Pyodide(flavor, preload=PRE) as py:
         assert py.run("print(f(1))") == 0
         assert not py.restored

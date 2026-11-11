@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Context and rules for working on pyodide-wasmtime with an agent. The way of work is taken from [wasmhost](https://github.com/natify-sh/py-wasmhost); where a rule below comes from the owner's words for this project it says so,
+Context and rules for working on pyodide-nojs with an agent. The way of work is taken from [wasmhost](https://github.com/natify-sh/py-wasmhost); where a rule below comes from the owner's words for this project it says so,
 the rest is wasmhost's practice carried over and open to the maintainer's correction.
 
 **Start with [`BRIEF.md`](BRIEF.md)**: what the project is, what it is not, and what is next.
@@ -18,10 +18,10 @@ The maintainer communicates in Ukrainian; code, comments, commit messages and do
 * **One toolchain: wasi-sdk 34's clang** builds every wasm we build (`adapter.wasm`, `wasm-opt.wasm`, the guest's `_ssl`); no `clang` from the system. (The owner, 2026-11-10.)
 * **Both packagings are tested** wherever a test runs, and **Pyodide's official test suite** (`tests/test_pyodide_suite.py`, `python_tests.yaml`, libregrtest) runs on both, locally and in CI. A feature that works on one only is not done. (The owner, 2026-11-10.)
 * **The supported Pyodide is pinned in `package.json`** (Dependabot tracks it); the adapter answers that build's `env` imports. A bump needs the new release sha in `tools/fetch.sh`, `PYODIDE_VERSION`/`PYODIDE_ABI`
-  in `src/pyodide_wasmtime/__init__.py`, `PYVER` if Python changes, and a green CI on both packagings.
+  in `src/pyodide_nojs/__init__.py`, `PYVER` if Python changes, and a green CI on both packagings.
 * **State lives in the `Pyodide` object, never in module globals**: two interpreters in one process must work (`test_two_interpreters_in_one_process`).
 * **What cannot work is reported, not faked**: an import the adapter does not answer is a stub that returns 0/null (the JavaScript bridge: documented in BRIEF.md); a missing build or engine is an error that says what to run.
-* **The wheel carries built wasm that is not committed** (`src/pyodide_wasmtime/data/` is ignored; CI builds it). The bundled binaries keep their licenses (`licenses/NOTICE`): a new one gets its text and a line there.
+* **The wheel carries built wasm that is not committed** (`src/pyodide_nojs/data/` is ignored; CI builds it). The bundled binaries keep their licenses (`licenses/NOTICE`): a new one gets its text and a line there.
 * **Measure, do not guess.** A claim about what runs has the command or the CI run behind it; a number has the command (and the machine) it came from. Say plainly what was not run (network checks need PyPI and jsDelivr, which a sandbox may block).
 * **Nothing is pushed to `main`.** Every change goes through a pull request that the owner opens; the assistant works on a branch, does not open a pull request, rename the branch or squash history.
 * **Do not copy the designs of wasmhost** (backends, a WebAssembly API): this is a separate project.
@@ -76,7 +76,7 @@ Report:      files changed, commands run with output, docs updated, open questio
 ## Working on the code
 * `wasm/adapter.c` is the glue as wasm: one translation unit that includes the sections in `wasm/adapter/*.h` (header-only, `common.h` first; `tools/build_adapter.sh` compiles `adapter.c` only). Wasmtime's adapter rules hold (checked by `tests/test_shape.py`): **no data section** (`-fno-jump-tables`, names built from integer constants), **no stack of its own** (`-z stack-size=0`, it runs on Pyodide's stack),
   state in wasm globals pointing at blocks from the main module's `malloc`. It imports only WASI, the main module's memory/table/stack pointer/allocator and the host's `loader`/`net`/`aux`.
-* `src/pyodide_wasmtime/_host.py` (`Pyodide`): `_start` builds either flavor; `run()` executes code in the guest's `__main__` through a wrapper that turns `SystemExit` into a status (Emscripten's `exit()` ends in `unreachable`).
+* `src/pyodide_nojs/_host.py` (`Pyodide`): `_start` builds either flavor; `run()` executes code in the guest's `__main__` through a wrapper that turns `SystemExit` into a status (Emscripten's `exit()` ends in `unreachable`).
   `_engine.py` is the one engine (exceptions, function references, GC), the machine-code cache in the user's cache dir, and `wasm-opt.wasm` run in-process. `_wasm.py` is the WAT of the dynamic build; import types come from `Module.imports`
   (wasmtime-py prints every reference type as `anyref`; here they are all `externref`). `guest/hostnet.py` runs inside the guest.
 * Wheels with legacy exceptions are converted at `dlopen` by `wasm-opt.wasm` (`Pyodide.converted` counts them); the modules the build ships are converted at build time.
@@ -88,12 +88,12 @@ Report:      files changed, commands run with output, docs updated, open questio
 uv sync                                                    # dev environment (add --group suite for the official suite)
 uv run ruff check . && uv run ruff format --check .
 uv run pyright
-sh tools/build_data.sh pyo-build                                # the wasm of the package -> src/pyodide_wasmtime/data (needs node, npm; cmake + ninja for wasm-opt.wasm)
+sh tools/build_data.sh pyo-build                                # the wasm of the package -> src/pyodide_nojs/data (needs node, npm; cmake + ninja for wasm-opt.wasm)
 sh tools/prepare_testenv.sh pyo-build                           # numpy, micropip, openssl, the real _ssl, the `test` wheel -> pyo-build/testenv
 uv run pytest -m "not network and not suite"               # offline, both packagings
 uv run pytest -m network                                   # PyPI and jsDelivr
 uv run pytest -m suite                                     # Pyodide's official CPython suite, both packagings (long; -n auto spreads it over the cores; PYODIDE_SUITE_SHARD=I/N, PYODIDE_SUITE_FLAVORS=fused)
-uv run python -m pyodide_wasmtime [--flavor fused|dynamic] -c "print(1 + 1)"
+uv run python -m pyodide_nojs [--flavor fused|dynamic] -c "print(1 + 1)"
 uv build --wheel                                           # the wheel carries data/
 ```
 CI: `build.yml` (wasm-opt.wasm cached, data, testenv), `tests.yml` (offline on Linux/Windows/macOS, network, the suite in one job per packaging, spread over the cores by pytest-xdist), `pre-commit.yml`, `publish.yml` (wheel only: the wasm is built, not committed).

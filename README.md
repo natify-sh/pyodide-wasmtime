@@ -1,16 +1,16 @@
-# pyodide-wasmtime
+# pyodide-nojs
 
-Pyodide's CPython, and its wheels, run by [wasmtime](https://github.com/bytecodealliance/wasmtime-py) **with no JavaScript**. No browser, no Node, none of Pyodide's glue.
+pyodide-nojs runs Pyodide's CPython, and its wheels, on [Wasmtime](https://github.com/bytecodealliance/wasmtime-py) (through wasmtime-py) **with no JavaScript**. No browser, no Node, none of Pyodide's glue.
 **Alpha:** the API and the wasm in the package change without notice; one Pyodide build is supported (below).
 
 ```sh
-pip install 'pyodide-wasmtime[wasmtime]'
-pyodide-wasmtime -c "import sys; print(sys.version, sys.platform)"      # 3.15.0rc1 ... emscripten
-pyodide-wasmtime script.py arg1 arg2
-pyodide-wasmtime                                                        # a REPL on a terminal; the script on stdin otherwise
+pip install 'pyodide-nojs[wasmtime]'
+pyodide-nojs -c "import sys; print(sys.version, sys.platform)"      # 3.15.0rc1 ... emscripten
+pyodide-nojs script.py arg1 arg2
+pyodide-nojs                                                        # a REPL on a terminal; the script on stdin otherwise
 ```
 ```python
-from pyodide_wasmtime import Pyodide
+from pyodide_nojs import Pyodide
 
 with Pyodide() as py:  # the fused build; Pyodide("dynamic") for the other
     py.run("import json; print(json.dumps({'a': 1}))")  # 0 if it ran, 1 if it raised, N for sys.exit(N)
@@ -21,10 +21,10 @@ with Pyodide() as py:  # the fused build; Pyodide("dynamic") for the other
 (one file of ~30 MB per packaging, keyed by the preload, the wasm files, the environment, `preopen_dev` and whether
 stdin/stdout/stderr are terminals); the next start restores it instead of booting Python, so `Pyodide(preload=P).run("pass")`
 takes ~0.2 s instead of ~2 s when P imports `asyncio`. The preload must only import and compute: it must not print (it prints at snapshot time only), and opening files or sockets, `chdir`, writing files, `dlopen` or `ctypes` symbol lookups make the snapshot be skipped (a normal start, the preload run once); with `site=`, `mounts=` or `inherit_env=True` there is none (a snapshot is a file in the cache folder, mode 0600 in a 0700 folder, and the host's variables, secrets included, must not get into it: the preload runs once, a normal start). Variables given with `env=` DO go into a snapshot: a secret in `env=` together with `preload=` is in the cache file. The snapshot is frozen with its hash seed, so every restore shares one `PYTHONHASHSEED` (`random` is re-seeded).
-`PYODIDE_WASMTIME_SNAPSHOT=0` turns it off. Without `preload` nothing changes. The REPL uses it.
+`PYODIDE_NOJS_SNAPSHOT=0` turns it off. Without `preload` nothing changes. The REPL uses it.
 
 Another Pyodide's files can be tried on the dynamic build: `Pyodide("dynamic", asm_wasm="pyodide.asm.wasm", stdlib="python_stdlib.zip")` (either one; the adapter and `wasm-opt.wasm` stay the package's),
-`pyodide-wasmtime --asm-wasm FILE --stdlib FILE ...`, or `$PYODIDE_WASMTIME_ASM_WASM` / `$PYODIDE_WASMTIME_STDLIB` (an argument wins; the tests honour the variables, the fused runs are skipped). They imply `dynamic`; the fused module is built for one Pyodide, so `fused` with them is an error. A raw `pyodide.asm.wasm` from the npm package (legacy exceptions) is accepted: it is converted once by `wasm-opt.wasm` and cached (a warning says so on that start). The snapshot key follows the files loaded. At start a warning on stderr says what is not the pinned build's: CPython's version string in the wasm (Pyodide's own is not in it), `env` imports the adapter does not know (`-v` lists ten), a missing `setsockopt` patch, a stdlib zip of another Python. Only the pinned build is tested; the adapter answers its imports.
+`pyodide-nojs --asm-wasm FILE --stdlib FILE ...`, or `$PYODIDE_NOJS_ASM_WASM` / `$PYODIDE_NOJS_STDLIB` (an argument wins; the tests honour the variables, the fused runs are skipped). They imply `dynamic`; the fused module is built for one Pyodide, so `fused` with them is an error. A raw `pyodide.asm.wasm` from the npm package (legacy exceptions) is accepted: it is converted once by `wasm-opt.wasm` and cached (a warning says so on that start). The snapshot key follows the files loaded. At start a warning on stderr says what is not the pinned build's: CPython's version string in the wasm (Pyodide's own is not in it), `env` imports the adapter does not know (`-v` lists ten), a missing `setsockopt` patch, a stdlib zip of another Python. Only the pinned build is tested; the adapter answers its imports.
 
 It is meant to run anything Pyodide runs without the browser's JavaScript: the standard library, binary Emscripten wheels
 (numpy and the rest of Pyodide's lock: `site=` folders, or `micropip` over the host's fetch or the guest's own TLS),
@@ -32,11 +32,11 @@ files (`mounts={"/data": "/host/dir"}`), sockets, `ctypes`/`cffi`. What needs th
 `pyodide.http` outside `hostnet`) does not exist here: those 169 `env` imports (158 of the bridge, 11 hooks that mean nothing here) are not answered: zero/null stubs, and hidden from `dlsym` in the fused build ([docs/IMPORT_AUDIT.md](docs/IMPORT_AUDIT.md)).
 
 **The guest is isolated.** Its environment is Pyodide's own minimal one (`USER`/`LOGNAME=web_user`, `PATH=/`, `PWD=/`, `HOME=/home/pyodide` (the folder exists), `LANG=en_US.UTF-8`, `LD_LIBRARY_PATH`), plus `env=`; nothing of the host's environment or files reaches it unless you ask (one exception: the CA bundle for TLS is read from the host, as `SSL_CERT_FILE` names it or from the system's, and copied to the guest's `/etc/ssl/cert.pem`: a file named by `SSL_CERT_FILE` that also holds a private key would put that key there):
-`Pyodide(inherit_env=True)` / `--inherit-env` pass ALL the host's variables too, secrets included: the guest can print or send them (`env=` / `--env K=V` win; the interpreter's own `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH` are not taken), `mounts=` / `--mount GUEST=HOST` give a host folder, `--mount-cwd` gives the current folder as the guest's working directory (`/host`). `sys.executable` is `'/home/pyodide/this.program'` as in the browser (the file does not exist); to tell this runtime from the browser's, read `sys._emscripten_info.runtime` (here `'pyodide-wasmtime <ver>'`). The network and the time zone are still the host's.
+`Pyodide(inherit_env=True)` / `--inherit-env` pass ALL the host's variables too, secrets included: the guest can print or send them (`env=` / `--env K=V` win; the interpreter's own `PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH` are not taken), `mounts=` / `--mount GUEST=HOST` give a host folder, `--mount-cwd` gives the current folder as the guest's working directory (`/host`). `sys.executable` is `'/home/pyodide/this.program'` as in the browser (the file does not exist); to tell this runtime from the browser's, read `sys._emscripten_info.runtime` (here `'pyodide-nojs <ver>'`). The network and the time zone are still the host's.
 
 | | |
 |---|---|
-| Pyodide | **315.0.0-alpha.2** (`pyodide_wasmtime.PYODIDE_VERSION`), Python 3.15.0rc1, Emscripten 6.0.5, wheels of ABI `pyemscripten_2026_5_wasm32` (`PYODIDE_ABI`) |
+| Pyodide | **315.0.0-alpha.2** (`pyodide_nojs.PYODIDE_VERSION`), Python 3.15.0rc1, Emscripten 6.0.5, wheels of ABI `pyemscripten_2026_5_wasm32` (`PYODIDE_ABI`) |
 | Python | 3.10+ (the host); CPython and PyPy |
 | Needs at run time | wasmtime-py (`[wasmtime]`, 50.0.1+) and the wasm files **in the wheel**: `pyodide.asm.wasm`, `python_stdlib.zip`, `adapter.wasm`, `pyodide_fused.wasm`, `wasm-opt.wasm`. No Node, no native Binaryen |
 
@@ -56,7 +56,7 @@ Two packagings of the same sources, both in the wheel, both tested:
 
 Wheels with legacy exceptions (every Emscripten wheel of Pyodide's CDN with C++ exceptions, numpy's two modules...) are converted at
 `dlopen` by **`wasm-opt.wasm`**: Binaryen 132 as a `wasm32-wasip1` module, run in-process by wasmtime-py. Machine code of the big modules is cached in
-`~/.cache/pyodide-wasmtime` (`$PYODIDE_WASMTIME_CACHE`), so a start takes a few seconds.
+`~/.cache/pyodide-nojs` (`$PYODIDE_NOJS_CACHE`), so a start takes a few seconds. The environment variables are `PYODIDE_NOJS_*`; the old `PYODIDE_WASMTIME_*` names are accepted during the alpha.
 
 More in [docs/EXPERIMENT.md](docs/EXPERIMENT.md) (the experiment this came from: results, what the adapter answers, TLS in the guest, what was found on the way)
 and [docs/NOTES-FUSEDWASI-AND-TESTSUITE.md](docs/NOTES-FUSEDWASI-AND-TESTSUITE.md) (WASI 0.2 over fusedwasi, next).
@@ -66,9 +66,9 @@ One toolchain: **wasi-sdk 34's clang** builds `adapter.wasm`, `wasm-opt.wasm` an
 
 ```sh
 uv sync
-sh tools/build_data.sh pyo-build         # -> src/pyodide_wasmtime/data/*  (wasm-opt.wasm from source takes ~12 min; WASM_OPT_WASM=path reuses one)
-sh tools/prepare_testenv.sh pyo-build    # -> pyo-build/testenv: numpy, micropip, openssl, the real _ssl, the `test` wheel, python_tests.yaml
-uv build --wheel                    # the wheel carries data/ (the wasm is built, not committed)
+sh tools/build_data.sh pyo-build    # -> src/pyodide_nojs/data/*  (wasm-opt.wasm from source takes ~12 min; WASM_OPT_WASM=path reuses one)
+sh tools/prepare_testenv.sh pyo-build # -> pyo-build/testenv: numpy, micropip, openssl, the real _ssl, the `test` wheel, python_tests.yaml
+uv build --wheel               # the wheel carries data/ (the wasm is built, not committed)
 ```
 Needs: node, npm, curl, git, cmake and ninja (for `wasm-opt.wasm`), perl and make (OpenSSL's `opensslconf.h`).
 

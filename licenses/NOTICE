@@ -1,4 +1,4 @@
-pyodide-wasmtime bundles binaries built from other projects. Each keeps its own license:
+pyodide-nojs bundles binaries built from other projects. Each keeps its own license:
 
 * pyodide.asm.wasm, python_stdlib.zip, pyodide_fused.wasm (which contains pyodide.asm.wasm): Pyodide 315.0.0-alpha.2,
   MPL-2.0 (Pyodide-LICENSE-MPL-2.0.txt). Pyodide's CPython is under the PSF license (CPython-LICENSE-PSF.txt); the

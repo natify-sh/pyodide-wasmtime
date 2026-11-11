@@ -12,7 +12,7 @@ import sidemod
 from conftest import Guest
 from wasmtime import wat2wasm
 
-from pyodide_wasmtime import Pyodide
+from pyodide_nojs import Pyodide
 
 POSIX = sys.platform != "win32"
 
@@ -24,8 +24,8 @@ def test_inherit_env_makes_no_snapshot_and_no_file_holds_the_secret(
 ) -> None:
     """Batch 1 M1: the snapshot is the guest's whole memory, environment included: with `inherit_env` it would be the
     host's secrets in a file."""
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path))
-    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(tmp_path))
+    monkeypatch.delenv("PYODIDE_NOJS_SNAPSHOT", raising=False)
     monkeypatch.setenv("WASMHOST_TEST_SECRET", "hunter2-needle")
     for _ in range(2):
         with Pyodide(flavor, preload="import json\nvalue = 41", inherit_env=True) as py:
@@ -43,8 +43,8 @@ def test_snapshot_restores_on_the_second_start(
 ) -> None:
     """The bytes of the snapshot and of the compiled-module cache are intact (a Windows file in text mode would turn
     every newline byte into two): the second start restores the first one's memory and runs."""
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(tmp_path))
-    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(tmp_path))
+    monkeypatch.delenv("PYODIDE_NOJS_SNAPSHOT", raising=False)
     for restored in (False, True):
         with Pyodide(flavor, preload="import json\nvalue = 41") as py:
             assert py.run("print(value + 1)") == 0
@@ -58,8 +58,8 @@ def test_an_existing_cache_folder_keeps_its_mode(flavor: str, tmp_path: Path, mo
     cache = tmp_path / "shared"
     cache.mkdir(mode=0o755)
     cache.chmod(0o755)
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(cache))
-    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(cache))
+    monkeypatch.delenv("PYODIDE_NOJS_SNAPSHOT", raising=False)
     with Pyodide(flavor, preload="import json") as py:
         py.run("pass")
     assert cache.stat().st_mode & 0o777 == 0o755
@@ -70,8 +70,8 @@ def test_an_existing_cache_folder_keeps_its_mode(flavor: str, tmp_path: Path, mo
 @pytest.mark.skipif(not POSIX, reason="file modes")
 def test_snapshot_and_cache_are_private(flavor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cache = tmp_path / "cache"
-    monkeypatch.setenv("PYODIDE_WASMTIME_CACHE", str(cache))
-    monkeypatch.delenv("PYODIDE_WASMTIME_SNAPSHOT", raising=False)
+    monkeypatch.setenv("PYODIDE_NOJS_CACHE", str(cache))
+    monkeypatch.delenv("PYODIDE_NOJS_SNAPSHOT", raising=False)
     with Pyodide(flavor, preload="import json") as py:
         py.run("pass")
     assert cache.stat().st_mode & 0o777 == 0o700
@@ -147,7 +147,7 @@ def test_inherit_env_skips_what_is_not_utf8(monkeypatch: pytest.MonkeyPatch, cap
         pytest.skip("Windows has no undecodable variables")
     monkeypatch.setenv("WASMHOST_BAD", "\udcff")
     monkeypatch.setenv("WASMHOST_GOOD", "ok")
-    with caplog.at_level("WARNING", logger="pyodide_wasmtime"):
+    with caplog.at_level("WARNING", logger="pyodide_nojs"):
         env = dict(Pyodide(inherit_env=True)._wasi_env())
     assert env["WASMHOST_GOOD"] == "ok" and "WASMHOST_BAD" not in env
     assert "WASMHOST_BAD" in caplog.text
@@ -156,7 +156,7 @@ def test_inherit_env_skips_what_is_not_utf8(monkeypatch: pytest.MonkeyPatch, cap
 @pytest.mark.parametrize("opt", ["--env", "--mount"])
 def test_cli_option_without_an_equals_sign_is_a_usage_error(opt: str) -> None:
     r = subprocess.run(
-        [sys.executable, "-m", "pyodide_wasmtime", opt, "NOEQUALS", "-c", "pass"],
+        [sys.executable, "-m", "pyodide_nojs", opt, "NOEQUALS", "-c", "pass"],
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
@@ -178,7 +178,7 @@ def test_sys_executable_is_the_web_pyodides(guest: Guest) -> None:
     r = guest.run("import sys; print(sys.executable); print(sys._emscripten_info.runtime)")
     out = r.stdout.splitlines()
     assert r.returncode == 0 and out[0] == "/home/pyodide/this.program", r.stderr
-    assert out[1].startswith("pyodide-wasmtime"), out
+    assert out[1].startswith("pyodide-nojs"), out
 
 
 def test_run_returns_the_status_as_a_process_exit_would(flavor: str) -> None:

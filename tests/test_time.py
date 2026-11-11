@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import Guest, check_file
 
-from pyodide_wasmtime._host import Pyodide
+from pyodide_nojs._host import Pyodide
 
 ZONES = ["UTC", "Europe/Kyiv", "America/New_York", "Australia/Lord_Howe", "Asia/Kolkata"]
 
@@ -23,7 +23,7 @@ def run_in_zone(guest: Guest, script: str, tz: str, raw: bool = False) -> str:
     cmd = [
         sys.executable,
         "-m",
-        "pyodide_wasmtime",
+        "pyodide_nojs",
         "--flavor",
         guest.flavor,
         "-c",
@@ -98,7 +98,7 @@ def test_a_host_offset_that_is_not_one_is_the_error_code_not_a_crash() -> None:
 def test_an_absurd_tm_gmtoff_is_replaced_by_the_offset_from_the_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """Windows gives an absurd tm_gmtoff from 2**31 on (CI: 2147483648 was OSError 28): the offset is then the local
     fields taken as UTC minus the instant."""
-    from pyodide_wasmtime import _host
+    from pyodide_nojs import _host
 
     def localtime(t: int) -> time.struct_time:
         lt = time.gmtime(t + 7200)  # a zone two hours east
