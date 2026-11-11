@@ -74,11 +74,11 @@ Needs: node, npm, curl, git, cmake and ninja (for `wasm-opt.wasm`), perl and mak
 uv run pytest -m "not network and not suite"     # offline: the interpreter, the shape of the wasm, numpy, openssl: both builds
 uv run pytest -m network                         # PyPI and jsDelivr: the host's fetch, the guest's TLS, micropip, numpy's wheel
 uv run pytest -m suite                           # Pyodide's official CPython test suite (python_tests.yaml, libregrtest), both builds
-PYODIDE_SUITE_FLAVORS=fused PYODIDE_SUITE_SHARD=3/8 uv run pytest -m suite -k test_json      # a part
+PYODIDE_SUITE_FLAVORS=fused PYODIDE_SUITE_SHARD=3/8 uv run pytest -n auto -m suite -k test_json      # a part (-n: pytest-xdist)
 ```
 The suite runs one guest process per test module, as Pyodide's `test_cpython_core` does: `xfail` entries are reported as xfail (`PYODIDE_SUITE_RUN_XFAIL=1` runs them),
 `skip` globs are passed on. Not included: the tests of the JavaScript API and `@run_in_pyodide`, which need a browser or Node.
-CI (`tests.yml`): the offline tests on Linux, Windows and macOS (Python 3.10 and 3.15), the network checks, and the suite in 8 shards per build.
+CI (`tests.yml`): the offline tests on Linux, Windows and macOS (Python 3.10 and 3.15), the network checks, and the suite (one job per build, the modules spread over the cores by pytest-xdist).
 
 ## Licenses
 MIT for this repository. The wheel carries binaries under their own licenses: Pyodide (MPL-2.0, with CPython's PSF license and Emscripten's/musl's MIT), Binaryen (Apache-2.0) and wasi-sdk's libraries: see [licenses/NOTICE](licenses/NOTICE).

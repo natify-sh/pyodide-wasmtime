@@ -38,7 +38,7 @@ implementation, investigation or measurement is done by a subagent with a fresh 
 | **orchestrator** (main session) | **the strongest available** | — | pick the next step, write briefs, verify, fix small mistakes, keep the docs true, ask the maintainer |
 | implementer | **Sonnet** | `implementer` | one scoped step: the host, a loader or net operation, a build script, tests, a CI job |
 | reviewer | **Opus** | `reviewer` | an independent read of a high-stakes diff (the adapter, the loader, exception conversion, sockets and TLS, the build pins) with a fresh context and without the implementer's conclusions |
-| runner | **Haiku** | `runner` | read CI logs and report which jobs and shards failed and why, summarise the junit files of the suite, run a build or a benchmark, mechanical edits |
+| runner | **Haiku** | `runner` | read CI logs and report which jobs failed and why, summarise the junit files of the suite, run a build or a benchmark, mechanical edits |
 
 ### A step, from start to end
 
@@ -47,7 +47,7 @@ implementation, investigation or measurement is done by a subagent with a fresh 
 3. **Do** (subagent): works only inside the brief's scope; if the step needs more than the scope or the budget, **stops and reports**.
 4. **Report** (subagent): files changed, the commands run and their output, what is left, questions. No claim without the command that shows it.
 5. **Verify** (orchestrator): read the diff against the brief (inside the scope? under the budget? no new dependency, nothing for later, no unrelated edits?); run `uv run ruff check . && uv run ruff format --check .` and
-   `uv run pyright`; check the docs (README, BRIEF, `licenses/NOTICE`). The offline tests and the official suite are run by CI (and locally for a part: `PYODIDE_SUITE_SHARD`, `-k`); push the branch and read the jobs of
+   `uv run pyright`; check the docs (README, BRIEF, `licenses/NOTICE`). The offline tests and the official suite are run by CI (and locally for a part: `-n auto`, `PYODIDE_SUITE_SHARD`, `-k`); push the branch and read the jobs of
    Build wasm, Tests and Pre-commit. For the adapter, the loader, sockets and TLS a `reviewer` reads the diff with no access to the implementer's reasoning.
 6. **Fix** (orchestrator): a small mistake (about 20 lines, obvious) in the main session; anything larger goes back to a subagent with a precise list; a second failure on the same point goes to the maintainer.
 7. **Close**: one commit per step (what and why), `git fetch` and `git pull --ff-only` first, push, and **look at CI**. A red CI is fixed at once, not left. A step is done when it is implemented, tested
@@ -92,8 +92,8 @@ sh tools/build_data.sh work                                # the wasm of the pac
 sh tools/prepare_testenv.sh work                           # numpy, micropip, openssl, the real _ssl, the `test` wheel -> work/testenv
 uv run pytest -m "not network and not suite"               # offline, both packagings
 uv run pytest -m network                                   # PyPI and jsDelivr
-uv run pytest -m suite                                     # Pyodide's official CPython suite, both packagings (long; PYODIDE_SUITE_SHARD=I/N, PYODIDE_SUITE_FLAVORS=fused)
+uv run pytest -m suite                                     # Pyodide's official CPython suite, both packagings (long; -n auto spreads it over the cores; PYODIDE_SUITE_SHARD=I/N, PYODIDE_SUITE_FLAVORS=fused)
 uv run python -m pyodide_wasmtime [--flavor fused|dynamic] -c "print(1 + 1)"
 uv build --wheel                                           # the wheel carries data/
 ```
-CI: `build.yml` (wasm-opt.wasm cached, data, testenv), `tests.yml` (offline on Linux/Windows/macOS, network, the suite in 8 shards per packaging), `pre-commit.yml`, `publish.yml` (wheel only: the wasm is built, not committed).
+CI: `build.yml` (wasm-opt.wasm cached, data, testenv), `tests.yml` (offline on Linux/Windows/macOS, network, the suite in one job per packaging, spread over the cores by pytest-xdist), `pre-commit.yml`, `publish.yml` (wheel only: the wasm is built, not committed).

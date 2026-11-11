@@ -58,6 +58,7 @@ dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.6",
     "prompt_toolkit>=3.0",
     "ruff>=0.17.3",
     "wasmtime>=50.0.1",

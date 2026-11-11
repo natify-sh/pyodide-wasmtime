@@ -3,7 +3,7 @@ name: Tests
 # build.yml builds the wasm once (wasi-sdk 34's clang for everything; Node only as a build tool), then:
 #   test     the offline tests on every OS and CPython oldest/newest, both builds (fused and dynamic) in each test
 #   network  the checks that go to PyPI and jsDelivr (the host's fetch, the guest's own TLS, micropip, numpy's wheel)
-#   suite    Pyodide's official CPython test suite (python_tests.yaml, libregrtest) on BOTH builds, in 8 shards each
+#   suite    Pyodide's official CPython test suite (python_tests.yaml, libregrtest) on BOTH builds, one job per build, spread over the cores by xdist
 # A missing build fails a test on CI instead of skipping it (CI=true).
 
 on:
@@ -62,7 +62,7 @@ jobs:
         run: uv sync --locked
 
       - name: pytest (offline)
-        run: uv run --locked pytest -v -m "not network and not suite"
+        run: uv run --locked pytest -v -n auto -m "not network and not suite"
 
   network:
     name: network checks
@@ -94,14 +94,14 @@ jobs:
         run: uv run --locked pytest -v -m network
 
   suite:
-    name: Pyodide suite / ${{ matrix.flavor }} ${{ matrix.shard }}/8
+    name: Pyodide suite / ${{ matrix.flavor }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         flavor: [fused, dynamic]
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -127,14 +127,14 @@ jobs:
       - name: Pyodide's CPython test suite
         env:
           PYODIDE_SUITE_FLAVORS: ${{ matrix.flavor }}
-          PYODIDE_SUITE_SHARD: ${{ matrix.shard }}/8
+        # one job per build, the modules spread over the runner's cores by xdist (a module is one guest process)
         run: >-
-          uv run --locked --group suite pytest -v -m suite
-          --junit-xml=suite-${{ matrix.flavor }}-${{ matrix.shard }}.xml
+          uv run --locked --group suite pytest -v -n auto -m suite
+          --junit-xml=suite-${{ matrix.flavor }}.xml
 
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
-          name: suite-${{ matrix.flavor }}-${{ matrix.shard }}
+          name: suite-${{ matrix.flavor }}
           path: suite-*.xml
           retention-days: 14

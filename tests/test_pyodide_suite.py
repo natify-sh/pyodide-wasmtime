@@ -7,7 +7,7 @@ runs no tests is a skip. Not here: the tests of the JavaScript API and `@run_in_
 
     uv run pytest -m suite                                    # all, both builds (about an hour on 4 cores)
     uv run pytest -m suite -k "fused and (test_abc or test_json)"
-    PYODIDE_SUITE_SHARD=2/8 uv run pytest -m suite            # a part of it (CI runs 8 shards per build)
+    PYODIDE_SUITE_SHARD=2/8 uv run pytest -m suite            # a part of it (CI runs one job per build with -n auto)
     PYODIDE_SUITE_FLAVORS=fused uv run pytest -m suite
 """
 
