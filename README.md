@@ -4,7 +4,7 @@ pyodide-nojs runs Pyodide's CPython, and its wheels, on [Wasmtime](https://githu
 **Alpha:** the API and the wasm in the package change without notice; one Pyodide build is supported (below).
 
 ```sh
-pip install 'pyodide-nojs[wasmtime]'
+pip install './pyodide_nojs-<ver>-py3-none-any.whl[wasmtime]'     # the wheel is attached to the GitHub releases
 pyodide-nojs -c "import sys; print(sys.version, sys.platform)"      # 3.15.0rc1 ... emscripten
 pyodide-nojs script.py arg1 arg2
 pyodide-nojs                                                        # a REPL on a terminal; the script on stdin otherwise

@@ -96,4 +96,4 @@ uv run pytest -m suite                                     # Pyodide's official 
 uv run python -m pyodide_nojs [--flavor fused|dynamic] -c "print(1 + 1)"
 uv build --wheel                                           # the wheel carries data/
 ```
-CI: `build.yml` (wasm-opt.wasm cached, data, testenv), `tests.yml` (offline on Linux/Windows/macOS, network, the suite in one job per packaging, spread over the cores by pytest-xdist), `pre-commit.yml`, `publish.yml` (wheel only: the wasm is built, not committed).
+CI: `build.yml` (wasm-opt.wasm cached, data, testenv), `tests.yml` (offline on Linux/Windows/macOS, network, the suite in one job per packaging, spread over the cores by pytest-xdist), `pre-commit.yml`, `publish.yml` (on a tag: builds the wheel and attaches it to the GitHub release; PyPI publishing is commented out while this is an alpha; wheel only: the wasm is built, not committed).
