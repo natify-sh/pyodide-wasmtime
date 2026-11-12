@@ -779,7 +779,8 @@ def test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_n
 import socket
 p, q = os.pipe()
 s = socket.socket()
-f = os.open(base + "/f", os.O_RDONLY)
+# O_RDWR: a host that sets times through the handle (Windows) needs write access for utime(fd)
+f = os.open(base + "/f", os.O_RDWR)
 c = os.open(base + "/f", os.O_RDONLY); os.close(c)
 calls = {
     "open": lambda d: os.close(os.open("x", os.O_RDONLY, dir_fd=d)),
