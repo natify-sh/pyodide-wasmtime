@@ -9,6 +9,7 @@ import os
 import platform
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,7 @@ def host_link(base: Path, link: str) -> str:
         return f"host ERR {x}"
 
 
-def test_windows_symlink_diagnostic(guest: Guest, capsys: pytest.CaptureFixture[str]) -> None:
+def test_windows_symlink_diagnostic(guest: Guest) -> None:
     from importlib.metadata import version
 
     lines = [f"## symlink diag [{guest.flavor}] {platform.platform()} wasmtime {version('wasmtime')}"]
@@ -92,8 +93,7 @@ def test_windows_symlink_diagnostic(guest: Guest, capsys: pytest.CaptureFixture[
         if p.returncode:
             lines.append("guest stderr: " + p.stderr[-800:].replace("\n", " | "))
     text = "\n".join(lines)
-    with capsys.disabled():  # the CI log shows it even though the test passes
-        print("\n" + text, flush=True)
+    warnings.warn("symlink diagnostic:\n" + text, stacklevel=1)  # xdist forwards warnings into the CI log, not stdout
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
