@@ -269,6 +269,9 @@ EXPORT("getprotobyname") u32 getprotobyname_(const char *name) {
 EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
     if (!vobj(fd)) return -EBADF;
     i32 *argp = va ? *(i32 **)va : 0;  // va points at the variable arguments; the first is the argument's address
+    if (is_dev(fd) && (vobj(fd)->dev == VN_TTY || vobj(fd)->dev == VN_TTY1) &&
+        ((op >= 0x5401 && op <= 0x5404) || op == 0x5413 || op == 0x5414 || op == 0x540F || op == 0x5410))
+        return tty_ioctl(vobj(fd)->dev, op, (u8 *)argp);
     if (is_pipe(fd) && (op == 0x541B || op == 0x5421)) {  // PIPEFS: FIONREAD is the bytes buffered, its other ioctls EINVAL
         if (op == 0x5421) return -28;
         if (!argp) return -21;
@@ -324,6 +327,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     for (i32 k = 0; k < n; k++) empty &= !iov[2 * k + 1];
     if (empty && fd_std(fd)) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
     if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
+    if (is_dev(fd)) return dev_read(vobj(fd), iov, n, nread);
     if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread);
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
@@ -343,6 +347,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
 WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     if (is_pipe(fd)) return pipe_write(vobj(fd), iov, n, nw);
+    if (is_dev(fd)) return dev_write(vobj(fd), iov, n, nw);
     if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_write(rfd(fd), iov, n, nw) : file_iov(1, rfd(fd), iov, n, 0, nw);
     if (would_block(fd, 0, 4)) return EAGAIN_;
     i32 tot = 0;
@@ -369,7 +374,7 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
         buf[0] = 4;  // as Pyodide's: a regular file, no flags, no rights
         return 0;
     }
-    buf[0] = 6;  // SOCKET_STREAM
+    buf[0] = is_dev(fd) ? dev_wasi_type(vobj(fd)) : 6;  // a virtual node's type, else SOCKET_STREAM
     *(u64 *)(buf + 8) = (1ull << 30) - 1, *(u64 *)(buf + 16) = (1ull << 30) - 1;
     return 0;
 }
@@ -378,15 +383,17 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
 WASI("fd_sync") i32 w_fd_sync(i32 fd);
 EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
+    if (is_dev(fd) && vobj(fd)->dev == VN_NULL) return dev_read(vobj(fd), (const u32 *)iov, n, nread);  // (the others have no offset)
     return is_virt(fd) ? FE_SPIPE : file_iov(2, rfd(fd), (const u32 *)iov, n, off, nread);
 }
 EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;
+    if (is_dev(fd) && vobj(fd)->dev == VN_NULL) return dev_write(vobj(fd), (const u32 *)iov, n, nw);
     return is_virt(fd) ? FE_SPIPE : file_iov(3, rfd(fd), (const u32 *)iov, n, off, nw);
 }
 EXPORT("fd_sync") i32 x_fd_sync(i32 fd) {
     if (is_pipe(fd)) return FE_INVAL;
-    if (is_sock(fd)) return 0;
+    if (is_sock(fd) || is_dev(fd)) return 0;
     i32 ft = fd_type(fd);  // a standard stream and a directory have nothing to sync: success, as Pyodide
     return ft < 0 ? -ft : fd_std(fd) || ft == 3 ? 0 : w_fd_sync(rfd(fd));
 }

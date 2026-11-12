@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import shutil
 import struct
 import sys
@@ -92,7 +93,7 @@ class Pyodide:
 
     ``site``: a folder (or several) copied into the guest's ``site-packages`` (a wheel unpacked, ``micropip``...);
     ``mounts``: ``{guest path: host folder}`` preopened as they are (the guest can write there);
-    ``preopen_dev``: the host's ``/dev`` (OpenSSL reads ``/dev/urandom``); ``env``: more environment variables.
+    ``env``: more environment variables.
     The guest is isolated: its environment is Pyodide's minimal one (``BASE_ENV``) plus ``env``, never the host's,
     unless ``inherit_env`` passes the host's variables too, secrets included (``env`` wins; no snapshot then).
     The guest's ``/`` is a temporary folder (stdlib zip, site-packages); it is not a sandbox against the host's own
@@ -112,7 +113,6 @@ class Pyodide:
         *,
         site: str | os.PathLike[str] | list[str | os.PathLike[str]] | None = None,
         mounts: dict[str, str | os.PathLike[str]] | None = None,
-        preopen_dev: bool | None = None,
         env: dict[str, str] | None = None,
         inherit_env: bool = False,
         data: str | os.PathLike[str] | None = None,
@@ -149,11 +149,16 @@ class Pyodide:
         self.flavor = flavor
         self.site = [site] if isinstance(site, (str, os.PathLike)) else list(site or [])
         self.mounts = {k: str(v) for k, v in (mounts or {}).items()}
+        for guest in self.mounts:
+            at = posixpath.normpath("/" + guest.lstrip("/"))
+            if at in ("/dev", "/proc") or at.startswith(("/dev/", "/proc/")):
+                raise ValueError(
+                    f"mount {guest!r}: /dev and /proc are the adapter's own (virtual) and can not be mounted over"
+                )
         for what, folders in (("site", self.site), ("mount", self.mounts.values())):
             for f in folders:
                 if not os.path.isdir(f):
                     raise FileNotFoundError(f"{what} folder not found: {f}{TESTENV_HINT}")
-        self.preopen_dev = bool(os.environ.get("PREOPEN_DEV")) if preopen_dev is None else preopen_dev
         self.env = dict(env or {})
         self.inherit_env = inherit_env
         self.preload = preload
@@ -751,12 +756,10 @@ class Pyodide:
     # ------------------------------------------------------------------ the host's view of the files
     def _preopen_dir(self, pfd: int) -> str | None:
         """The host folder of a preopen, named by its WASI descriptor (3 + its place in the order they are opened here:
-        the guest's root, the mounts, /dev). The guest never gives the host a path: the adapter has proved that the
+        the guest's root, the mounts). The guest never gives the host a path: the adapter has proved that the
         guest's path exists through WASI and names only the preopen it belongs to."""
         assert self.root is not None
         dirs = [str(self.root), *self.mounts.values()]
-        if self.preopen_dev:
-            dirs.append("/dev")
         return dirs[pfd - 3] if 3 <= pfd < 3 + len(dirs) else None
 
     def _fs_statvfs(self, pfd: int, buf: int) -> int:
@@ -865,10 +868,6 @@ class Pyodide:
         wasi.preopen_dir(str(self.root), "/")
         for guest, host in self.mounts.items():
             wasi.preopen_dir(host, guest)
-        if self.preopen_dev:  # the entropy device OpenSSL reads (/dev/urandom)
-            if not os.path.isdir("/dev"):
-                raise FileNotFoundError("preopen_dev: the host has no /dev (a POSIX host has the entropy device)")
-            wasi.preopen_dir("/dev", "/dev")
         wasi.inherit_stdin()
         wasi.inherit_stdout()
         wasi.inherit_stderr()
@@ -922,6 +921,7 @@ class Pyodide:
                 "malloc",
                 "calloc",
                 "free",
+                "getentropy",
                 "emscripten_builtin_memalign",
                 "_emscripten_find_dylib",
             }
@@ -974,7 +974,14 @@ class Pyodide:
             al.define(store, "env", "__stack_pointer", self.guest.ex["__stack_pointer"])
             al.define(store, "env", "__memory_base", wt.Global(store, wt.GlobalType(I32, False), wt.Val.i32(0)))
             al.define(store, "env", "__table_base", wt.Global(store, wt.GlobalType(I32, False), wt.Val.i32(0)))
-            for f in ("malloc", "calloc", "free", "emscripten_builtin_memalign", "_emscripten_find_dylib"):
+            for f in (
+                "malloc",
+                "calloc",
+                "free",
+                "getentropy",
+                "emscripten_builtin_memalign",
+                "_emscripten_find_dylib",
+            ):
                 al.define(store, "env", f, self.guest.ex[f])
             al.define(store, "aux", "table_grow", tramp["table_grow"])
             define_ops(al)
@@ -1068,7 +1075,6 @@ class Pyodide:
                     if (f := self.data / "pyodide-lock.json").exists()
                     else None,
                     self._wasi_env(),
-                    self.preopen_dev,
                     [isatty(fd) for fd in (0, 1, 2)],  # the guest decides buffering at init
                     # the time module read the host's zone at init (tzname, timezone, daylight, as _tzset_js gives them)
                     [time.localtime().tm_year, *_timecalc.year_minutes(time.localtime().tm_year)],
@@ -1166,7 +1172,6 @@ class Pyodide:
         snapshot does not hold: dlopen, table slots, closures, signals, open fds, the cwd, files."""
         fresh = Pyodide(
             self.flavor,
-            preopen_dev=self.preopen_dev,
             env=self.env,
             inherit_env=self.inherit_env,
             data=self.data,

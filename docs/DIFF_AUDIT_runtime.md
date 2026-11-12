@@ -102,8 +102,8 @@ The audit's entries `_gmtime_js`, `_timegm_js`, `_localtime_js`, `_tzset_js`, `e
 ## 5. Host-dependent
 
 * `sys.argv`: ours is the file's path (the CLI runs a file), Pyodide's is `['']`.
-* `/dev/null` and the other devices are absent without `--dev` (`open('/dev/null')` is ENOENT in ours; Pyodide has them): the
-  files area. The probes avoid it.
+* `/dev/null` and the other devices were absent in ours (ENOENT; Pyodide has them) when this was measured; the adapter serves
+  them now (BACKLOG W2, `tests/test_dev.py`), and the `--dev` flag of that time is gone.
 * `os.cpu_count()`, `sched_getaffinity`, `getloadavg`, `SC_NPROCESSORS_*`, `SC_PHYS_PAGES`: compared as names only in
   `runtime_info.py`; their values are equal on both sides in this run (the answers are fixed in the adapter/libc, not read
   from the host).

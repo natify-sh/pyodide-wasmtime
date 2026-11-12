@@ -7,6 +7,7 @@
 #include "cwd.h"
 #include "metadata.h"
 #include "vfd.h"
+#include "dev.h"
 
 // ---- the open files: the absolute guest path and the open flags of each file opened by openat live in its object (vfd.h): the
 // paths that ".." and fstatfs need, and mmap's reopen.
@@ -251,8 +252,18 @@ static void put_stat(u8 *dst, const u8 *fs) {
     *(u64 *)(dst + 88) = ino;
 }
 
+// the filestat of a descriptor's object, for /proc/self/fd/N followed: a file's from WASI, a virtual node's synthesized, a pipe's
+// and a socket's those of the link (they have no filestat of their own)
+static i32 fd_fs(i32 fd, u64 *fs) {
+    Obj *o = vobj(fd);
+    if (o && o->kind == K_FILE) return w_fd_filestat_get(o->w, fs);
+    vfs(o && o->kind == K_DEV ? o->dev : VN_FDLINK, fd, fs);
+    return 0;
+}
+i32 sc_fstat64(i32 fd, void *buf);
+
 // the WASI filestat of dirfd + path: an empty path is ENOENT (only AT_EMPTY_PATH allows it); -> an errno or 0
-static i32 fx_lookup(i32 dirfd, const char *path, i32 follow, u64 *fs) {
+static i32 fx_real(i32 dirfd, const char *path, i32 follow, u64 *fs) {
     if (!path[0]) return FE_NOENT;
     i32 nd = notdir(dirfd, path);
     if (nd) return nd;
@@ -261,12 +272,28 @@ static i32 fx_lookup(i32 dirfd, const char *path, i32 follow, u64 *fs) {
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
     return w_path_filestat_get(fd, follow ? 1 : 0, p, n, fs);
 }
+// a virtual node's filestat (the target's for a followed /proc/self/fd/N), or the answer of fx_real
+static i32 fx_lookup(i32 dirfd, const char *path, i32 follow, u64 *fs) {
+    Vn v;
+    i32 vk = vnode(dirfd, path, &v);
+    if (!vk) return fx_real(dirfd, path, follow, fs);
+    if (vk == 2) return v.err;
+    if (v.id == VN_FDLINK && (follow || v.slash)) return fd_fs(v.n, fs);
+    vfs(v.id, v.n, fs);
+    return 0;
+}
 
 static i32 stat_path(i32 dirfd, const char *path, void *buf, i32 follow) {
     u64 fs[8];
-    i32 e = fx_lookup(dirfd, path, follow, fs);
+    Vn v;
+    i32 vk = vnode(dirfd, path, &v), e;
+    if (vk == 1 && v.id == VN_FDLINK && (follow || v.slash)) return sc_fstat64(v.n, buf);
+    if (vk == 2) e = v.err;
+    else if (vk) vfs(v.id, v.n, fs), e = 0;
+    else e = fx_real(dirfd, path, follow, fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
+    if (vk) vpatch((u8 *)buf, v.id);
     return 0;
 }
 
@@ -471,6 +498,9 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
 EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
     i32 fd = fd_new(0);  // the number first, as a kernel does: a full table fails before a file is made
     if (fd < 0) return fd;
+    Vn v;
+    i32 vk = vnode(dirfd, path, &v);
+    if (vk) return dev_open(fd, vk, &v, flags);  // under /dev or /proc: never the host
     i32 w = open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);  // the WASI descriptor, never the guest's number
     if (w < 0) return w;
     Obj *o = (Obj *)calloc(1, sizeof(Obj));
@@ -505,6 +535,11 @@ EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
         *(u32 *)((u8 *)buf + 4) = 010600;
         return 0;
     }
+    if (dev_fs(fd, fs)) {  // a virtual node
+        put_stat((u8 *)buf, (const u8 *)fs);
+        vpatch((u8 *)buf, vobj(fd)->dev);
+        return 0;
+    }
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
@@ -523,6 +558,9 @@ EXPORT("__syscall_newfstatat") i32 sc_newfstatat(i32 dirfd, const char *path, vo
 }
 
 EXPORT("__syscall_readlinkat") i32 sc_readlinkat(i32 dirfd, const char *path, char *buf, i32 len) {
+    Vn v;
+    i32 vk = vnode(dirfd, path, &v);
+    if (vk) return vk == 2 ? -v.err : v.id == VN_FDLINK ? fd_target(v.n, buf, len) : -FE_INVAL;  // the only links there
     i32 nd = notdir(dirfd, path);
     if (nd) return -nd;
     char dot[2];
@@ -617,11 +655,11 @@ static i32 snap_load(i32 fd, Snap *s) {
 EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
     Obj *o = vobj(fd);
     if (!o) return -EBADF;
-    if (o->kind != K_FILE) return -FE_NOTDIR;
+    if (o->kind == K_DEV ? !dev_isdir(o) : o->kind != K_FILE) return -FE_NOTDIR;
     Snap *s = snap_get(o);
     if (!s) return -ENOMEM;
     if (!s->loaded) {
-        i32 e = snap_load(o->w, s);
+        i32 e = o->kind == K_DEV ? dev_snap(o, s) : snap_load(o->w, s);
         if (e) return -e;
     }
     u64 idx = s->off / DIR_STEP;
@@ -657,6 +695,7 @@ WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
 static i32 fd_type(i32 fd) {
     Obj *o = vobj(fd);
     if (!o) return -FE_BADF;
+    if (o->kind == K_DEV) return dev_isdir(o) ? 3 : 2;
     if (o->kind != K_FILE) return 6;  // (a pipe is a stream too)
     u8 st[24] __attribute__((aligned(8)));
     i32 e = w_fd_fdstat_get(o->w, st);
@@ -678,6 +717,7 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
         case 3: {  // F_GETFL
             if (is_sock(fd)) return 2 | (sock_nb(fd) ? 04000 : 0);  // O_RDWR, O_NONBLOCK
             if (is_pipe(fd)) return (vobj(fd)->kind == K_PIPEW) | vobj(fd)->fl;  // O_WRONLY / O_RDONLY, and what F_SETFL set
+            if (vobj(fd)->kind == K_DEV) return (vobj(fd)->oflags & 03) | (vobj(fd)->fl & 02000) | (vobj(fd)->nb ? 04000 : 0);  // as opened, and F_SETFL's O_APPEND and O_NONBLOCK
             u8 st[24] __attribute__((aligned(8)));
             i32 e = w_fd_fdstat_get(rfd(fd), st);
             if (e) return -e;
@@ -699,6 +739,7 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
                 vobj(fd)->fl = (vobj(fd)->fl & ~289792) | (flags & 289792);
                 return 0;
             }
+            if (vobj(fd)->kind == K_DEV) vobj(fd)->fl = (vobj(fd)->fl & ~02000) | (flags & 02000);  // O_APPEND is kept
             if (nb_keeps(fd)) return nb_set(fd, flags & 04000);
             if (flags & 02000) ff |= 1;
             if (flags & 04000) ff |= 4;
@@ -729,16 +770,18 @@ EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
     if (off > (1ll << 53) || off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
     Obj *o = vobj(fd);
     if (!o) return FE_BADF;
-    if (o->kind != K_FILE) return FE_SPIPE;
+    i32 isdev = o->kind == K_DEV;
+    if (o->kind != K_FILE && !isdev) return FE_SPIPE;
     fd = o->w;
     if ((u32)whence > 2) {  // WASI's enum conversion would trap
         u8 st[24] __attribute__((aligned(8)));
-        return w_fd_fdstat_get(fd, st) ? FE_BADF : FE_INVAL;
+        return isdev || !w_fd_fdstat_get(fd, st) ? FE_INVAL : FE_BADF;
     }
-    i32 e = w_fd_seek(fd, off, whence, newoff);
+    if (isdev && o->dev == VN_NULL) return *newoff = 0;  // /dev/null seeks to 0, the other devices do not seek
+    i32 e = isdev ? (dev_isdir(o) ? FE_BADF : FE_SPIPE) : w_fd_seek(fd, off, whence, newoff);
     if (e != FE_BADF) return e;  // WASI refuses a directory descriptor (EBADF): that one is ours
     u8 st[24] __attribute__((aligned(8)));
-    if (w_fd_fdstat_get(fd, st) || st[0] != 3) return e;
+    if (!isdev && (w_fd_fdstat_get(fd, st) || st[0] != 3)) return e;
     Snap *s = snap_get(o);
     if (!s) return ENOMEM;
     i64 pos = whence == 1 ? (i64)s->off + off : off;  // SEEK_SET, SEEK_END (a directory has no size: as SET), SEEK_CUR

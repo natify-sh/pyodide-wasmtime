@@ -123,6 +123,7 @@ static void meta_del(u64 dev, u64 ino) {
 }
 static u32 def_mode(u8 ft) { return ft == 3 ? 0755 : ft == 7 || ft == 5 || ft == 6 ? 0777 : ft == 2 || ft == 1 ? 0666 : 0644; }
 static u32 def_for(const u8 *fs) {  // the mode of a file with no record: Pyodide's defaults (its root directory is 0777)
+    if (*(const u64 *)fs == VDEV) return *(const u32 *)(fs + 20);  // a virtual node (dev.h) carries its mode in the padding
     MetaT *t = mt();
     if (fs[16] == 3 && t->hasroot && *(const u64 *)fs == t->rdev && *(const u64 *)(fs + 8) == t->rino) return 0777;
     return def_mode(fs[16]);

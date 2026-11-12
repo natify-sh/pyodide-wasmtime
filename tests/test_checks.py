@@ -7,7 +7,6 @@ import hashlib
 import http.server
 import io
 import re
-import sys
 import threading
 import zipfile
 from pathlib import Path
@@ -36,9 +35,8 @@ def test_numpy(guest: Guest):
     assert "unresolved 0" not in p.stderr or True  # the loader's own log is not part of the contract
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="--dev preopens the host's /dev, which Windows does not have")
 def test_openssl_through_ctypes(guest: Guest):
-    exact(guest, "openssl_check.py", "site_ssl", "openssl_check.expected", "--dev")
+    exact(guest, "openssl_check.py", "site_ssl", "openssl_check.expected")
 
 
 NET = [
@@ -77,7 +75,7 @@ def test_net_through_the_hosts_fetch(guest: Guest):
 
 @pytest.mark.network
 def test_the_guests_own_tls(guest: Guest):
-    lines(guest, check_file("tls_check.py"), "site_tls", TLS, "--dev")
+    lines(guest, check_file("tls_check.py"), "site_tls", TLS)
 
 
 @pytest.mark.network
@@ -87,13 +85,12 @@ def test_micropip_over_the_guests_tls(guest: Guest):
         check_file("tls_micropip.py"),
         "site_tls",
         [r"^micropip over guest TLS: six \S+ \| requests\.get 200 micropip$"],
-        "--dev",
     )
 
 
 @pytest.mark.network
 def test_the_guest_refuses_a_certificate_with_no_ca(guest: Guest):
-    lines(guest, REFUSE, "site_tls", [r"^refused: "], "--dev")
+    lines(guest, REFUSE, "site_tls", [r"^refused: "])
 
 
 @pytest.mark.network

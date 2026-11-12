@@ -16,6 +16,7 @@ ALLOWED_ENV = {
     "malloc",
     "calloc",
     "free",
+    "getentropy",
     "emscripten_builtin_memalign",
     "_emscripten_find_dylib",
 }

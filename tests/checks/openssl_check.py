@@ -1,6 +1,5 @@
 # Pyodide's own OpenSSL (the shared library package libopenssl 1.1.1w of the lock) in the guest, through
-# ctypes and the adapter's loader. Needs the host's /dev preopened (PREOPEN_DEV=1): OpenSSL reads its
-# entropy from /dev/urandom. SITE_DIR/openssl/ holds the unpacked libopenssl-1.1.1w.zip.
+# ctypes and the adapter's loader. OpenSSL reads its entropy from /dev/urandom (the adapter's virtual one). SITE_DIR/openssl/ holds the unpacked libopenssl-1.1.1w.zip.
 import ctypes
 import hashlib
 import os

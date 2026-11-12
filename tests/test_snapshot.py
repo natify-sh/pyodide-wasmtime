@@ -130,9 +130,8 @@ def test_random_differs_between_restores(flavor, cache, capfd):
     assert len(seen) == 2
 
 
-def test_key_changes_with_stdlib_stamp_and_dev(flavor, cache, monkeypatch):
+def test_key_changes_with_stdlib_stamp(flavor, cache, monkeypatch):
     base = Pyodide(flavor, preload=PRE)._snapshot_path()
-    assert Pyodide(flavor, preload=PRE, preopen_dev=True)._snapshot_path() != base
     orig = engine.file_stamp
     monkeypatch.setattr(engine, "file_stamp", lambda p: orig(p) + (b"x" if p.name == "python_stdlib.zip" else b""))
     assert Pyodide(flavor, preload=PRE)._snapshot_path() != base

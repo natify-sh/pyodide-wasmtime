@@ -2,6 +2,8 @@
 > names scripts (`prepare.sh`, `run_tests.py`, `run_pyodide_adapter.py`...) that are now `tools/*.sh`, `tests/` and `src/pyodide_nojs/`;
 > see the README for the current state. The mechanics below are unchanged.
 
+> **Historical measurement:** measured when the host's `/dev` was mounted with `--dev`, since removed (the adapter serves a virtual `/dev`, BACKLOG W2).
+
 # Pyodide without JavaScript: the Emscripten glue as wasm (experiment, 2026-11-10)
 
 Not a goal and not part of wasmhost: an experiment of what is possible, by hand on Linux, **not in CI**.

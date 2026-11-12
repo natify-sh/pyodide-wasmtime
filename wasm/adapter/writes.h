@@ -11,6 +11,8 @@
 // ================================================================== writing files (what installing a wheel needs)
 
 EXPORT("__syscall_mkdirat") i32 sc_mkdirat(i32 dirfd, const char *path, i32 mode) {
+    i32 vd = vdeny(dirfd, path, 1);
+    if (vd) return -vd;
     i32 nd = notdir(dirfd, path);
     if (nd) return -nd;
     char dot[2];
@@ -27,6 +29,8 @@ EXPORT("__syscall_mkdirat") i32 sc_mkdirat(i32 dirfd, const char *path, i32 mode
 
 EXPORT("__syscall_unlinkat") i32 sc_unlinkat(i32 dirfd, const char *path, i32 flags) {
     if (flags && flags != 0x200) return -FE_INVAL;  // only AT_REMOVEDIR is a flag of unlinkat
+    i32 vd = vdeny(dirfd, path, 0);
+    if (vd) return -vd;
     i32 nd = notdir(dirfd, path);
     if (nd) return -nd;
     char dot[2];
@@ -47,6 +51,9 @@ EXPORT("__syscall_rmdir") i32 sc_rmdir(const char *path) { return sc_unlinkat(AT
 static void relink(i32 dirfd, const char *path);
 static void relink_tree(const char *abs, i32 depth);
 EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath) {
+    i32 vd = vdeny(olddirfd, oldpath, 0);
+    if (!vd) vd = vdeny(newdirfd, newpath, 1);
+    if (vd) return -vd;
     i32 nd = notdir(olddirfd, oldpath);
     if (!nd) nd = notdir(newdirfd, newpath);
     if (nd) return -nd;
@@ -88,6 +95,9 @@ EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
 }
 
 EXPORT("__syscall_truncate64") i32 sc_truncate64(const char *path, i64 len) {
+    Vn v;
+    i32 vk = vnode(AT_FDCWD, path, &v);
+    if (vk) return vk == 2 ? -v.err : v.id <= VN_SHM ? -FE_ISDIR : -FE_INVAL;  // a virtual node: as Pyodide's (EINVAL for a device)
     char dot[2];
     const char *p;
     i32 n, fd = resolve(AT_FDCWD, path, &p, &n, dot), out = -1;
@@ -179,6 +189,8 @@ done:
 }
 
 EXPORT("__syscall_symlinkat") i32 sc_symlinkat(const char *target, i32 newdirfd, const char *linkpath) {
+    i32 vd = vdeny(newdirfd, linkpath, 1);
+    if (vd) return -vd;
     i32 nd = notdir(newdirfd, linkpath);
     if (nd) return -nd;
     char dot[2];
@@ -298,6 +310,9 @@ EXPORT("__syscall_linkat") i32 sc_linkat(i32 olddirfd, const char *oldpath, i32 
     const char *p1, *p2;
     char *real = 0;
     if (flags & ~0x400) return -FE_INVAL;
+    i32 vd = vdeny(olddirfd, oldpath, 0);
+    if (!vd) vd = vdeny(newdirfd, newpath, 1);
+    if (vd) return -vd;
     i32 nd = notdir(olddirfd, oldpath);
     if (!nd) nd = notdir(newdirfd, newpath);
     if (nd) return -nd;
@@ -354,6 +369,9 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         }
     }
     if (path && path[0]) {
+        Vn v;
+        i32 vk = vnode(dirfd, path, &v);
+        if (vk) return vk == 2 ? -v.err : 0;  // a virtual node keeps no times: accepted (Pyodide's answer)
         i32 nd = notdir(dirfd, path);
         if (nd) return -nd;
         char dot[2];
@@ -391,6 +409,7 @@ EXPORT("__syscall_chmod") i32 sc_chmod(const char *path, i32 mode) {
 }
 EXPORT("__syscall_fchmod") i32 sc_fchmod(i32 fd, i32 mode) {
     u64 fs[8];
+    if (dev_fs(fd, fs)) return set_mode(fs, mode);  // a virtual node keeps it like a file
     if (is_virt(fd)) return 0;  // (a socket or a pipe has no mode here, and no WASI descriptor to ask)
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;

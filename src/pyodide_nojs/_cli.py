@@ -142,7 +142,6 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FILE",
         help="a python_stdlib.zip instead of the package's (implies --flavor dynamic; or $PYODIDE_NOJS_STDLIB)",
     )
-    ap.add_argument("--dev", action="store_true", help="give the guest the host's /dev (OpenSSL reads /dev/urandom)")
     ap.add_argument(
         "--allow-top-level-await",
         action="store_true",
@@ -193,7 +192,6 @@ def main(argv: list[str] | None = None) -> int:
         env=dict(e.split("=", 1) for e in ns.env),
         inherit_env=ns.inherit_env,
         data=ns.data,
-        preopen_dev=ns.dev or None,
         preload=preload,
         asm_wasm=ns.asm_wasm,
         stdlib=ns.stdlib,

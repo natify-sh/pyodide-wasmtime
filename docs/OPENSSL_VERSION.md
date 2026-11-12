@@ -4,6 +4,8 @@ Research report, 2026-11-11. No code of the repository was changed; everything m
 directory. Purpose: the argument for an upstream proposal to Pyodide when pyodide-nojs reaches alpha.
 Sources are URLs, files, or the command that produced the number; what could not be verified is in the last section.
 
+> **Historical measurement:** measured when the host's `/dev` was mounted with `--dev`, since removed (the adapter serves a virtual `/dev`, BACKLOG W2).
+
 ## Summary
 
 | route | effort | blocks | evidence |

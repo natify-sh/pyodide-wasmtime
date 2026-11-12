@@ -12,7 +12,8 @@
 // number stands for is an OBJECT (an open file description), shared by the numbers that dup() made of it, with a
 // reference count: a file or directory (K_FILE: the WASI descriptor that really holds it, `w`, which never changes while
 // the object lives; the file offset is its own, so it is shared; also its path, open flags and directory snapshot), a
-// socket (K_SOCK: the host's handle in `w`), the two ends of a pipe (K_PIPER, K_PIPEW). A number without an object is
+// socket (K_SOCK: the host's handle in `w`), the two ends of a pipe (K_PIPER, K_PIPEW), a node of the virtual /dev or /proc
+// (K_DEV: no WASI descriptor, w = -1, `dev` the node; dev.h). A number without an object is
 // free (EBADF). The standard streams are the objects of the numbers 0..2 from the table's creation (K_FILE, w = 0..2).
 // WASI descriptors that the adapter opens for itself (the preopens, a path walk, mmap's write-back) are no guest numbers
 // and are never in the table: a guest number can not name them.
@@ -25,6 +26,7 @@
 #define K_SOCK 2
 #define K_PIPER 3
 #define K_PIPEW 4
+#define K_DEV 5
 #define BKT 8192
 #define FE_AGAIN 6
 #define FE_FAULT 21
@@ -46,10 +48,11 @@ typedef struct {
     u8 nb;   // O_NONBLOCK of a socket, a standard stream or a directory (WASI can not hold it for the last two)
     u8 std;  // a standard stream (fstat says character device)
     u8 isdir;  // a file object: 0 not asked yet, 1 a directory, 2 no directory (the type of an open file never changes)
+    u8 dev;    // K_DEV: the node (VN_* of dev.h)
     Pipe *pipe;
     // K_FILE opened by openat: the absolute guest path and the open flags (what mmap's write-back opens again; the path is
-    // 0 when it could not be kept), and the snapshot of a directory's listing, read at its first getdents64 (lseek(fd, 0,
-    // SEEK_SET) drops it, the last unref frees it)
+    // 0 when it could not be kept; a K_DEV object always has its path), and the snapshot of a directory's listing, read at
+    // its first getdents64 (lseek(fd, 0, SEEK_SET) drops it, the last unref frees it)
     char *path;
     i32 oflags;
     Snap *snap;
@@ -58,6 +61,7 @@ typedef struct {
     Obj *o[MAXFD];
     u8 cloexec[MAXFD];  // FD_CLOEXEC, per number (not per object: a new number from dup() starts without it)
     u32 npipe;
+    u64 ts;  // when the table was made: the times of the virtual /dev (dev.h)
 } Vt;
 __asm__(".globaltype vt_state, i32\nvt_state:\n");
 static Vt *vt(void) {
@@ -66,6 +70,7 @@ static Vt *vt(void) {
     if (!r) {
         r = (Vt *)calloc(1, sizeof(Vt));
         if (r) {
+            w_clock_time_get(0, 1000, &r->ts);
             for (i32 k = 0; k < 3; k++) {  // the standard streams: the numbers 0..2 are their WASI descriptors
                 Obj *o = (Obj *)calloc(1, sizeof(Obj));
                 if (!o) continue;
@@ -79,6 +84,7 @@ static Vt *vt(void) {
 }
 static void meta_closing(const Obj *o);
 static void sock_close(i32 h);
+static i32 dev_isdir(const Obj *o);
 
 // the object of a number; 0 for a free number, a negative one, or one past the table (a guest-controlled value, up to 2^31)
 static Obj *vobj(i32 fd) {
@@ -93,7 +99,11 @@ static i32 is_pipe(i32 fd) {
     Obj *o = vobj(fd);
     return o && (o->kind == K_PIPER || o->kind == K_PIPEW);
 }
-static i32 is_virt(i32 fd) {  // not a file: a socket or a pipe end
+static i32 is_dev(i32 fd) {  // a node of the virtual /dev or /proc
+    Obj *o = vobj(fd);
+    return o && o->kind == K_DEV;
+}
+static i32 is_virt(i32 fd) {  // not a file: a socket, a pipe end or a virtual node
     Obj *o = vobj(fd);
     return o && o->kind != K_FILE;
 }
@@ -117,7 +127,7 @@ static i32 fd_std(i32 fd) {
 static i32 nb_keeps(i32 fd) {
     u8 st[24] __attribute__((aligned(8)));
     Obj *o = vobj(fd);
-    return o && o->kind == K_FILE && (o->std || (!w_fd_fdstat_get(o->w, st) && st[0] == 3));
+    return o && (o->kind == K_DEV || (o->kind == K_FILE && (o->std || (!w_fd_fdstat_get(o->w, st) && st[0] == 3))));
 }
 // ENOTDIR for a relative path under a dirfd that is an open object but no directory (a pipe, a socket, a file, a standard
 // stream; Linux), else 0: a free number stays EBADF (WASI), and an absolute path has no use for the directory
@@ -125,6 +135,7 @@ static i32 notdir(i32 dirfd, const char *path) {
     u8 st[24] __attribute__((aligned(8)));
     Obj *o = path[0] == '/' ? 0 : vobj(dirfd);
     if (!o) return 0;
+    if (o->kind == K_DEV && dev_isdir(o)) return 0;
     if (o->kind == K_FILE && !o->std) {
         if (!o->isdir) o->isdir = !w_fd_fdstat_get(o->w, st) && st[0] == 3 ? 1 : 2;  // one host call per object
         if (o->isdir == 1) return 0;
@@ -178,6 +189,9 @@ static i32 obj_unref(Obj *o) {
         e = w_fd_close(o->w);
     } else if (o->kind == K_SOCK) {
         sock_close(o->w);
+    } else if (o->kind == K_DEV) {
+        if (o->snap) snap_free(o->snap);
+        free(o->path);
     } else {
         Pipe *p = o->pipe;
         if (o->kind == K_PIPER) p->ropen = 0, pipe_drop(p);

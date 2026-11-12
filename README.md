@@ -9,7 +9,7 @@ pyodide-nojs -c "import sys; print(sys.version, sys.platform)"      # 3.15.0rc1 
 pyodide-nojs script.py arg1 arg2
 pyodide-nojs                                                        # a REPL on a terminal; the script on stdin otherwise
 ```
-Command line flags (`pyodide-nojs -h` has the rest): `--flavor fused|dynamic`, `--site DIR` (a folder copied into the guest's site-packages), `--mount GUEST=HOST`, `--mount-cwd`, `--env K=V`, `--inherit-env`, `--dev` (the host's `/dev`, which OpenSSL reads), `--allow-top-level-await` (in the REPL), `--asm-wasm FILE` / `--stdlib FILE` / `--data DIR` (other wasm files than the package's), `-v` (log the loader and the network).
+Command line flags (`pyodide-nojs -h` has the rest): `--flavor fused|dynamic`, `--site DIR` (a folder copied into the guest's site-packages), `--mount GUEST=HOST`, `--mount-cwd`, `--env K=V`, `--inherit-env`, `--allow-top-level-await` (in the REPL), `--asm-wasm FILE` / `--stdlib FILE` / `--data DIR` (other wasm files than the package's), `-v` (log the loader and the network).
 
 ```python
 from pyodide_nojs import Pyodide
@@ -20,7 +20,7 @@ with Pyodide() as py:  # the fused build; Pyodide("dynamic") for the other
 ```
 
 `Pyodide(preload=CODE)` runs CODE once at start and keeps the guest's memory afterwards as a snapshot in the cache dir
-(one file of ~30 MB per packaging, keyed by the preload, the wasm files, the environment, `preopen_dev` and whether
+(one file of ~30 MB per packaging, keyed by the preload, the wasm files, the environment and whether
 stdin/stdout/stderr are terminals); the next start restores it instead of booting Python, so `Pyodide(preload=P).run("pass")`
 takes ~0.2 s instead of ~2 s when P imports `asyncio`. The preload must only import and compute: it must not print (it prints at snapshot time only), and opening files or sockets, `chdir`, writing files, `dlopen` or `ctypes` symbol lookups make the snapshot be skipped (a normal start, the preload run once); with `site=`, `mounts=` or `inherit_env=True` there is none (a snapshot is a file in the cache folder, mode 0600 in a 0700 folder, and the host's variables, secrets included, must not get into it: the preload runs once, a normal start). Variables given with `env=` DO go into a snapshot: a secret in `env=` together with `preload=` is in the cache file. The snapshot is frozen with its hash seed, so every restore shares one `PYTHONHASHSEED` (`random` is re-seeded).
 `PYODIDE_NOJS_SNAPSHOT=0` turns it off. Without `preload` nothing changes. The REPL uses it.

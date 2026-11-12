@@ -199,8 +199,8 @@ def test_read_of_zero_bytes_does_not_wait_for_stdin(guest: Guest) -> None:
 
 def test_preopen_descriptors_are_not_the_guests(guest: Guest) -> None:
     """Files N3: close(3) closed the guest's root, so every later open failed; fstat/dup/read/write/seek on the numbers
-    the preopens have in WASI (3 and 4 with --dev) must be EBADF, as for any free number: the guest's numbers have
-    nothing to do with WASI's (tests/test_descriptors.py has the numbering)."""
+    the preopens have in WASI (3, the root) and a free number (4) must be EBADF, as for any free number: the guest's
+    numbers have nothing to do with WASI's (tests/test_descriptors.py has the numbering)."""
     code = """
 import os, errno
 def c(n, f):
@@ -222,8 +222,7 @@ for fd in (3, 4):
     c('fcntl', lambda: __import__('fcntl').fcntl(fd, 1))
 print(os.listdir('/') != [], os.path.exists('/lib'), os.close(os.open('/tmp', 0)) is None)
 """
-    # descriptor 4 is a preopen only with --dev (the root is 3), and Windows has no /dev to give: there only 3 is one
-    r = guest.run(code.replace("(3, 4)", "(3,)"), None) if sys.platform == "win32" else guest.run(code, None, "--dev")
+    r = guest.run(code, None)
     assert r.returncode == 0, r.stderr
     lines = r.stdout.splitlines()
     assert lines[-1] == "True True True"

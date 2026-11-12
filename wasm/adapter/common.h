@@ -85,6 +85,7 @@ LOADER("cpuclock") i32 host_cpuclock(i32 id, i32 res, u64 *out);  // the host's 
 #define ERANGE 68
 #define EBADF 8
 #define ENOMEM 48
+#define VDEV 0x7de0000000000001ull  // the st_dev of the filestat of a virtual /dev or /proc node (dev.h): no host file has it
 #define MAXFD 4096  // the guest's descriptor numbers are 0..MAXFD-1 (Pyodide's MAX_OPEN_FDS is 4096 too)
 // errno values of this ABI (WASI's numbering), for the file functions
 #define FE_ACCES 2

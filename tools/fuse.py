@@ -123,6 +123,7 @@ def main(pyodide_wasm, adapter_wasm, out):
             "malloc",
             "calloc",
             "free",
+            "getentropy",
             "emscripten_builtin_memalign",
             "_emscripten_find_dylib",
         )

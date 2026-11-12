@@ -12,7 +12,7 @@ first-line marker `# prelude: NAME` (_prelude_NAME.py): `files_*` -> files (case
 `# standalone`), `io_*`/`loader_*`/`mmap_*` -> io (the fresh directory B, case(id, fn), and the side modules of _sides.py written to
 B/so/), `runtime_*` -> none. `--isolate`, or a line `# isolate` at the top of an io probe, runs every case of it in a fresh interpreter
 (3 targets x N cases, 60 s each, --jobs at a time; a case that dies is `id | CRASH`): for cases that leave state in the loader or kill
-the guest. --keep DIR keeps the raw outputs in DIR. --ours-arg=ARG passes ARG to pyodide_nojs (e.g. --ours-arg=--dev).
+the guest. --keep DIR keeps the raw outputs in DIR. --ours-arg=ARG passes ARG to pyodide_nojs (e.g. --ours-arg=--mount-cwd).
 
 A probe is a Python file that prints one line per case: `case-id | result` (`ERR errno-name` for an OSError).
 A file may hold several programs, each run in a fresh interpreter: a line `# --- name` starts a program

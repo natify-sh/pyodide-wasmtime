@@ -5,6 +5,8 @@ report are new. Machine: Linux, 4 shared cores, wasmtime-py 50.0.1, Node 22; our
 (`tools/build_data.sh`), the baseline is `pyo-build/dl/dist` (Pyodide 315.0.0a2 on Node). Every number below is from the
 runs of these probes; the raw outputs are not committed (`--keep DIR` writes them).
 
+> **Historical measurement:** measured when the host's `/dev` was mounted with `--dev`, since removed (the adapter serves a virtual `/dev`, BACKLOG W2).
+
 ## 1. The harness
 
 ```
