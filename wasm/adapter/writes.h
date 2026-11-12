@@ -11,6 +11,8 @@
 // ================================================================== writing files (what installing a wheel needs)
 
 EXPORT("__syscall_mkdirat") i32 sc_mkdirat(i32 dirfd, const char *path, i32 mode) {
+    i32 nd = notdir(dirfd, path);
+    if (nd) return -nd;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
@@ -25,6 +27,8 @@ EXPORT("__syscall_mkdirat") i32 sc_mkdirat(i32 dirfd, const char *path, i32 mode
 
 EXPORT("__syscall_unlinkat") i32 sc_unlinkat(i32 dirfd, const char *path, i32 flags) {
     if (flags && flags != 0x200) return -FE_INVAL;  // only AT_REMOVEDIR is a flag of unlinkat
+    i32 nd = notdir(dirfd, path);
+    if (nd) return -nd;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
@@ -43,6 +47,9 @@ EXPORT("__syscall_rmdir") i32 sc_rmdir(const char *path) { return sc_unlinkat(AT
 static void relink(i32 dirfd, const char *path);
 static void relink_tree(const char *abs, i32 depth);
 EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath) {
+    i32 nd = notdir(olddirfd, oldpath);
+    if (!nd) nd = notdir(newdirfd, newpath);
+    if (nd) return -nd;
     char d1[2], d2[2];
     const char *p1, *p2;
     i32 n1, n2, f1 = resolve(olddirfd, oldpath, &p1, &n1, d1), f2 = resolve(newdirfd, newpath, &p2, &n2, d2);
@@ -172,6 +179,8 @@ done:
 }
 
 EXPORT("__syscall_symlinkat") i32 sc_symlinkat(const char *target, i32 newdirfd, const char *linkpath) {
+    i32 nd = notdir(newdirfd, linkpath);
+    if (nd) return -nd;
     char dot[2];
     const char *p;
     i32 n, fd, err = 0;
@@ -289,6 +298,9 @@ EXPORT("__syscall_linkat") i32 sc_linkat(i32 olddirfd, const char *oldpath, i32 
     const char *p1, *p2;
     char *real = 0;
     if (flags & ~0x400) return -FE_INVAL;
+    i32 nd = notdir(olddirfd, oldpath);
+    if (!nd) nd = notdir(newdirfd, newpath);
+    if (nd) return -nd;
     if (flags & 0x400) {  // AT_SYMLINK_FOLLOW: wasmtime refuses it, so the link is followed here and the file linked
         char *abs = absdup(olddirfd, oldpath);
         if (!abs) return -FE_BADF;
@@ -342,6 +354,8 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         }
     }
     if (path && path[0]) {
+        i32 nd = notdir(dirfd, path);
+        if (nd) return -nd;
         char dot[2];
         const char *p;
         i32 n, fd = resolve(dirfd, path, &p, &n, dot);
@@ -356,6 +370,8 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         i32 n, fd = resolve(AT_FDCWD, dot, &p, &n, dot);
         e = w_path_set_times(fd, 1, p, n, tv[0], tv[1], ff);
     } else {
+        Obj *o = vobj(dirfd);
+        if (o && (o->kind != K_FILE || o->std)) return 0;  // a pipe, a socket, a standard stream: Pyodide's answer
         e = w_fd_set_times(rfd(dirfd), tv[0], tv[1], ff);
     }
     return e ? -e : 0;

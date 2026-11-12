@@ -254,6 +254,8 @@ static void put_stat(u8 *dst, const u8 *fs) {
 // the WASI filestat of dirfd + path: an empty path is ENOENT (only AT_EMPTY_PATH allows it); -> an errno or 0
 static i32 fx_lookup(i32 dirfd, const char *path, i32 follow, u64 *fs) {
     if (!path[0]) return FE_NOENT;
+    i32 nd = notdir(dirfd, path);
+    if (nd) return nd;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
@@ -425,6 +427,8 @@ EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
 // Opens a file: the WASI descriptor, or -errno. It is no guest number (sc_openat makes one); the callers that open for themselves
 // (mmap) close it with w_fd_close. nocheck: mmap opens the same file again (from its path record), which no permission can forbid
 static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck) {
+    i32 nd = notdir(dirfd, path);
+    if (nd) return -nd;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
@@ -519,6 +523,8 @@ EXPORT("__syscall_newfstatat") i32 sc_newfstatat(i32 dirfd, const char *path, vo
 }
 
 EXPORT("__syscall_readlinkat") i32 sc_readlinkat(i32 dirfd, const char *path, char *buf, i32 len) {
+    i32 nd = notdir(dirfd, path);
+    if (nd) return -nd;
     char dot[2];
     const char *p;
     i32 n, used = 0, fd = resolve(dirfd, path, &p, &n, dot);

@@ -2038,7 +2038,7 @@
   "gaps": [
    "WASI timestamps are unsigned nanoseconds since 1970 (u64): a time before 1970 or after the year 2554 is EINVAL, where Pyodide's JavaScript Date accepts it (os.utime(f, (-5, 10)) and (2**40, 10))."
   ],
-  "evidence": "adapter.c sc_utimensat: path_filestat_set_times / fd_filestat_set_times (a null or empty path is the descriptor, futimens), UTIME_NOW and UTIME_OMIT per time, AT_SYMLINK_NOFOLLOW, ENOENT for a missing path, EINVAL for a bad nanosecond. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match for ordinary times. (CPython's os.utime here goes through utimes(), so a time set from Python has microsecond precision.)",
+  "evidence": "adapter.c sc_utimensat: path_filestat_set_times / fd_filestat_set_times (a null or empty path is the descriptor, futimens), UTIME_NOW and UTIME_OMIT per time, AT_SYMLINK_NOFOLLOW, ENOENT for a missing path, EINVAL for a bad nanosecond, ENOTDIR for a relative path under a dirfd that is an open non-directory (a pipe, a socket, a file, a standard stream), 0 for the descriptor itself when it is a pipe, a socket or a standard stream (Pyodide: None). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match for ordinary times. (CPython's os.utime here goes through utimes(), so a time set from Python has microsecond precision.)",
   "tested": "tests/test_files.py::test_utimensat_sets_the_times"
  },
  {

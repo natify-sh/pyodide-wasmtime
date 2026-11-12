@@ -118,6 +118,14 @@ static i32 nb_keeps(i32 fd) {
     Obj *o = vobj(fd);
     return o && o->kind == K_FILE && (o->std || (!w_fd_fdstat_get(o->w, st) && st[0] == 3));
 }
+// ENOTDIR for a relative path under a dirfd that is an open object but no directory (a pipe, a socket, a file, a standard
+// stream; Linux), else 0: a free number stays EBADF (WASI), and an absolute path has no use for the directory
+static i32 notdir(i32 dirfd, const char *path) {
+    u8 st[24] __attribute__((aligned(8)));
+    Obj *o = path[0] == '/' ? 0 : vobj(dirfd);
+    if (!o) return 0;
+    return o->kind != K_FILE || o->std || (!w_fd_fdstat_get(o->w, st) && st[0] != 3) ? FE_NOTDIR : 0;
+}
 static i32 nb_set(i32 fd, i32 on) {  // 0 or -errno
     Obj *o = vobj(fd);
     if (!o) return -EBADF;

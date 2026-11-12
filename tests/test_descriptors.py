@@ -768,6 +768,47 @@ print("different:", bad)
     assert out == ["different: 0"]
 
 
+def test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf(guest: Guest) -> None:
+    """Linux: ENOTDIR for a relative path under a pipe, a socket, a file or a standard stream, in every *at call
+    (Pyodide says ENOENT for a pipe and a socket: the owner's decision is Linux); a closed number is
+    EBADF; an absolute path ignores the descriptor; utime on a pipe, a socket or a standard stream succeeds, as
+    Pyodide's does."""
+    out = run(
+        guest,
+        """
+import socket
+p, q = os.pipe()
+s = socket.socket()
+f = os.open(base + "/f", os.O_RDONLY)
+c = os.open(base + "/f", os.O_RDONLY); os.close(c)
+calls = {
+    "open": lambda d: os.close(os.open("x", os.O_RDONLY, dir_fd=d)),
+    "stat": lambda d: os.stat("x", dir_fd=d),
+    "readlink": lambda d: os.readlink("x", dir_fd=d),
+    "mkdir": lambda d: os.mkdir("nd", dir_fd=d),
+    "unlink": lambda d: os.unlink("x", dir_fd=d),
+    "rename": lambda d: os.rename("x", "y", src_dir_fd=d, dst_dir_fd=d),
+    "utime": lambda d: os.utime("x", None, dir_fd=d),
+}
+for name, fn in calls.items():
+    for who, d in (("pipe", p), ("sock", s.fileno()), ("file", f), ("stdin", 0), ("stdout", 1), ("closed", c)):
+        t(name + " " + who, lambda: fn(d))
+t("absolute", lambda: os.stat(base + "/f", dir_fd=p).st_size)
+for who, d in (("pipe", p), ("sock", s.fileno()), ("stdout", 1), ("file", f), ("closed", c)):
+    t("utime fd " + who, lambda: os.utime(d, None))
+""",
+    )
+    want = []
+    for name in ("open", "stat", "readlink", "mkdir", "unlink", "rename", "utime"):
+        for who in ("pipe", "sock", "file", "stdin", "stdout"):
+            want.append(f"{name} {who} 'OSError ENOTDIR'")
+        want.append(f"{name} closed 'OSError EBADF'")
+    want.append("absolute 10")
+    want += [f"utime fd {w} None" for w in ("pipe", "sock", "stdout", "file")]
+    want.append("utime fd closed 'OSError EBADF'")
+    assert out == want
+
+
 def test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back(guest: Guest) -> None:
     """Pyodide: after close(1) an open is 1 and it is a regular file (not a character device, no tty), writes to 1 go
     into it; dup2(saved, 1) makes 1 the stream again. dup2 onto a number of the same object keeps it, and the object
