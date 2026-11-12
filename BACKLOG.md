@@ -8,7 +8,7 @@ Order inside a section is not a priority; the order of work is at the end.
 
 | id | question | state |
 |---|---|---|
-| D1 | `emscripten_dlopen` callback: now a pending call of the interpreter (before the next statement); option C = at sleep/poll/end of `run()` | B kept, documented in BRIEF.md |
+| D1 | `emscripten_dlopen` callback: now a pending call of the interpreter (before the next statement); option C = at sleep/poll/end of `run()` | B kept, documented in BRIEF.md; confirmed by the owner after B5: leave as it is |
 | D2 | Pyodide's own pipe quirks we copy: unbounded buffer, no EPIPE for a write with no reader | copied; may change |
 | D3 | Which Pyodide bugs to mirror (trailing slash on a file works there, `umask` ignored, `chown` a no-op, `st_nlink` of an unlinked file, ms-rounded `utimensat`, `O_CREAT|O_EXCL` on a dangling symlink, libc `linkat` gives EMLINK) | after the files audit: recommendation is NOT to copy |
 | D4 | The guest's root: files on the host's disk (now) or an in-memory root ported from Pyodide's MEMFS (+ a host API to move files in and out, mounts as real host folders, maybe a lazy overlay) | PARKED (owner, 2026-11-11: no win seen for now): the root stays on the host's disk. Revisit if there is a real need: many Windows users, identical results without mounts, isolation from the disk. A scope study (docs/MEMFS_SCOPE.md when it arrives) records the cost: do not start the port without a new reason |
@@ -78,6 +78,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 
 * Unverified guesses to look at in the next CI logs: UDP `send` without a peer on Windows (WSAENOTCONN mapped to EDESTADDRREQ without a log), `_t_localtime` on Windows (fixed by the offset from the fields: green now), poll HUP after `shutdown` on Windows (the host adds it), the wasm stack 1 MiB and the NEEDED depth cap 800/1500 (Linux measured only), `chmod /tmp` at start on Windows.
 * Offline matrix: 6 jobs (3 OS x Python 3.10/3.15) plus the suite 2 and build 2 and network 1: fewer if the runners are the limit.
+* macOS CI flake: `test_a_non_blocking_send_never_waits` (send with MSG_DONTWAIT on a full AF_UNIX socketpair is not always EAGAIN on macOS); it passed on rerun.
 
 ## 8. Work: loader, ffi, time, misc
 
@@ -92,6 +93,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 * Branch `claude/wasip2-component` (experiment): Python, files, TCP, DNS under `wasmtime run`; needs `net_pollv` in `wasm/net_p2.c` before any merge, and everything the p1 side got since (real `setsockopt`, non-blocking, bind/listen/accept, Emscripten errno numbers, UDP).
 * Bundle mode (BRIEF "Direction"): a CLI that bakes the wheels in (`dlopen` answered inside the module by a registry), try `wasm-tools component link --dl-openable`; `wasm-tools-package` as an optional bundler dependency.
 * HTTPS in a component: the guest's own TLS (`_ssl` bundled), the CA bundle (baked in = frozen at build time, or a preopen), `wasi:random` for OpenSSL, `wasi:clocks` for certificate dates (the host-side time operations of this branch must move), size. `wasi:http` was left out ("for now"; some hosts give only `wasi:http`).
+* After B5 (the descriptor table), the two things left out on purpose, if a real need shows up: `F_DUPFD` with a minimum of 4096 or more (Pyodide accepts any; here EINVAL; it needs a sparse table for the numbers above 4095) and the last number 4096 (`MAXFD` 4097; Pyodide's `open` reaches it). Also decided to stay as they are (owner): a program that ends with the table full fails in the wrapper, `os.set_inheritable` is a no-op, a pipe or a socket that finds no room takes nothing (Pyodide's `pipe()` leaks the number).
 * Theory only: a Rust host (fast ffi, threads, a thread-safe interrupt, but a platform wheel and a rewrite) and a host compiled to a component with wasmtime's Pulley interpreter (not tried).
 * `fusedwasi` cannot be used on component hosts; it could fix part of the suite on p1 (statfs is missing there).
 
