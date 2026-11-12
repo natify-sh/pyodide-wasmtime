@@ -29,6 +29,10 @@ VARIANTS = [
     ("dir-sub-rel", "d", "sub/ld2", True),
     ("dir-sub-up", "../d", "sub/ld3", True),
     ("dir-abs", "/mnt/h/d", "ld4", True),
+    # the target exists in one place only: from the link's directory it is dangling (only_root) or found (only_sub);
+    # resolved from the root it is the other way round
+    ("sub-to-root-only", "only_root", "sub/l7", False),
+    ("sub-to-sub-only", "only_sub", "sub/l8", False),
 ]
 
 GUEST = """
@@ -84,6 +88,8 @@ def test_windows_symlink_diagnostic(guest: Guest) -> None:
         (base / "d").mkdir()
         (base / "f").write_bytes(b"x")
         (base / "sub" / "f").write_bytes(b"x")
+        (base / "only_root").write_bytes(b"x")
+        (base / "sub" / "only_sub").write_bytes(b"x")
         p = guest.run(GUEST.replace("{variants!r}", repr([v[:3] for v in VARIANTS])), None, "--mount", f"/mnt/h={base}")
         lines.append(f"guest returncode={p.returncode}")
         lines += [
