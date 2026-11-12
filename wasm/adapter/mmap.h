@@ -12,21 +12,19 @@
 // pwrite on msync and munmap. A private mapping never writes back. The copy is not live: a write(2) to the file
 // after the mmap is not seen through it (and the other way round, until msync). Anonymous mappings are the libc's.
 // The write-back is the whole mapping, which extends a truncated file (as MEMFS does).
-// A shared writable mapping keeps a descriptor of its own (a dup, as POSIX lets the mapping outlive the descriptor
-// it was made from; the glue looks the descriptor up again at msync and munmap and fails with EBADF when it was closed:
-// a deliberate difference, decided by the owner).
+// A shared writable mapping keeps a reference to the file's object (as POSIX lets the mapping outlive the descriptor it was
+// made from; the glue looks the descriptor up again at msync and munmap and fails with EBADF when it was closed: a deliberate
+// difference, decided by the owner). The reference is no number: the guest can close and reuse its numbers freely.
 WASI("fd_pread") i32 w_fd_pread(i32 fd, const void *iovs, i32 n, u64 offset, i32 *nread);
 WASI("fd_pwrite") i32 w_fd_pwrite(i32 fd, const void *iovs, i32 n, u64 offset, i32 *nwritten);
 void *emscripten_builtin_memalign(u32 align, u32 size);
-i32 x_fd_fdstat_get(i32 fd, u8 *buf);
-i32 x_fd_close(i32 fd);
 #define PROT_WRITE 2
 #define MAP_PRIVATE 2
 #define MM_CHUNK (8u << 20)
 
 typedef struct {
     u32 addr;
-    i32 fd;  // the mapping's own descriptor, -1 when it could not be made (the caller's is used then)
+    Obj *o;  // the file's object, one reference of the mapping's own (obj_unref at munmap), for a shared writable mapping
 } Map;
 __asm__(".globaltype map_state, i32\nmap_state:\n");
 static Vec *maps(void) {
@@ -50,20 +48,24 @@ static Map *map_find(u32 addr, i32 forget) {
 }
 
 // the descriptor's file type check of the glue: EBADF, then ENODEV for anything but a regular file
-static i32 mm_file(i32 fd, u64 *rights) {
+static i32 mm_file(const Obj *o, u64 *rights) {
     u8 st[24] __attribute__((aligned(8)));
-    i32 e = x_fd_fdstat_get(fd, st);
+    if (!o) return -EBADF;
+    if (o->kind != K_FILE) return -43;  // ENODEV
+    i32 e = w_fd_fdstat_get(o->w, st);
     if (e) return -e;
     if (rights) *rights = *(u64 *)(st + 8);
     return st[0] == 4 ? 0 : -43;  // ENODEV
 }
 
 EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset, i32 *allocated, u32 *addr) {
-    u64 rights = 0;
     u8 st[24] __attribute__((aligned(8)));
-    i32 e = x_fd_fdstat_get(fd, st);
+    Obj *ob = vobj(fd);
+    if (!ob) return -EBADF;
+    if (ob->kind != K_FILE) return -43;  // ENODEV: a socket or a pipe
+    i32 e = w_fd_fdstat_get(ob->w, st);
     if (e) return -e;  // EBADF
-    rights = *(u64 *)(st + 8);
+    u64 rights = *(u64 *)(st + 8);
     i32 rd = (rights & (1ull << 1)) != 0, wr = (rights & (1ull << 6)) != 0;
     if ((prot & PROT_WRITE) && !(flags & MAP_PRIVATE) && !(rd && wr)) return -2;  // EACCES: shared + writable needs O_RDWR
     if (wr && !rd) return -2;                                                       // EACCES: O_WRONLY
@@ -90,14 +92,13 @@ EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset,
     if ((prot & PROT_WRITE) && !(flags & MAP_PRIVATE)) {
         Map *m = (Map *)malloc(sizeof(Map));
         Vec *M = maps();
-        if (m) m->addr = (u32)ptr, m->fd = sc_dup(fd);
+        if (m) m->addr = (u32)ptr, m->o = ob;
         if (!m || !M || !vec_push(M, m)) {
-            if (m && m->fd >= 0) x_fd_close(m->fd);
             free(m);
             free(ptr);
             return -48;  // ENOMEM
         }
-        if (m->fd < 0) m->fd = -1;
+        ob->ref++;
     }
     *allocated = 1, *addr = (u32)ptr;
     return 0;
@@ -105,11 +106,10 @@ EXPORT("_mmap_js") i32 mmap_js(u32 len, i32 prot, i32 flags, i32 fd, i64 offset,
 
 // the bytes of a mapping back to the file: the whole length, as MEMFS's msync writes it (a truncated file grows again).
 // A descriptor without write rights (a read-only shared mapping) is opened again for writing by its path.
-static i32 mm_write_back(u32 addr, u32 len, i32 fd, i64 offset, u64 rights) {
-    i32 wfd = rfd(fd), e = 0;
-    fd = wfd;
-    if (!(rights & (1ull << 6)) && fd < MAXFD && fds()->path[fd]) {
-        wfd = open_at(AT_FDCWD, fds()->path[fd], (fds()->flags[fd] & ~(3 | 0100 | 0200 | 01000)) | 2, 0, 1);
+static i32 mm_write_back(u32 addr, u32 len, const Obj *o, i64 offset, u64 rights) {
+    i32 wfd = o->w, e = 0;
+    if (!(rights & (1ull << 6)) && o->path) {
+        wfd = open_at(AT_FDCWD, o->path, (o->oflags & ~(3 | 0100 | 0200 | 01000)) | 2, 0, 1);
         if (wfd < 0) return wfd;
     }
     for (u32 done = 0; done < len && !e;) {
@@ -121,7 +121,7 @@ static i32 mm_write_back(u32 addr, u32 len, i32 fd, i64 offset, u64 rights) {
         else if (w == 0) e = -29;  // EIO
         else done += (u32)w;
     }
-    if (wfd != fd) x_fd_close(wfd);
+    if (wfd != o->w) w_fd_close(wfd);  // (the reopened one: ours, no guest number)
     return e;
 }
 
@@ -129,12 +129,12 @@ EXPORT("_msync_js") i32 msync_js(u32 addr, u32 len, i32 prot, i32 flags, i32 fd,
     (void)prot;  // the glue does not look at it either
     if (offset < 0) return -28;
     Map *m = map_find(addr, 0);
-    if (m && m->fd >= 0) fd = m->fd;
+    const Obj *o = m ? m->o : vobj(fd);  // the mapping's own reference, else the caller's number
     u64 rights = 0;
-    i32 e = mm_file(fd, &rights);
+    i32 e = mm_file(o, &rights);
     if (e) return e;
     if (flags & MAP_PRIVATE) return 0;  // the glue returns before it writes
-    return mm_write_back(addr, len, fd, offset, rights);
+    return mm_write_back(addr, len, o, offset, rights);
 }
 
 EXPORT("_munmap_js") i32 munmap_js(u32 addr, u32 len, i32 prot, i32 flags, i32 fd, i64 offset) {
@@ -142,7 +142,7 @@ EXPORT("_munmap_js") i32 munmap_js(u32 addr, u32 len, i32 prot, i32 flags, i32 f
     i32 e = msync_js(addr, len, prot, flags, fd, offset);
     Map *m = map_find(addr, 1);
     if (m) {
-        if (m->fd >= 0) x_fd_close(m->fd);
+        obj_unref(m->o);
         free(m);
     }
     return e;

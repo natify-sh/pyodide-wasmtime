@@ -72,11 +72,10 @@ EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, 
 }
 
 EXPORT("__syscall_ftruncate64") i32 sc_ftruncate64(i32 fd, i64 len) {
-    if (is_pre(fd)) return -FE_BADF;
     if (is_virt(fd)) return -FE_INVAL;
     i32 ft = fd_type(fd);  // a standard stream and a directory: EINVAL (a tty, a pipe; Pyodide)
     if (ft < 0) return ft;
-    if (fd_std(rfd(fd)) || ft == 3) return -FE_INVAL;
+    if (fd_std(fd) || ft == 3) return -FE_INVAL;
     i32 e = w_fd_set_size(rfd(fd), (u64)len);
     return e ? -e : 0;
 }
@@ -98,10 +97,10 @@ EXPORT("__syscall_fallocate") i32 sc_fallocate(i32 fd, i32 mode, i64 offset, i64
     if (mode != 0) return -FE_OPNOTSUPP;
     if (offset < 0 || len < 0) return -FE_INVAL;
     i32 ft = fd_type(fd);
-    fd = rfd(fd);
     if (ft < 0) return ft;
     if (!fd_seekable(fd, ft)) return -FE_SPIPE;
     u64 fs[8];
+    fd = rfd(fd);
     i32 e = w_fd_filestat_get(fd, fs);
     if (e) return -e;
     if ((u64)(offset + len) > fs[4]) {  // growing is a write: the recorded mode must allow it (Pyodide's ftruncate checks)
@@ -116,7 +115,7 @@ EXPORT("__syscall_fallocate") i32 sc_fallocate(i32 fd, i32 mode, i64 offset, i64
 EXPORT("__syscall_fdatasync") i32 sc_fdatasync(i32 fd) {
     i32 ft = fd_type(fd);
     if (ft < 0) return ft;
-    if (is_virt(fd) || fd_std(rfd(fd))) return 0;
+    if (is_virt(fd) || fd_std(fd)) return 0;
     i32 e = w_fd_datasync(rfd(fd));
     // EBADF here is the missing right of a read-only descriptor (a valid one, checked above): nothing to sync
     return e == 0 || e == FE_INVAL || e == FE_BADF || e == 58 /* ENOTSUP */ ? 0 : -e;
@@ -357,7 +356,7 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         i32 n, fd = resolve(AT_FDCWD, dot, &p, &n, dot);
         e = w_path_set_times(fd, 1, p, n, tv[0], tv[1], ff);
     } else {
-        e = is_pre(dirfd) ? FE_BADF : w_fd_set_times(rfd(dirfd), tv[0], tv[1], ff);
+        e = w_fd_set_times(rfd(dirfd), tv[0], tv[1], ff);
     }
     return e ? -e : 0;
 }
@@ -376,10 +375,10 @@ EXPORT("__syscall_chmod") i32 sc_chmod(const char *path, i32 mode) {
 }
 EXPORT("__syscall_fchmod") i32 sc_fchmod(i32 fd, i32 mode) {
     u64 fs[8];
-    if (is_pre(fd)) return -FE_BADF;
+    if (is_virt(fd)) return 0;  // (a socket or a pipe has no mode here, and no WASI descriptor to ask)
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
-    return is_virt(fd) ? 0 : set_mode(fs, mode);
+    return set_mode(fs, mode);
 }
 EXPORT("__syscall_fchmodat2") i32 sc_fchmodat2(i32 dirfd, const char *path, i32 mode, i32 flags) {
     u64 fs[8];

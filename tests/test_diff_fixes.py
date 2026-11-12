@@ -198,8 +198,9 @@ def test_read_of_zero_bytes_does_not_wait_for_stdin(guest: Guest) -> None:
 
 
 def test_preopen_descriptors_are_not_the_guests(guest: Guest) -> None:
-    """Files N3: close(3) closed the guest's root, so every later open failed; fstat/dup/read/write/seek on a preopen
-    number must be EBADF as for a free number (the numbering itself is a later step)."""
+    """Files N3: close(3) closed the guest's root, so every later open failed; fstat/dup/read/write/seek on the numbers
+    the preopens have in WASI (3 and 4 with --dev) must be EBADF, as for any free number: the guest's numbers have
+    nothing to do with WASI's (tests/test_descriptors.py has the numbering)."""
     code = """
 import os, errno
 def c(n, f):
@@ -217,7 +218,6 @@ for fd in (3, 4):
     c('ftruncate', lambda: os.ftruncate(fd, 0))
     c('fchdir', lambda: os.chdir(fd))
     c('listdir', lambda: os.listdir(fd))
-    c('dup2', lambda: os.dup2(0, fd))
     c('openat', lambda: os.open('x', os.O_RDONLY, dir_fd=fd))
     c('fcntl', lambda: __import__('fcntl').fcntl(fd, 1))
 print(os.listdir('/') != [], os.path.exists('/lib'), os.close(os.open('/tmp', 0)) is None)

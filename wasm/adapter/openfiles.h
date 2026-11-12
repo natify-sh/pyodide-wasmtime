@@ -8,54 +8,21 @@
 #include "metadata.h"
 #include "vfd.h"
 
-// ---- the open files: the absolute guest path and the open flags of each descriptor opened by openat (indexed by the
-// WASI descriptor that holds the file, see vfd.h): the paths that ".." and fstatfs need, and mmap's reopen.
-typedef struct {
-    char *path[MAXFD];
-    i32 flags[MAXFD];
-} Fds;
-__asm__(".globaltype fds_state, i32\nfds_state:\n");
-static Fds *fds(void) {
-    Fds *r;
-    __asm__ volatile("global.get fds_state\n\tlocal.set %0" : "=r"(r));
-    if (!r) {
-        r = (Fds *)calloc(1, sizeof(Fds));
-        __asm__ volatile("local.get %0\n\tglobal.set fds_state" : : "r"(r));
-    }
-    return r;
-}
-static const char *fd_base_path(i32 fd) {  // the path of a directory descriptor, including the preopens
-    fd = rfd(fd);
-    if (fd >= 0 && fd < MAXFD && fds()->path[fd]) return fds()->path[fd];
-    Pre *P = preopens();
-    for (i32 k = 0; k < P->n; k++)
-        if (P->fd[k] == fd) return P->name[k];
-    return 0;
+// ---- the open files: the absolute guest path and the open flags of each file opened by openat live in its object (vfd.h): the
+// paths that ".." and fstatfs need, and mmap's reopen.
+static const char *fd_base_path(i32 fd) {  // the path of a directory descriptor opened by openat (0: none known)
+    Obj *o = vobj(fd);
+    return o && o->kind == K_FILE ? o->path : 0;
 }
 static char *absdup(i32 dirfd, const char *path);
-static void fd_forget(i32 fd) {
-    snap_free(fd);  // the directory listing of the number, if it was read
-    if (fd >= 0 && fd < MAXFD && fds()->path[fd]) {
-        free(fds()->path[fd]);
-        fds()->path[fd] = 0;
-    }
-}
-// the WASI descriptor `from` is renumbered to `to` (vfd.h): its records follow it
-static void fd_move_meta(i32 from, i32 to) {
-    if (from < 0 || from >= MAXFD || to < 0 || to >= MAXFD) return;
-    fd_forget(to);
-    fds()->path[to] = fds()->path[from], fds()->flags[to] = fds()->flags[from];
-    fds()->path[from] = 0;
-    if (!snp(from > to ? from : to)) return;  // the table grows (and moves) here, not between the two pointers
-    Snap **a = snp(from), **b = snp(to);
-    if (a && b) *b = *a, *a = 0;  // (fd_forget(to) freed the target's)
-}
-// is a descriptor (other than `skip`) that this adapter opened still open on the file (dev, ino)?
-static i32 fd_open_inode(u64 dev, u64 ino, i32 skip) {
-    Fds *F = fds();
-    for (i32 k = 0; k < MAXFD; k++) {
+// is an object other than `skip`, opened by openat, still open on the file (dev, ino)? (An object that only a mmap holds, with
+// no number left, is not looked at: its record may go early, which can not give a later file a stale mode.)
+static i32 fd_open_inode(u64 dev, u64 ino, const Obj *skip) {
+    Vt *T = vt();
+    for (i32 k = 0; T && k < MAXFD; k++) {
+        const Obj *o = T->o[k];
         u64 fs[8];
-        if (k != skip && F->path[k] && !w_fd_filestat_get(k, fs) && fs[0] == dev && fs[1] == ino) return 1;
+        if (o && o != skip && o->kind == K_FILE && o->path && !w_fd_filestat_get(o->w, fs) && fs[0] == dev && fs[1] == ino) return 1;
     }
     return 0;
 }
@@ -64,18 +31,18 @@ static i32 fd_open_inode(u64 dev, u64 ino, i32 skip) {
 static void meta_release(u64 dev, u64 ino) {
     Meta *e = meta_find(dev, ino);
     if (!e) return;
-    if (fd_open_inode(dev, ino, -1)) {
+    if (fd_open_inode(dev, ino, 0)) {
         if (!e->orphan) e->orphan = 1, mt()->norphan++;
     } else {
         meta_del(dev, ino);
     }
 }
-// a descriptor is about to be closed: if it held an unlinked file, drop the record when it was the last one
-static void meta_closing(i32 fd) {
+// an object is about to be closed: if it held an unlinked file, drop the record when it was the last one
+static void meta_closing(const Obj *o) {
     u64 fs[8];
-    if (w_fd_filestat_get(fd, fs)) return;
+    if (w_fd_filestat_get(o->w, fs)) return;
     Meta *e = meta_find(fs[0], fs[1]);
-    if (e && e->orphan && !fd_open_inode(fs[0], fs[1], fd)) meta_del(fs[0], fs[1]);
+    if (e && e->orphan && !fd_open_inode(fs[0], fs[1], o)) meta_del(fs[0], fs[1]);
 }
 
 static i32 ncomp(const char *s) {  // the depth of an absolute path below the root
@@ -129,8 +96,8 @@ static i32 lead_dots_only(const char *s) {  // every ".." comes before the first
     }
     return 1;
 }
-static const char *fixpath(i32 dirfd, const char *path) {
-    dirfd = rfd(dirfd);
+static const char *fixpath(i32 gfd, const char *path) {  // gfd: a guest number, or AT_FDCWD
+    i32 dirfd = rfd(gfd);
     Cwd *C = cwdst();
     i32 rel = path[0] != '/';
     i32 dd = has_dotdot(path);
@@ -139,7 +106,7 @@ static const char *fixpath(i32 dirfd, const char *path) {
     if (byfd) {
         u64 fs[8], gs[8];
         if (!dd || w_path_filestat_get(dirfd, 0, path, slen(path), fs) != FE_PERM) return path;
-        base = fd_base_path(dirfd);
+        base = fd_base_path(gfd);
         char dot[2];
         const char *bp;
         i32 bn, bfd;
@@ -199,7 +166,7 @@ static const char *fixpath(i32 dirfd, const char *path) {
 // an absolute path (malloc'd, ".." resolved as above), or 0: the directory descriptor has no known path, or no memory
 static char *absdup(i32 dirfd, const char *path) {
     if (path[0] == '/') {
-        const char *f = fixpath(dirfd, path);
+        const char *f = fixpath(AT_FDCWD, path);  // (an absolute path has no use for the directory)
         return dupn(f, (u32)slen(f));
     }
     const char *base = dirfd == AT_FDCWD ? cwdst()->cwd : fd_base_path(dirfd);
@@ -219,13 +186,8 @@ static char *absdup(i32 dirfd, const char *path) {
 
 // A guest path and dirfd -> (WASI fd, path pointer, length). An empty result is ".". The cwd is kept by chdir (the root at first).
 static i32 resolve(i32 dirfd, const char *path, const char **out, i32 *len, char *dot) {
-    i32 fd = dirfd = rfd(dirfd);
-    if (path[0] != '/' && is_pre(dirfd)) {  // a preopen is no descriptor of the guest: WASI answers EBADF for -1
-        dot[0] = '.', dot[1] = 0;
-        *out = dot, *len = 1;
-        return -1;
-    }
-    path = fixpath(dirfd, path);
+    i32 gfd = dirfd, fd = dirfd = rfd(gfd);  // a number that is no directory of the guest is -1 for WASI: EBADF
+    path = fixpath(gfd, path);
     if (path[0] == '/' || dirfd == AT_FDCWD) {
         Pre *P = preopens();
         i32 best = -1, bl = -1;
@@ -455,14 +417,13 @@ EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
 }
 
 EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
-    if (is_pre(fd)) return -FE_BADF;
-    const char *p = fd_base_path(fd);  // a directory opened by openat, or a preopen
+    const char *p = fd_base_path(fd);  // a directory opened by openat
     if (p) return sc_chdir(p);
-    u8 st[24] __attribute__((aligned(8)));
-    return (is_virt(fd) || !w_fd_fdstat_get(rfd(fd), st)) ? -FE_NOTDIR : -FE_BADF;  // a stream: not a directory
+    return vobj(fd) ? -FE_NOTDIR : -FE_BADF;  // a stream, a file or a socket: not a directory
 }
 
-// nocheck: mmap opens the same file again (from its path record), which no permission can forbid
+// Opens a file: the WASI descriptor, or -errno. It is no guest number (sc_openat makes one); the callers that open for themselves
+// (mmap) close it with w_fd_close. nocheck: mmap opens the same file again (from its path record), which no permission can forbid
 static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck) {
     char dot[2];
     const char *p;
@@ -499,22 +460,25 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
         u64 fs[8];
         if (!w_fd_filestat_get(out, fs)) meta_created((const u8 *)fs, mode, 07777);
     }
-    snap_free(out);  // a new descriptor lists its directory from the start
-    if (out >= 0 && out < MAXFD) {
-        fd_forget(out);
-        char *copy = absdup(dirfd, path);  // the path mmap opens again, of any length
-        if (copy) {
-            fds()->path[out] = copy;
-            fds()->flags[out] = flags;
-        }
-    }
     return out;
 }
 
 // the mode of O_CREAT is the variable argument (va points at it)
 EXPORT("__syscall_openat") i32 sc_openat(i32 dirfd, const char *path, i32 flags, i32 va) {
-    i32 fd = open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);
-    if (fd >= 0) cloexec_set(fd, flags & 02000000);  // O_CLOEXEC: kept per number, as POSIX does (there is no exec)
+    i32 fd = fd_new(0);  // the number first, as a kernel does: a full table fails before a file is made
+    if (fd < 0) return fd;
+    i32 w = open_at(dirfd, path, flags, va ? *(const u32 *)va : 0, 0);  // the WASI descriptor, never the guest's number
+    if (w < 0) return w;
+    Obj *o = (Obj *)calloc(1, sizeof(Obj));
+    if (!o) {
+        w_fd_close(w);
+        return -ENOMEM;
+    }
+    o->kind = K_FILE, o->ref = 1, o->w = w, o->oflags = flags;
+    o->path = absdup(dirfd, path);  // the path mmap opens again, of any length (0: not kept)
+    Vt *T = vt();                   // (not 0: fd_new made it)
+    T->o[fd] = o;
+    T->cloexec[fd] = (flags & 02000000) != 0;  // O_CLOEXEC: kept per number, as POSIX does (there is no exec)
     return fd;
 }
 
@@ -523,7 +487,6 @@ EXPORT("__syscall_lstat64") i32 sc_lstat64(const char *path, void *buf) { return
 
 EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
     u64 fs[8];
-    if (is_pre(fd)) return -FE_BADF;
     if (is_sock(fd)) {  // a socket: S_IFSOCK
         for (i32 i = 0; i < 8; i++) fs[i] = 0;
         put_stat((u8 *)buf, (const u8 *)fs);
@@ -538,8 +501,7 @@ EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
         *(u32 *)((u8 *)buf + 4) = 010600;
         return 0;
     }
-    fd = rfd(fd);
-    i32 e = w_fd_filestat_get(fd, fs);
+    i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
     if (fd_std(fd)) *(u32 *)((u8 *)buf + 4) = 0020666;  // the standard streams are character devices (Pyodide's fstat(1))
@@ -591,10 +553,9 @@ EXPORT("__syscall_faccessat") i32 sc_faccessat(i32 dirfd, const char *path, i32 
 // are not seen, and a big directory is not asked from WASI again for every few entries (wasmtime lists the host directory
 // from the start at every fd_readdir call). lseek(fd, 0, SEEK_SET) (rewinddir) drops it, so the next read sees the
 // directory as it is then.
-static Snap *snap_get(i32 fd) {
-    Snap **sp = snp(fd);
-    if (sp && !*sp) *sp = (Snap *)calloc(1, sizeof(Snap));
-    return sp ? *sp : 0;
+static Snap *snap_get(Obj *o) {  // the object's snapshot (made empty if it has none; 0 without memory)
+    if (!o->snap) o->snap = (Snap *)calloc(1, sizeof(Snap));
+    return o->snap;
 }
 static void snap_drop(Snap *s) {
     if (s->buf) free(s->buf);
@@ -648,13 +609,13 @@ static i32 snap_load(i32 fd, Snap *s) {
 // {d_ino u64, d_off i64, d_reclen u16, d_type u8, name\0, padded to 8}. The position is the index of the next entry times
 // DIR_STEP and d_off the one after the entry (the glue's numbers: what lseek(fd, 0, SEEK_CUR) says on a directory).
 EXPORT("__syscall_getdents64") i32 sc_getdents64(i32 fd, u8 *dirp, i32 count) {
-    if (fd < 0 || is_pre(fd)) return -EBADF;
-    if (is_virt(fd)) return -FE_NOTDIR;
-    fd = rfd(fd);
-    Snap *s = snap_get(fd);
+    Obj *o = vobj(fd);
+    if (!o) return -EBADF;
+    if (o->kind != K_FILE) return -FE_NOTDIR;
+    Snap *s = snap_get(o);
     if (!s) return -ENOMEM;
     if (!s->loaded) {
-        i32 e = snap_load(fd, s);
+        i32 e = snap_load(o->w, s);
         if (e) return -e;
     }
     u64 idx = s->off / DIR_STEP;
@@ -688,14 +649,15 @@ WASI("fd_fdstat_set_flags") i32 w_fd_fdstat_set_flags(i32 fd, i32 flags);
 
 // the WASI filetype of an open descriptor (a socket is a stream socket), or -errno (EBADF)
 static i32 fd_type(i32 fd) {
-    if (is_pre(fd)) return -FE_BADF;
-    if (is_virt(fd)) return 6;  // (a pipe is a stream too)
+    Obj *o = vobj(fd);
+    if (!o) return -FE_BADF;
+    if (o->kind != K_FILE) return 6;  // (a pipe is a stream too)
     u8 st[24] __attribute__((aligned(8)));
-    i32 e = w_fd_fdstat_get(rfd(fd), st);
+    i32 e = w_fd_fdstat_get(o->w, st);
     return e ? -e : st[0];
 }
 // can the descriptor seek? The standard streams, sockets and character devices can not (Pyodide: stream.seekable)
-static i32 fd_seekable(i32 fd, i32 ft) { return !fd_std(rfd(fd)) && ft != 2 && ft != 5 && ft != 6; }
+static i32 fd_seekable(i32 fd, i32 ft) { return !fd_std(fd) && ft != 2 && ft != 5 && ft != 6; }
 
 // fcntl: the flags are WASI's fdflags (append, nonblock) and rights; an invalid descriptor is EBADF for every command (as
 // Pyodide's getStreamFromFD). The lock commands of this ABI are F_GETLK 12, F_SETLK 13, F_SETLKW 14: there is one process,
@@ -759,9 +721,10 @@ EXPORT("__syscall_fcntl64") i32 sc_fcntl64(i32 fd, i32 cmd, i32 va) {
 // again, seekdir/telldir use the d_off of the entries, getdents64 continues from it); the others go to WASI. Sockets can not seek.
 EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
     if (off > (1ll << 53) || off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
-    if (is_pre(fd)) return FE_BADF;
-    if (is_virt(fd)) return FE_SPIPE;
-    fd = rfd(fd);
+    Obj *o = vobj(fd);
+    if (!o) return FE_BADF;
+    if (o->kind != K_FILE) return FE_SPIPE;
+    fd = o->w;
     if ((u32)whence > 2) {  // WASI's enum conversion would trap
         u8 st[24] __attribute__((aligned(8)));
         return w_fd_fdstat_get(fd, st) ? FE_BADF : FE_INVAL;
@@ -770,7 +733,7 @@ EXPORT("fd_seek") i32 x_fd_seek(i32 fd, i64 off, i32 whence, u64 *newoff) {
     if (e != FE_BADF) return e;  // WASI refuses a directory descriptor (EBADF): that one is ours
     u8 st[24] __attribute__((aligned(8)));
     if (w_fd_fdstat_get(fd, st) || st[0] != 3) return e;
-    Snap *s = snap_get(fd);
+    Snap *s = snap_get(o);
     if (!s) return ENOMEM;
     i64 pos = whence == 1 ? (i64)s->off + off : off;  // SEEK_SET, SEEK_END (a directory has no size: as SET), SEEK_CUR
     if (whence < 0 || whence > 2 || pos < 0) return FE_INVAL;

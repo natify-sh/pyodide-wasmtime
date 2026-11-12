@@ -431,7 +431,7 @@ print("closed")
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot rename a file that a mapping keeps open")
 def test_mmap_keeps_working_after_the_descriptor_is_closed(guest: Guest) -> None:
-    """mmap holds a duplicate of the descriptor: the same file, not a re-opening by name (Pyodide: EBADF at flush)."""
+    """mmap holds a reference to the open file (not a number, not a re-opening by name; Pyodide: EBADF at flush)."""
     out = run(
         guest,
         """
@@ -485,8 +485,8 @@ print(r(lambda: os.fsync(99)), r(lambda: os.ftruncate(99, 0)), r(lambda: os.set_
 
 def test_a_program_that_closes_1_or_2_ends_without_a_shutdown_error(guest: Guest) -> None:
     """os.close(1): write/read/fstat/fsync on it are EBADF, print() raises it, and the end of the run does not flush the
-    dead stream again (it printed `OSError: [Errno 8]` and exited 255; Pyodide has no such end). The number of the next
-    open() differs from Pyodide's (BACKLOG W5), so it is not asserted."""
+    dead stream again (it printed `OSError: [Errno 8]` and exited 255; Pyodide has no such end). The next open() is
+    descriptor 1 again, as in Pyodide (and in a kernel)."""
     code = """
 import os
 def r(fn):
@@ -497,33 +497,14 @@ def r(fn):
         return e.errno
 os.close(1)
 msg = [r(lambda: os.write(1, b"x")), r(lambda: os.read(1, 1)), r(lambda: os.fstat(1)), r(lambda: os.fsync(1))]
-msg += [r(lambda: print("x")), r(lambda: os.fsync(1))]
+msg += [r(lambda: print("x")), r(lambda: os.fsync(1)), os.open("/", os.O_RDONLY)]
 os.write(2, repr(msg).encode() + b"\\n")
 """
     p = guest.run(code)
     assert p.returncode == 0 and p.stdout == "", p
-    assert "[8, 8, 8, 8, 8, 8]" in p.stderr and "Traceback" not in p.stderr
+    assert "[8, 8, 8, 8, 8, 8, 1]" in p.stderr and "Traceback" not in p.stderr
     p = guest.run("import os\nos.close(2)\nraise ValueError('boom')")
     assert p.returncode == 1 and p.stdout == "" and "boom" not in p.stderr, p
-
-
-def test_set_blocking_on_a_number_above_the_descriptor_table_keeps_the_table_intact(guest: Guest) -> None:
-    """A directory held above 1024 (WASI hands out such numbers after many opens) has no slot in the adapter's table:
-    set_blocking succeeds as it does in Pyodide (not kept), and must not write into the neighbouring arrays."""
-    out = run(
-        guest,
-        """
-held = [os.open(base, os.O_RDONLY | os.O_DIRECTORY) for _ in range(1100)]
-x = max(held)
-print(x >= 1024)
-before = [fcntl.fcntl(n, fcntl.F_GETFD) for n in (0, 1, 2, 4)]
-os.set_blocking(x, False)
-os.set_blocking(max(held), False)
-fcntl.ioctl(x, termios.FIONBIO, b"\\\\1\\\\0\\\\0\\\\0")
-print(before == [fcntl.fcntl(n, fcntl.F_GETFD) for n in (0, 1, 2, 4)])
-""",
-    )
-    assert out == ["True", "True"]
 
 
 def test_the_end_of_a_run_reports_a_failed_flush_as_cpython_does(guest: Guest) -> None:
@@ -543,3 +524,272 @@ sys.stdout = S()
     assert p.returncode == 3 and "Exception ignored in" in p.stderr and "] x" in p.stderr, p
     p = guest.run(code % ("errno.EBADF", ""))
     assert p.returncode == 0 and "Exception ignored" not in p.stderr, p
+
+
+def test_a_directory_number_above_1024_keeps_its_nonblocking_flag(guest: Guest) -> None:
+    """The table has 4096 numbers (it had 1024, and WASI's numbers above that were accepted and not kept): a directory
+    held as number 1102 keeps O_NONBLOCK like any other, and the numbers beside it are untouched."""
+    out = run(
+        guest,
+        """
+held = [os.open(base, os.O_RDONLY | os.O_DIRECTORY) for _ in range(1100)]
+x = held[-1]
+print(x == 1102)
+before = [fcntl.fcntl(n, fcntl.F_GETFD) for n in (0, 1, 2, 4)]
+os.set_blocking(x, False)
+print(os.get_blocking(x), os.get_blocking(held[0]), os.get_blocking(held[-2]))
+fcntl.ioctl(x, termios.FIONBIO, b"\\0\\0\\0\\0")
+print(os.get_blocking(x), before == [fcntl.fcntl(n, fcntl.F_GETFD) for n in (0, 1, 2, 4)])
+""",
+    )
+    assert out == ["True", "False True True", "True True"]
+
+
+# ---- the numbers: a kernel's (BACKLOG B5), whatever WASI's allocator hands out. The expected values are the real
+# Pyodide 315.0.0-alpha.2 on Node's, except where a test says it differs.
+
+
+def test_numbers_start_at_3_and_every_new_one_is_the_lowest_free(guest: Guest) -> None:
+    out = run(
+        guest,
+        """
+import socket
+log = []
+a = os.open(base + "/f", os.O_RDONLY); b = os.open(base + "/f", os.O_RDONLY)
+log.append(("first, second", a, b))
+os.close(a); x = os.open(base + "/f", os.O_RDONLY)
+log.append(("the freed one again", x == a))
+sv = os.dup(1)                 # the standard output is kept to print at the end
+log.append(("dup", sv))
+os.close(1); log.append(("open after close(1)", os.open(base + "/f", os.O_RDONLY)))
+os.close(0); log.append(("open after close(0)", os.open(base + "/f", os.O_RDONLY)))
+os.close(2); log.append(("dup after close(2)", os.dup(x)))
+log.append(("dup", os.dup(x)))
+log.append(("pipe", os.pipe()))
+s = socket.socket(); log.append(("socket", s.fileno()))
+log.append(("F_DUPFD 10", fcntl.fcntl(x, fcntl.F_DUPFD, 10), fcntl.fcntl(x, fcntl.F_DUPFD, 10)))
+os.dup2(sv, 1)
+for entry in log: print(*entry)
+""",
+    )
+    assert out == [
+        "first, second 3 4",
+        "the freed one again True",
+        "dup 5",
+        "open after close(1) 1",
+        "open after close(0) 0",
+        "dup after close(2) 2",
+        "dup 6",
+        "pipe (7, 8)",
+        "socket 9",
+        "F_DUPFD 10 10 11",
+    ]
+
+
+def test_dup2_takes_any_number_below_the_limit_and_later_calls_stay_fast(guest: Guest) -> None:
+    """Pyodide: dup2 to 4000 and 4095 work, to 4096, 5000, 2**31-1 and -1 are EBADF, dup2 onto itself returns the number
+    (dup3: EINVAL), F_DUPFD 4095 is 4095. It also gives 4096 and 5000 for F_DUPFD, and 4096 when 4095 is taken: EINVAL
+    and EMFILE here (as in Linux: the limit is the size of the table). The old numbering opened a placeholder for every
+    number below the wanted one: 200 dup + close took 3 s after a dup2 to 1000."""
+    out = run(
+        guest,
+        """
+import time
+a = os.open(base + "/f", os.O_RDONLY)
+def t(name, fn):
+    try: r = fn()
+    except OSError as e: r = "OSError " + errno.errorcode.get(e.errno, str(e.errno))
+    print(name, r)
+for n in (4000, 4095, 4096, 5000, 2**31 - 1, -1): t("dup2 to %d" % n, lambda: os.dup2(a, n))
+t("dup2 onto itself", lambda: os.dup2(a, a))
+t("dup3 onto itself", lambda: os.dup2(a, a, inheritable=False))
+t("dup2 of a free number", lambda: os.dup2(777, 777))
+t("F_DUPFD 4094", lambda: fcntl.fcntl(a, fcntl.F_DUPFD, 4094))
+t("F_DUPFD 4095 (taken by the dup2)", lambda: fcntl.fcntl(a, fcntl.F_DUPFD, 4095))
+t("F_DUPFD 4096", lambda: fcntl.fcntl(a, fcntl.F_DUPFD, 4096))
+t("F_DUPFD 2**31-1", lambda: fcntl.fcntl(a, fcntl.F_DUPFD, 2**31 - 1))
+print("the data of 4000", os.read(4000, 3), os.lseek(a, 0, 1))
+s = time.perf_counter()
+for _ in range(300):
+    os.close(os.dup(a)); os.close(os.open(base + "/f", os.O_RDONLY))
+print("fast", time.perf_counter() - s < 2)
+print("lowest", os.dup(a), os.open(base + "/f", os.O_RDONLY))
+""",
+    )
+    assert out == [
+        "dup2 to 4000 4000",
+        "dup2 to 4095 4095",
+        "dup2 to 4096 OSError EBADF",
+        "dup2 to 5000 OSError EBADF",
+        "dup2 to 2147483647 OSError EBADF",
+        "dup2 to -1 OSError EBADF",
+        "dup2 onto itself 3",
+        "dup3 onto itself OSError EINVAL",
+        "dup2 of a free number OSError EBADF",
+        "F_DUPFD 4094 4094",
+        "F_DUPFD 4095 (taken by the dup2) OSError EMFILE",
+        "F_DUPFD 4096 OSError EINVAL",
+        "F_DUPFD 2**31-1 OSError EINVAL",
+        "the data of 4000 b'012' 3",
+        "fast True",
+        "lowest 4 5",
+    ]
+
+
+def _need_host_fds(n: int) -> None:
+    """Each guest file is a host descriptor too: raise the soft limit or skip (else the host says EIO, not EMFILE)."""
+    try:
+        import resource
+    except ImportError:  # Windows
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != resource.RLIM_INFINITY and soft < n:
+        if hard != resource.RLIM_INFINITY and hard < n:
+            pytest.skip(f"the host's open-file limit is {hard}, the test needs {n}")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (n, hard))
+
+
+def test_the_table_is_full_at_4096_numbers_and_a_failed_call_leaves_nothing_behind(guest: Guest) -> None:
+    _need_host_fds(4300)
+    """Pyodide: opens give 3..4096 (4094 files), then EMFILE; os.pipe() with one number left is EMFILE and leaks that
+    number (the next open is EMFILE too); 5000 open + close pairs are fine. Here the numbers are 0..4095 (4093 files),
+    a pipe or a socket that finds no room takes nothing, and the churn is no problem (it ended in EMFILE after about
+    1200 files before)."""
+    out = run(
+        guest,
+        """
+import socket
+files = []
+try:
+    while True: files.append(os.open(base + "/f", os.O_RDONLY))
+except OSError as e:
+    print("full", files[0], files[-1], len(files), errno.errorcode[e.errno])
+print(files == list(range(3, 4096)))
+os.close(files.pop())
+try: os.pipe()
+except OSError as e: print("pipe", errno.errorcode[e.errno])
+print("the free number is still free", os.open(base + "/f", os.O_RDONLY) == 4095)
+try: socket.socket()
+except OSError as e: print("socket", errno.errorcode[e.errno])
+try: os.dup(0)
+except OSError as e: print("dup", errno.errorcode[e.errno])
+for f in files: os.close(f)
+for _ in range(5000): os.close(os.open(base + "/f", os.O_RDONLY))
+print("churn", os.open(base + "/f", os.O_RDONLY))
+""",
+    )
+    assert out == [
+        "full 3 4095 4093 EMFILE",
+        "True",
+        "pipe EMFILE",
+        "the free number is still free True",
+        "socket EMFILE",
+        "dup EMFILE",
+        "churn 3",
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot rename a file that a mapping keeps open")
+def test_a_mapping_uses_no_number_and_survives_the_guest_closing_all_of_them(guest: Guest) -> None:
+    """Pyodide: open 3, mmap (CPython dups it: 4), dup gives 5, and the next open after closing 3 and 5 is 3 again. The
+    mapping's own hold on the file (it outlives the descriptor: a difference from Pyodide) is no number: the guest can
+    close every number it has and reuse them, and the mapping still writes the file it was made from."""
+    out = run(
+        guest,
+        """
+import mmap
+f = os.open(base + "/f", os.O_RDWR)
+m = mmap.mmap(f, 10)
+n = os.dup(f)
+print(f, n)
+os.close(f); os.close(n)
+print(os.open(base + "/d/a", os.O_RDWR))
+for k in range(3, 100):
+    try: os.close(k)
+    except OSError: pass
+others = [os.open(base + "/d/b", os.O_RDWR) for _ in range(10)]  # the numbers it had are reused
+m[0:2] = b"QQ"
+m.flush()
+try: m.close()
+except OSError: pass
+print(open(base + "/f").read(), open(base + "/d/a").read(), open(base + "/d/b").read())
+""",
+    )
+    assert out == ["3 5", "3", "QQ23456789 a b"]
+
+
+def test_numbers_that_are_no_descriptor_are_ebadf_whatever_the_value(guest: Guest) -> None:
+    """The numbers a guest controls (negative, past the table, 2**31-1, a number nothing was opened on, and the numbers
+    the preopens have in WASI) are EBADF in every call that takes a descriptor, as in Pyodide; the few other answers are
+    Python's own (a negative number to fsync, fcntl, ioctl and poll is a ValueError, isatty says False, poll says
+    POLLNVAL)."""
+    out = run(
+        guest,
+        """
+import mmap
+bad = 0
+def t(name, n, fn):
+    global bad
+    try: r = fn()
+    except OSError as e: r = "OSError " + errno.errorcode.get(e.errno, str(e.errno))
+    except (ValueError, OverflowError) as e: r = type(e).__name__
+    want = "OSError EBADF"
+    if name in ("fsync", "fcntl", "ioctl", "poll") and n < 0: want = "ValueError"
+    if name == "isatty": want = False
+    if name == "poll" and n >= 0: want = [(n, 32)]
+    if r != want:
+        bad += 1; print("DIFFERENT", name, n, r)
+for n in (3, 4, -1, 99, 1100, 4095, 4096, 5000, 2**31 - 1, -2**31):
+    t("fstat", n, lambda: os.fstat(n))
+    t("read", n, lambda: os.read(n, 1))
+    t("write", n, lambda: os.write(n, b"x"))
+    t("lseek", n, lambda: os.lseek(n, 0, 0))
+    t("close", n, lambda: os.close(n))
+    t("dup", n, lambda: os.dup(n))
+    t("fsync", n, lambda: os.fsync(n))
+    t("ftruncate", n, lambda: os.ftruncate(n, 0))
+    t("fcntl", n, lambda: fcntl.fcntl(n, fcntl.F_GETFD))
+    t("ioctl", n, lambda: fcntl.ioctl(n, termios.FIONREAD, b"\\0\\0\\0\\0"))
+    t("listdir", n, lambda: os.listdir(n))
+    t("fchdir", n, lambda: os.chdir(n))
+    t("fchmod", n, lambda: os.fchmod(n, 0o600))
+    t("fchown", n, lambda: os.fchown(n, 0, 0))
+    t("pread", n, lambda: os.pread(n, 1, 0))
+    t("isatty", n, lambda: os.isatty(n))
+    t("get_blocking", n, lambda: os.get_blocking(n))
+    t("utime", n, lambda: os.utime(n, None))
+    t("open dir_fd", n, lambda: os.open("x", os.O_RDONLY, dir_fd=n))
+    t("dup2 from", n, lambda: os.dup2(n, 20))
+    t("poll", n, lambda: (lambda p: (p.register(n, select.POLLIN), p.poll(0)))(select.poll())[1])
+    if n >= 0: t("mmap", n, lambda: mmap.mmap(n, 4))
+print("different:", bad)
+""",
+    )
+    assert out == ["different: 0"]
+
+
+def test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back(guest: Guest) -> None:
+    """Pyodide: after close(1) an open is 1 and it is a regular file (not a character device, no tty), writes to 1 go
+    into it; dup2(saved, 1) makes 1 the stream again. dup2 onto a number of the same object keeps it, and the object
+    lives while one number is left."""
+    out = run(
+        guest,
+        """
+sv = os.dup(1)
+os.close(1)
+fd = os.open(base + "/f", os.O_RDWR)
+st = os.fstat(1)
+res = [fd, stat.S_ISREG(st.st_mode), stat.S_ISCHR(st.st_mode), os.isatty(1), os.get_blocking(1)]
+os.write(1, b"AB"); os.lseek(1, 0, 0); res.append(os.read(1, 4))
+os.close(1)
+res.append(os.dup(sv))   # the lowest free number is 1 again
+os.dup2(sv, 1)           # onto the number just made: the same object stays
+res.append(stat.S_ISCHR(os.fstat(1).st_mode))
+a = os.open(base + "/f", os.O_RDONLY); b = os.dup(a)
+res += [os.dup2(a, b) == b, os.lseek(a, 0, 1), os.read(b, 2), os.read(a, 2)]
+os.close(a)
+res.append(os.read(b, 2))
+print(res)
+""",
+    )
+    assert out == ["[1, True, False, False, True, b'AB23', 1, True, True, 0, b'AB', b'23', b'45']"]

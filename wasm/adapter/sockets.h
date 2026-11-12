@@ -36,15 +36,14 @@ NET("resolve") i32 net_resolve(const char *name, i32 n, u8 *addr4);  // -> 0, or
 NET("getaddrinfo") i32 net_getaddrinfo(const char *node, const char *service, const i32 *hint, u32 *out);
 NET("getnameinfo") i32 net_getnameinfo(const u8 *sa, i32 salen, char *node, i32 nodelen, char *serv, i32 servlen, i32 flags);
 
-// A socket takes a real WASI descriptor number (a directory opened as a placeholder, vfd.h), so that numbers stay small
-// (select() takes less than 1024) and never clash with files; its object (handle, O_NONBLOCK) is shared by the dups.
+// A socket is a guest number (the lowest free one, from fd_new) with an object (the host's handle, O_NONBLOCK) that the
+// dups share; there is no WASI descriptor behind it.
 static void sock_close(i32 h) { net_close(h); }
-static i32 sock_new(i32 fd, i32 h, i32 nb) {  // 0, or -ENOMEM (the host's socket is closed, and the placeholder)
+static i32 sock_new(i32 fd, i32 h, i32 nb) {  // 0, or -ENOMEM (the host's socket is closed)
     Obj *o = (Obj *)calloc(1, sizeof(Obj));
     if (!o || !vt()) {
         free(o);
         net_close(h);
-        w_fd_close(fd);
         return -ENOMEM;
     }
     o->kind = K_SOCK, o->ref = 1, o->w = h, o->nb = (u8)nb;
@@ -58,10 +57,7 @@ static i32 sock_new(i32 fd, i32 h, i32 nb) {  // 0, or -ENOMEM (the host's socke
 #define EINVAL_ 28
 #define MSG_DONTWAIT 0x40
 // a descriptor that is not a socket: EBADF if it is not open at all, else ENOTSOCK
-static i32 notsock(i32 fd) {
-    u8 st[24] __attribute__((aligned(8)));
-    return w_fd_fdstat_get(fd, st) ? -EBADF : -ENOTSOCK_;
-}
+static i32 notsock(i32 fd) { return vobj(fd) ? -ENOTSOCK_ : -EBADF; }
 static i32 nbflag(i32 fd) { return sock_nb(fd) ? MSG_DONTWAIT : 0; }
 // does the socket have what is asked (events: 1 read, 4 write)? An error or a hang-up is an answer too. EAGAIN if not
 static i32 would_block(i32 fd, i32 flags, i32 events) {
@@ -71,13 +67,10 @@ static i32 would_block(i32 fd, i32 flags, i32 events) {
 
 EXPORT("__syscall_socket") i32 sc_socket(i32 domain, i32 type, i32 proto, i32 a, i32 b, i32 c) {
     (void)a, (void)b, (void)c;
-    i32 fd = sock_fd();
+    i32 fd = fd_new(0);  // before the host's socket: no number, no socket
     if (fd < 0) return fd;
     i32 h = net_socket(domain, type & ~(04000 | 02000000), proto);  // without SOCK_NONBLOCK, SOCK_CLOEXEC
-    if (h < 0) {
-        w_fd_close(fd);
-        return h;
-    }
+    if (h < 0) return h;
     i32 e = sock_new(fd, h, (type & 04000) != 0);  // SOCK_NONBLOCK
     if (e) return e;
     cloexec_set(fd, type & 02000000);  // SOCK_CLOEXEC
@@ -101,13 +94,10 @@ EXPORT("__syscall_accept4") i32 sc_accept4(i32 fd, u8 *sa, u32 *lenp, i32 flags,
     if (!is_sock(fd)) return notsock(fd);
     if (flags & ~(04000 | 02000000)) return -EINVAL_;  // SOCK_NONBLOCK, SOCK_CLOEXEC
     if (would_block(fd, 0, 1)) return -EAGAIN_;
-    i32 nfd = sock_fd();  // before the accept: no descriptor, the connection stays queued
+    i32 nfd = fd_new(0);  // before the accept: no number, the connection stays queued
     if (nfd < 0) return nfd;
     i32 h = net_accept(hof(fd), sa, lenp, sock_nb(fd));
-    if (h < 0) {
-        w_fd_close(nfd);
-        return h;
-    }
+    if (h < 0) return h;
     i32 e = sock_new(nfd, h, (flags & 04000) != 0);
     if (e) return e;
     cloexec_set(nfd, flags & 02000000);
@@ -200,8 +190,7 @@ static i32 do_poll(u8 *fds, i32 n, i32 timeout) {
             rev = (i16)(pipe_mask(vobj(fd)) & (ev | 8 | 16 | POLLNVAL));
             if (rev) immediate = 1;
         } else if (fd >= 0) {
-            u8 st[24] __attribute__((aligned(8)));
-            if (is_pre(fd) || w_fd_fdstat_get(fd, st)) rev = POLLNVAL;  // a preopen is no descriptor of the guest
+            if (!vobj(fd)) rev = POLLNVAL;  // not open (also a number beyond the table)
             else rev = (i16)(ev & 5);
             if (rev) immediate = 1;
         }
@@ -278,8 +267,7 @@ EXPORT("getprotobyname") u32 getprotobyname_(const char *name) {
 // requests are ENOTTY (no descriptor here is a terminal for them); anything else is EINVAL. (FIOCLEX and FIONCLEX never
 // come here: the main module's libc answers them with 0 itself, so os.set_inheritable(fd, True) is a no-op; F_SETFD works.)
 EXPORT("__syscall_ioctl") i32 sc_ioctl(i32 fd, i32 op, i32 va) {
-    u8 st[24] __attribute__((aligned(8)));
-    if (is_pre(fd) || (!is_sock(fd) && w_fd_fdstat_get(fd, st))) return -EBADF;
+    if (!vobj(fd)) return -EBADF;
     i32 *argp = va ? *(i32 **)va : 0;  // va points at the variable arguments; the first is the argument's address
     if (is_pipe(fd) && (op == 0x541B || op == 0x5421)) {  // PIPEFS: FIONREAD is the bytes buffered, its other ioctls EINVAL
         if (op == 0x5421) return -28;
@@ -332,10 +320,9 @@ static i32 is_regular(i32 fd) { return fd_type(fd) == 4; }
 
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
-    if (is_pre(fd)) return FE_BADF;
     i32 empty = 1;
     for (i32 k = 0; k < n; k++) empty &= !iov[2 * k + 1];
-    if (empty && !is_virt(fd) && fd_std(rfd(fd))) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
+    if (empty && fd_std(fd)) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
     if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
     if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread);
     if (would_block(fd, 0, 1)) return EAGAIN_;
@@ -355,7 +342,6 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
 
 WASI("fd_write") i32 w_fd_write(i32 fd, const void *iovs, i32 n, i32 *nwritten);
 EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
-    if (is_pre(fd)) return FE_BADF;
     if (is_pipe(fd)) return pipe_write(vobj(fd), iov, n, nw);
     if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_write(rfd(fd), iov, n, nw) : file_iov(1, rfd(fd), iov, n, 0, nw);
     if (would_block(fd, 0, 4)) return EAGAIN_;
@@ -373,11 +359,10 @@ EXPORT("fd_write") i32 x_fd_write(i32 fd, const u32 *iov, i32 n, i32 *nw) {
     return 0;
 }
 
-EXPORT("fd_close") i32 x_fd_close(i32 fd) { return is_pre(fd) ? FE_BADF : fd_release(fd); }
+EXPORT("fd_close") i32 x_fd_close(i32 fd) { return fd_release(fd); }
 
 WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
 EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
-    if (is_pre(fd)) return FE_BADF;
     if (!is_virt(fd)) return w_fd_fdstat_get(rfd(fd), buf);
     for (i32 i = 0; i < 24; i++) buf[i] = 0;
     if (is_pipe(fd)) {
@@ -393,18 +378,17 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
 WASI("fd_sync") i32 w_fd_sync(i32 fd);
 EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
-    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : file_iov(2, rfd(fd), (const u32 *)iov, n, off, nread);
+    return is_virt(fd) ? FE_SPIPE : file_iov(2, rfd(fd), (const u32 *)iov, n, off, nread);
 }
 EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;
-    return is_pre(fd) ? FE_BADF : is_virt(fd) ? FE_SPIPE : file_iov(3, rfd(fd), (const u32 *)iov, n, off, nw);
+    return is_virt(fd) ? FE_SPIPE : file_iov(3, rfd(fd), (const u32 *)iov, n, off, nw);
 }
 EXPORT("fd_sync") i32 x_fd_sync(i32 fd) {
-    if (is_pre(fd)) return FE_BADF;
     if (is_pipe(fd)) return FE_INVAL;
     if (is_sock(fd)) return 0;
     i32 ft = fd_type(fd);  // a standard stream and a directory have nothing to sync: success, as Pyodide
-    return ft < 0 ? -ft : fd_std(rfd(fd)) || ft == 3 ? 0 : w_fd_sync(rfd(fd));
+    return ft < 0 ? -ft : fd_std(fd) || ft == 3 ? 0 : w_fd_sync(rfd(fd));
 }
 
 #endif

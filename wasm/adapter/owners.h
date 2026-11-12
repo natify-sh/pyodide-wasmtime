@@ -27,10 +27,10 @@ EXPORT("__syscall_fchownat") i32 sc_fchownat(i32 dirfd, const char *path, i32 ui
 
 EXPORT("__syscall_fchown32") i32 sc_fchown32(i32 fd, i32 uid, i32 gid) {
     u64 fs[8];
-    if (is_pre(fd)) return -FE_BADF;
+    if (is_virt(fd)) return 0;  // (a socket or a pipe has no owner here, and no WASI descriptor to ask)
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
-    return is_virt(fd) ? 0 : set_owner(fs, uid, gid);
+    return set_owner(fs, uid, gid);
 }
 
 // mknod: a regular file (made like open(O_CREAT|O_EXCL), with the mode and the umask); FIFOs, devices and sockets can not
@@ -42,7 +42,7 @@ EXPORT("__syscall_mknodat") i32 sc_mknodat(i32 dirfd, const char *path, i32 mode
     if (type != 0100000) return -FE_NOSYS;
     i32 fd = open_at(dirfd, path, 0100 | 0200 | 1, (u32)mode, 0);  // O_CREAT | O_EXCL | O_WRONLY
     if (fd < 0) return fd;
-    x_fd_close(fd);
+    w_fd_close(fd);  // (a WASI descriptor of ours, no guest number)
     return 0;
 }
 

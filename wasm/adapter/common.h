@@ -38,7 +38,6 @@ WASI("fd_fdstat_get") i32 w_fd_fdstat_get(i32 fd, void *buf);
 WASI("fd_allocate") i32 w_fd_allocate(i32 fd, u64 offset, u64 len);
 WASI("fd_tell") i32 w_fd_tell(i32 fd, u64 *offset);
 WASI("fd_seek") i32 w_fd_seek(i32 fd, i64 offset, i32 whence, u64 *newoffset);
-WASI("fd_renumber") i32 w_fd_renumber(i32 from, i32 to);
 WASI("fd_datasync") i32 w_fd_datasync(i32 fd);
 WASI("proc_exit") __attribute__((noreturn)) void w_proc_exit(i32 code);
 
@@ -86,7 +85,7 @@ LOADER("cpuclock") i32 host_cpuclock(i32 id, i32 res, u64 *out);  // the host's 
 #define ERANGE 68
 #define EBADF 8
 #define ENOMEM 48
-#define MAXFD 1024
+#define MAXFD 4096  // the guest's descriptor numbers are 0..MAXFD-1 (Pyodide's MAX_OPEN_FDS is 4096 too)
 // errno values of this ABI (WASI's numbering), for the file functions
 #define FE_ACCES 2
 #define FE_BADF 8
