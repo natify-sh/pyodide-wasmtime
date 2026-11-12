@@ -1455,7 +1455,7 @@
   "evidence": "an externref in the signature: a JavaScript value crosses the boundary; Pyodide's JS: __hiwire_deduplicate_delete (66 bytes)",
   "tested": "n/a"
  },
-  {
+ {
   "name": "__syscall_fcntl64",
   "class": "os",
   "verdict": "partial",
@@ -1466,12 +1466,14 @@
   "evidence": "adapter: sc_fcntl64: EBADF for a closed descriptor for every command (Pyodide's getStreamFromFD); F_DUPFD/F_DUPFD_CLOEXEC give the lowest free number from the argument on (fd_dup; a negative argument is EINVAL, as Pyodide) for files, directories, 0/1/2, sockets and pipes; F_GETFL/F_SETFL of a pipe end are its access mode and the bits of Emscripten's mask (O_NONBLOCK shared by the dups); F_SETFL of O_NONBLOCK on a standard stream or a directory succeeds, as in Pyodide (WASI refuses it: EBADF before), the flag kept in the open file's object (shared by dup, read back by F_GETFL and os.get_blocking; only O_NONBLOCK is kept on stdio and directories (other F_SETFL bits are accepted and not stored;); the read side is POSIX's 0/1/1, not Pyodide's 2048/2049, the owner keeps it; a directory's F_GETFL is its access mode 0, Pyodide's is 624640); F_GETLK (12) reports F_UNLCK, F_SETLK/F_SETLKW (13, 14) are granted (one process): fcntl.lockf and flock work; other commands EINVAL. Probes (pipes_b.py) on real Pyodide, fused and dynamic: F_DUPFD 10/40/taken/-1/bad fd and the flags of pipes the same.",
   "tested": "tests/test_files.py::test_fcntl_locks_and_invalid_descriptors, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, tests/test_descriptors.py::test_f_dupfd_takes_the_lowest_free_number_from_the_argument, ::test_standard_streams_and_directories_sync_truncate_and_set_nonblocking, ::test_pipe2_flags, ::test_dup_of_pipe_ends, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor, tests/test_descriptors.py::test_numbers_start_at_3_and_every_new_one_is_the_lowest_free, ::test_dup2_takes_any_number_below_the_limit_and_later_calls_stay_fast, ::test_the_table_is_full_at_4096_numbers_and_a_failed_call_leaves_nothing_behind, ::test_numbers_that_are_no_descriptor_are_ebadf_whatever_the_value, ::test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back"
  },
-  {
+ {
   "name": "__syscall_openat",
   "class": "os",
   "verdict": "partial",
-  "gaps": ["The length of a path is the host's: the guest's files live on the host's file system, so a path or a name beyond its limits is refused there. Pyodide's MEMFS has no limit (probed on Pyodide 315.0.0a2 on Node: a 6000-byte path, a 5000-byte name and a 5012-byte current directory all work or give ENOENT, ENAMETOOLONG is never raised). Ours: a 6000-byte path gives ENAMETOOLONG on a Linux host (the kernel) and ENOENT on Windows and macOS (CI run 42829422107); a path or name over the host's limit cannot be created or used here at all. Deliberate difference (owner, 2026-11-10): the host's answer is kept, the same applies to every path-taking system call; the test accepts ENAMETOOLONG or ENOENT for a 6000-byte path (tests/test_files.py::test_long_paths_have_no_wrong_answer)."],
-  "evidence": "adapter.c open_at: the mode of O_CREAT (the variable argument) minus the umask is recorded for a file made now (checked with a stat before the open); an existing file with a recorded mode is opened only if that mode allows the access (EACCES, as Pyodide's mayOpen); a file made now needs the directory to allow write and search (dir_denies); the path record (for '..', fstatfs and mmap's reopen) is malloc'd and has no length limit. The ABI's '..' above the root is clamped in resolve()/fixpath (stat('/..') is the root); cwd + relative paths are composed in growing buffers (no 1024-byte limit, no silent resolution against '/'). O_SYNC/O_DSYNC/O_RSYNC/O_NOATIME are no-ops in Pyodide as well. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: open mode, umask, chmod 0 + open -> EACCES, long paths match. '..' after a name is resolved physically (phys(): a path like /l/../../top with l -> a/b gives /top, as Linux; a leading chain of '..' from the cwd or the root is clamped lexically); a dirfd-relative path is left to WASI, and only a '..' out of the descriptor (which cap-std refuses) is walked from the descriptor's recorded path, if that path still names the same directory. mmap reopens the file without any permission check (open_at nocheck), as Linux; O_CLOEXEC is kept per descriptor number (see __syscall_fcntl64). Out of memory is ENOMEM where a syscall can say it. The new number is the lowest free one of the adapter's table, taken BEFORE the file is opened (as a kernel does: a full table fails before a file is made); the object made for it holds the WASI descriptor, the path record and the open flags (vfd.h), so the number has no relation to the WASI descriptor.",
+  "gaps": [
+   "The length of a path is the host's: the guest's files live on the host's file system, so a path or a name beyond its limits is refused there. Pyodide's MEMFS has no limit (probed on Pyodide 315.0.0a2 on Node: a 6000-byte path, a 5000-byte name and a 5012-byte current directory all work or give ENOENT, ENAMETOOLONG is never raised). Ours: a 6000-byte path gives ENAMETOOLONG on a Linux host (the kernel) and ENOENT on Windows and macOS (CI run 42829422107); a path or name over the host's limit cannot be created or used here at all. Deliberate difference (owner, 2026-11-10): the host's answer is kept, the same applies to every path-taking system call; the test accepts ENAMETOOLONG or ENOENT for a 6000-byte path (tests/test_files.py::test_long_paths_have_no_wrong_answer)."
+  ],
+  "evidence": "adapter.c open_at: the mode of O_CREAT (the variable argument) minus the umask is recorded for a file made now (checked with a stat before the open); an existing file with a recorded mode is opened only if that mode allows the access (EACCES, as Pyodide's mayOpen); a file made now needs the directory to allow write and search (dir_denies); the path record (for '..', fstatfs and mmap's reopen) is malloc'd and has no length limit. The ABI's '..' above the root is clamped in resolve()/fixpath (stat('/..') is the root); cwd + relative paths are composed in growing buffers (no 1024-byte limit, no silent resolution against '/'). O_SYNC/O_DSYNC/O_RSYNC/O_NOATIME are no-ops in Pyodide as well. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: open mode, umask, chmod 0 + open -> EACCES, long paths match. '..' after a name is resolved physically (phys(): a path like /l/../../top with l -> a/b gives /top, as Linux; a leading chain of '..' from the cwd or the root is clamped lexically); a dirfd-relative path is left to WASI, and only a '..' out of the descriptor (which cap-std refuses) is walked from the descriptor's recorded path, if that path still names the same directory. mmap reopens the file without any permission check (open_at nocheck), as Linux; O_CLOEXEC is kept per descriptor number (see __syscall_fcntl64). Out of memory is ENOMEM where a syscall can say it. The new number is the lowest free one of the adapter's table, taken BEFORE the file is opened (as a kernel does: a full table fails before a file is made); the object made for it holds the WASI descriptor, the path record and the open flags (vfd.h), so the number has no relation to the WASI descriptor. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files, tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode, tests/test_files.py::test_long_paths_have_no_wrong_answer, tests/test_files.py::test_dotdot_after_a_symlink_is_physical, tests/test_files.py::test_dup_does_not_check_permissions, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor, tests/test_review_fixes.py::test_a_file_opened_on_a_closed_standard_number_is_a_file, tests/test_descriptors.py::test_numbers_start_at_3_and_every_new_one_is_the_lowest_free, ::test_dup2_takes_any_number_below_the_limit_and_later_calls_stay_fast, ::test_the_table_is_full_at_4096_numbers_and_a_failed_call_leaves_nothing_behind, ::test_numbers_that_are_no_descriptor_are_ebadf_whatever_the_value, ::test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back"
  },
  {
@@ -1495,7 +1497,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_faccessat: amode & ~7 is EINVAL; the recorded (or default) mode bits give EACCES as Pyodide's nodePermissions (any of the user/group/other bits, whoever asks); a missing path or an empty one is ENOENT. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chmod 0 file -> (R, W, X, F) = (False, False, False, True), amode 8 -> EINVAL.",
+  "evidence": "adapter.c sc_faccessat: amode & ~7 is EINVAL; the recorded (or default) mode bits give EACCES as Pyodide's nodePermissions (any of the user/group/other bits, whoever asks); a missing path or an empty one is ENOENT. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: chmod 0 file -> (R, W, X, F) = (False, False, False, True), amode 8 -> EINVAL. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
@@ -1519,10 +1521,10 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_fchownat -> set_owner: any uid/gid is accepted and recorded in the metadata table (-1 leaves one as it is) for the interpreter's lifetime, not written to the host file; a missing path is ENOENT; AT_SYMLINK_NOFOLLOW honoured. stat/fstat report the recorded uid/gid. (Pyodide accepts the call and records nothing; recording is the Linux behaviour and the decision.)",
+  "evidence": "adapter.c sc_fchownat -> set_owner: any uid/gid is accepted and recorded in the metadata table (-1 leaves one as it is) for the interpreter's lifetime, not written to the host file; a missing path is ENOENT; AT_SYMLINK_NOFOLLOW honoured. stat/fstat report the recorded uid/gid. (Pyodide accepts the call and records nothing; recording is the Linux behaviour and the decision.) A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_chown_is_recorded_and_stat_shows_it"
  },
-  {
+ {
   "name": "__syscall_dup",
   "class": "os",
   "verdict": "full",
@@ -1530,11 +1532,13 @@
   "evidence": "vfd.h fd_dup/sc_dup: a guest number is an index into the adapter's table of objects (Vt, 4096 numbers) and has nothing to do with a WASI descriptor: the new number is the LOWEST free one (the first open of a program is 3; after close(0) the next open or dup is 0), and it is another number for the same object: a file or directory shares its WASI descriptor and so its offset and readdir snapshot, a socket its host handle and O_NONBLOCK, a pipe end its buffer; the WASI descriptor is closed with the last number (obj_unref), so a renamed or unlinked file is still the same file. dup of 0/1/2, sockets and pipes works; dup of a number that holds no object, or is negative or past the table, is EBADF; EMFILE only when the table is full. Probes (pipes_b.py and the B5 probes) on real Pyodide, fused and dynamic: the same answers (shared offset (b'01', b'23', 4, 4), dup(999)/dup(-1)/dup(1<<30) EBADF, redirection of 1 and 2, the numbers of tests/test_descriptors.py::test_numbers_start_at_3_and_every_new_one_is_the_lowest_free). The guest's numbers are the adapter's own table (vfd.h), not WASI's: the WASI descriptors of the preopens (the root's 3, a mount's, /dev's) are no guest number at all, so 3 and 4 are free numbers for the guest (EBADF until opened), and the adapter's own use of them is unchanged.",
   "tested": "tests/test_descriptors.py::test_dup_shares_the_offset_and_does_not_depend_on_the_name, ::test_dup_of_directories, ::test_dup_of_the_standard_streams, ::test_dup_of_pipe_ends, ::test_dup_of_a_socket, ::test_mmap_keeps_working_after_the_descriptor_is_closed, tests/test_basic.py::test_dup_scandir_fwalk_and_rmtree, tests/test_diff_fixes.py::test_preopen_descriptors_are_not_the_guests, tests/test_review_fixes.py::test_moving_the_holder_of_a_directory_keeps_its_listing, tests/test_descriptors.py::test_numbers_start_at_3_and_every_new_one_is_the_lowest_free, ::test_dup2_takes_any_number_below_the_limit_and_later_calls_stay_fast, ::test_the_table_is_full_at_4096_numbers_and_a_failed_call_leaves_nothing_behind, ::test_numbers_that_are_no_descriptor_are_ebadf_whatever_the_value, ::test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back"
  },
-  {
+ {
   "name": "__syscall_dup3",
   "class": "os",
   "verdict": "partial",
-  "gaps": ["deliberate difference (owner): FD_CLOEXEC is kept per descriptor number for EVERY descriptor (a bit per number: set by openat O_CLOEXEC, socket/accept4 SOCK_CLOEXEC, pipe2, dup3, F_DUPFD_CLOEXEC, F_SETFD; cleared by close and by dup/F_DUPFD; read by F_GETFD), as POSIX does; Python passes O_CLOEXEC/SOCK_CLOEXEC on everything (PEP 446), so os.get_inheritable is False for what Python opens here and True in Pyodide (whose F_GETFD is constant 0 and F_SETFD a no-op; F_DUPFD_CLOEXEC is EINVAL there). os.set_inheritable(fd, True) stays a no-op in both: the main module's libc answers FIOCLEX/FIONCLEX with 0 itself before the system call (fcntl F_SETFD works). CPython here has no pipe2, so os.pipe() is pipe() plus that same ioctl and reports inheritable True in both."],
+  "gaps": [
+   "deliberate difference (owner): FD_CLOEXEC is kept per descriptor number for EVERY descriptor (a bit per number: set by openat O_CLOEXEC, socket/accept4 SOCK_CLOEXEC, pipe2, dup3, F_DUPFD_CLOEXEC, F_SETFD; cleared by close and by dup/F_DUPFD; read by F_GETFD), as POSIX does; Python passes O_CLOEXEC/SOCK_CLOEXEC on everything (PEP 446), so os.get_inheritable is False for what Python opens here and True in Pyodide (whose F_GETFD is constant 0 and F_SETFD a no-op; F_DUPFD_CLOEXEC is EINVAL there). os.set_inheritable(fd, True) stays a no-op in both: the main module's libc answers FIOCLEX/FIONCLEX with 0 itself before the system call (fcntl F_SETFD works). CPython here has no pipe2, so os.pipe() is pipe() plus that same ioctl and reports inheritable True in both."
+  ],
   "evidence": "vfd.h sc_dup3 over fd_dup: flags other than O_CLOEXEC and oldfd == newfd are EINVAL, a bad oldfd or a newfd outside the table (negative, 4096 and above) EBADF; what is on newfd is closed first (fd_release: the object loses a number, and ends with its last), then newfd takes the object of oldfd: any number below 4096 works at once (dup2(fd, 4000) is 4000 and costs nothing later, where it was a placeholder directory for every number below). dup2 onto an unused number works, onto an open one shares the offset (equal lseek), onto 0/1/2 redirects, onto a number of the same object keeps it. Probes on real Pyodide, fused and dynamic: the same except FD_CLOEXEC above (dup2 to 4096, 5000, 2**31-1 and -1 are EBADF on both). The guest's numbers are the adapter's own table (vfd.h), not WASI's: the WASI descriptors of the preopens (the root's 3, a mount's, /dev's) are no guest number at all, so 3 and 4 are free numbers for the guest (EBADF until opened), and the adapter's own use of them is unchanged.",
   "tested": "tests/test_descriptors.py::test_dup_shares_the_offset_and_does_not_depend_on_the_name, ::test_dup_of_the_standard_streams, ::test_dup_of_pipe_ends, tests/test_diff_fixes.py::test_preopen_descriptors_are_not_the_guests, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor, tests/test_descriptors.py::test_numbers_start_at_3_and_every_new_one_is_the_lowest_free, ::test_dup2_takes_any_number_below_the_limit_and_later_calls_stay_fast, ::test_the_table_is_full_at_4096_numbers_and_a_failed_call_leaves_nothing_behind, ::test_numbers_that_are_no_descriptor_are_ebadf_whatever_the_value, ::test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back"
  },
@@ -1608,7 +1612,7 @@
   "evidence": "adapter.c log_formatted: error and warn (flags & 6) to stderr, everything else to stdout, one line each, as console.error/warn and console.log/info/debug/out/err. n/a per flag: EM_LOG_C_STACK, EM_LOG_JS_STACK (and with them DEMANGLE, NO_PATHS, FUNC_PARAMS) ask for a JavaScript stack (new Error().stack), which does not exist here: the message is printed without it (trailing white space stripped, as the glue does before it adds a stack). Probe: emscripten_log() with flags 0, 1, 1|2, 1|4, 1|512, 1|256, 2, 4, 512, 8. Judged, not equal: the call stack of EM_LOG_C_STACK / EM_LOG_JS_STACK is the JavaScript engine's own trace of its frames (new Error().stack: 'at wasm-function[123] (...)'); no program can depend on it, and wasm has no way to make one here, so it is left out (n/a per flag).",
   "tested": "tests/test_loader.py::test_emscripten_log_goes_to_stdout_or_stderr"
  },
-  {
+ {
   "name": "_munmap_js",
   "class": "runtime",
   "verdict": "partial",
@@ -1619,7 +1623,7 @@
   "evidence": "adapter.c munmap_js: a shared writable mapping is written back through msync_js (the whole length, pwrite; a truncated file grows again, as MEMFS's msync does: probe truncate to 4 then close -> Pyodide and ours b'01234567!9') and its reference to the file dropped; private and read-only mappings return 0, as the glue only syncs when prot has PROT_WRITE (and the flags without MAP_PRIVATE). The libc's __syscall_munmap finds the mapping by its exact base and length (else EINVAL), calls _munmap_js, DROPS the result, frees the block and returns 0: the glue's EBADF for a read-only mapping whose descriptor was closed is not seen (probe on Pyodide: libc munmap after close() of a read-only mapping returns 0, as here), so a failed write-back is silent there and here.",
   "tested": "tests/test_mmap.py::test_writes_reach_the_file_on_flush_and_close, ::test_a_write_back_is_the_whole_mapping_and_extends_a_truncated_file, ::test_a_mapping_outlives_the_descriptor_it_was_made_from"
  },
-  {
+ {
   "name": "_msync_js",
   "class": "runtime",
   "verdict": "partial",
@@ -1630,11 +1634,13 @@
   "evidence": "adapter.c msync_js/mm_write_back: the whole mapping is written with pwrite (a truncated file grows again; probe truncate to 4, write at 8, flush -> Pyodide and ours b'01234567!9'). MAP_PRIVATE returns 0 at once, as doMsync does (flags & 2). A shared mapping WITHOUT PROT_WRITE is written as well (its unchanged bytes, which re-extends a truncated file and changes mtime): probe through libc msync, Pyodide and ours: ro-shared b'0123456789' with a new mtime, ro-private and rw-private b'0123'. Python's own mmap.flush returns early for ACCESS_READ and ACCESS_COPY, so only a direct libc msync gets there. An address inside a mapping is the libc's EINVAL before the import, the same on both.",
   "tested": "tests/test_mmap.py::test_writes_reach_the_file_on_flush_and_close, ::test_a_write_back_is_the_whole_mapping_and_extends_a_truncated_file, ::test_msync_writes_a_read_only_shared_mapping_but_not_a_private_one, ::test_private_mappings_never_write_back"
  },
-  {
+ {
   "name": "_mmap_js",
   "class": "runtime",
   "verdict": "partial",
-  "gaps": ["deliberate difference (owner): a shared writable mapping keeps a reference to the open file (POSIX: the mapping outlives close() of the descriptor it was made from; the reference is no descriptor number, so the guest can close and reuse every number it has) and outlives close() of the descriptor it was made from. Pyodide looks the descriptor number up again at msync/munmap: after close() its flush() raises EBADF and m.close() loses the data silently, and when the number was reused by another file it writes the mapping into THAT file (probe, Pyodide 315.0.0a2: open b, mmap, close, open c gets the same fd, m[0:2]=b'ZZ', flush -> 'flush ok', b unchanged, c = b'ZZbbbbbbcccc'; here b = b'ZZbbbbbb', c unchanged). Tested: tests/test_mmap.py::test_a_mapping_outlives_the_descriptor_it_was_made_from, ::test_a_closed_descriptor_number_reused_by_another_file_is_not_written_to."],
+  "gaps": [
+   "deliberate difference (owner): a shared writable mapping keeps a reference to the open file (POSIX: the mapping outlives close() of the descriptor it was made from; the reference is no descriptor number, so the guest can close and reuse every number it has) and outlives close() of the descriptor it was made from. Pyodide looks the descriptor number up again at msync/munmap: after close() its flush() raises EBADF and m.close() loses the data silently, and when the number was reused by another file it writes the mapping into THAT file (probe, Pyodide 315.0.0a2: open b, mmap, close, open c gets the same fd, m[0:2]=b'ZZ', flush -> 'flush ok', b unchanged, c = b'ZZbbbbbbcccc'; here b = b'ZZbbbbbb', c unchanged). Tested: tests/test_mmap.py::test_a_mapping_outlives_the_descriptor_it_was_made_from, ::test_a_closed_descriptor_number_reused_by_another_file_is_not_written_to."
+  ],
   "evidence": "adapter.c mmap_js: the glue's mmap for a file. EBADF, EACCES (shared + writable needs O_RDWR; O_WRONLY), ENODEV (not a regular file), EINVAL (length 0, offset < 0), ENOMEM; a block of whole 64 KiB pages from the main module's memalign, zeroed, filled by pread in 8 MiB pieces (wasmtime refuses a big read); allocated = 1. Probe (mm.py) on Pyodide and ours prints the same lines for read, slice, find, write + flush + close, MAP_PRIVATE, ACCESS_COPY, read-only, empty file, directory, unaligned offset, write-only fd, anonymous, dup'd fd, offset past 4 GiB. The file is copied in, as on Pyodide: MEMFS copies as well unless the file's contents are a view of the JS heap, which Python's write path never makes (probe: os.pwrite after mmap is not seen through the mapping on Pyodide or here), so that is not observable. A shared writable mapping takes one more reference to the file's object (no number: obj_unref at munmap; mmap of a socket or a pipe is ENODEV).",
   "tested": "tests/test_descriptors.py::test_a_mapping_uses_no_number_and_survives_the_guest_closing_all_of_them, tests/test_mmap.py (all but test_cpythons_test_mmap), test_cpythons_test_mmap (CPython's test_mmap with its Emscripten skip removed: only mremap/resize, which are the libc's, still fail)"
  },
@@ -1691,7 +1697,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_fchmodat2: as chmod; AT_SYMLINK_NOFOLLOW (256) changes the link's own record, as Pyodide's JS does; a missing or empty path is ENOENT.",
+  "evidence": "adapter.c sc_fchmodat2: as chmod; AT_SYMLINK_NOFOLLOW (256) changes the link's own record, as Pyodide's JS does; a missing or empty path is ENOENT. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_chmod_fchmod_access_and_open_follow_the_recorded_mode"
  },
  {
@@ -1710,7 +1716,7 @@
   "evidence": "adapter.c sc_fdatasync: EBADF for a closed descriptor; a standard stream or a socket succeeds (Pyodide); other descriptors go to WASI's fd_datasync (EINVAL/ENOTSUP and the EBADF of a read-only descriptor's missing right are success). fsync is the WASI import fd_sync, not an env import: x_fd_sync answers 0 for fds 0-2 and directories, as Pyodide (it was EBADF), EINVAL for a pipe, EBADF for a closed number. probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: fdatasync(1) -> None, (5000) -> EBADF, file, directory.",
   "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
-  {
+ {
   "name": "__syscall_fstat64",
   "class": "os",
   "verdict": "full",
@@ -1731,7 +1737,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_newfstatat: an empty path is ENOENT unless AT_EMPTY_PATH (0x1000), which stats the descriptor (or the cwd for AT_FDCWD); a relative path with '..' to a directory descriptor is made absolute (WASI refuses a '..' out of a descriptor); the rest as stat64/lstat64.",
+  "evidence": "adapter.c sc_newfstatat: an empty path is ENOENT unless AT_EMPTY_PATH (0x1000), which stats the descriptor (or the cwd for AT_FDCWD); a relative path with '..' to a directory descriptor is made absolute (WASI refuses a '..' out of a descriptor); the rest as stat64/lstat64. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_stat_types_and_empty_and_dotdot_paths"
  },
  {
@@ -1758,11 +1764,13 @@
   "evidence": "adapter.c:305-311; probe: getcwd '/' both; getcwd(buf,1) → ERANGE both (size==0 gives ERANGE not EINVAL, but musl never passes 0); a symlinked cwd is chdir's gap",
   "tested": "tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
-  {
+ {
   "name": "__syscall_getdents64",
   "class": "os",
   "verdict": "partial",
-  "gaps": ["A name removed or renamed while a listing is read is still listed (Pyodide looks each name up as it serves it, so it skips what is gone); d_reclen is the compact size, Pyodide's is always 280; a listing of 5000 names takes 0.13 s (Pyodide 0.005 s) and 30,000 names of 100 bytes take 4.2 s, because wasmtime's fd_readdir stats every entry and lists the host directory again at every call (superlinear)."],
+  "gaps": [
+   "A name removed or renamed while a listing is read is still listed (Pyodide looks each name up as it serves it, so it skips what is gone); d_reclen is the compact size, Pyodide's is always 280; a listing of 5000 names takes 0.13 s (Pyodide 0.005 s) and 30,000 names of 100 bytes take 4.2 s, because wasmtime's fd_readdir stats every entry and lists the host directory again at every call (superlinear)."
+  ],
   "evidence": "adapter.c sc_getdents64 + snap_load + x_fd_seek (fd_seek is routed through the adapter, WASI_ROUTED): the listing of a directory is read whole at the first getdents64 of its descriptor (a snapshot, 1 MiB per fd_readdir call, repeated from the cookie of the last complete record) and served by the position, as Pyodide's glue serves stream.getdents: an entry comes exactly once, names created during a scandir loop are not listed (the 25-name probe printed 30 with 2 duplicates before), a 5000-name listdir takes 0.13 s instead of 12 s (Pyodide: 0.005 s: the rest is wasmtime's fd_readdir, which stats every entry). The position is the entry index * 280 (Emscripten's struct size): lseek(fd, 0, SEEK_CUR) after 3002 entries is 840560 as on Pyodide; lseek on a directory sets/reads it (rewinddir = SEEK_SET 0 drops the snapshot, so the next read lists the directory as it is then; seekdir/telldir use d_off); the table has the numbers 0..4095; the snapshot is kept in the open file's object, so dup'd numbers share it and its position, and it is freed with the object (the last close; a number opened again starts with none). The readv/writev/pread/pwrite loops (file_iov, regular files only: a stream keeps one WASI call, so a read never waits for a second buffer) stop at 0x7ffff000 bytes, Linux's MAX_RW_COUNT, so the count cannot overflow. Probes tools/diff_probes/files_listing.py (19 cases: 3000 names by path and by fd, readdir/rewinddir/telldir/seekdir, dup, names created during the loop, a change between two listdir(fd)) run on Pyodide, fused and dynamic: 0 differing lines. Still different from Pyodide (files_dirs.py): a name removed or renamed while the loop runs is still listed (Pyodide looks each name up as it serves it, and its batches are 7 entries), d_reclen is the compact size where Pyodide's is always 280.",
   "tested": "tests/test_files.py::test_directory_descriptors_seek_and_list_past_1024, tests/test_files.py::test_dup2_onto_a_directory_resets_its_listing, tests/test_files.py::test_a_big_directory_lists_every_name_once_and_fast, tests/test_files.py::test_files_created_while_scandir_runs_are_not_listed_twice, tests/test_files.py::test_rewinddir_and_lseek_of_a_directory_read_the_listing_again"
  },
@@ -1806,7 +1814,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_linkat: AT_SYMLINK_FOLLOW is done here (phys() resolves the link, then the file is linked: wasmtime's own flag is EINVAL); other flags EINVAL. The directory of the new name must allow write and search (EACCES). A hard link to a directory is the host's EPERM. Ours really links where Pyodide's JS says EMLINK for every call (more than the baseline).",
+  "evidence": "adapter.c sc_linkat: AT_SYMLINK_FOLLOW is done here (phys() resolves the link, then the file is linked: wasmtime's own flag is EINVAL); other flags EINVAL. The directory of the new name must allow write and search (EACCES). A hard link to a directory is the host's EPERM. Ours really links where Pyodide's JS says EMLINK for every call (more than the baseline). A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat"
  },
  {
@@ -1822,7 +1830,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_mkdirat: the mode minus the umask (& 01777) is recorded for the new directory; the parent must allow write and search (dir_denies, EACCES as Pyodide). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: mkdir(d, 0o700) -> 0o40700.",
+  "evidence": "adapter.c sc_mkdirat: the mode minus the umask (& 01777) is recorded for the new directory; the parent must allow write and search (dir_denies, EACCES as Pyodide). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: mkdir(d, 0o700) -> 0o40700. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_umask_is_stored_and_applied_to_new_files"
  },
  {
@@ -1871,7 +1879,7 @@
   "evidence": "adapter.c gmtime_js/fill_tm: integer arithmetic with Date's range (|t| > 8.64e12 s: error 1 -> OSError EINVAL) and the JS yday bug for the years 0..99 (counted from Jan 1 of 19xx) and for -271821 (NaN | 0 = 0). Probe: 27 values from 0 to +-2^63, tests/checks/time_gm.py equals the output of Pyodide on Node",
   "tested": "tests/test_time.py::test_gmtime_and_timegm_at_the_edges_of_date"
  },
-  {
+ {
   "name": "__syscall_poll",
   "class": "os",
   "verdict": "full",
@@ -1879,7 +1887,7 @@
   "evidence": "adapter.c do_poll -> _net.py Net._poll: one select.poll() call (select() where there is no poll) for all sockets with the timeout, revents POLLIN/PRI/OUT/ERR/HUP/NVAL as the host reports them (POLLOUT after a connect, POLLHUP after shutdown, POLLERR after a refused connect); nfds above MAXFD is EINVAL; a file is ready for what it is asked (Pyodide's pollOne: 5 for a stream without poll op) and an unopened descriptor is POLLNVAL.; a pipe end is ready from its buffer (PIPEFS's mask); a number that holds no object is POLLNVAL, and select() on it is EBADF (probe: Pyodide gives OSError 8 / revents 32); the WASI numbers of the preopens are no guest numbers (a free number for the guest unless it opened one)",
   "tested": "tests/test_sockets.py::test_poll_waits_for_the_socket_that_gets_data, tests/test_sockets.py::test_poll_times_out_on_idle_sockets, tests/test_sockets.py::test_a_ready_file_does_not_wait_for_an_idle_socket, tests/test_sockets.py::test_poll_reports_an_invalid_descriptor, tests/test_sockets.py::test_poll_reports_a_hang_up, tests/test_sockets.py::test_a_non_blocking_connect_is_in_progress_then_completes, tests/test_review_fixes.py::test_poll_and_select_of_a_preopen_number_are_invalid"
  },
-  {
+ {
   "name": "__syscall_pipe2",
   "class": "os",
   "verdict": "partial",
@@ -1943,7 +1951,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_readlinkat: WASI's path_readlink; for a link made with an absolute target (symlinkat) the original string from the metadata table. Relative links, not-a-link EINVAL, missing ENOENT match Pyodide.",
+  "evidence": "adapter.c sc_readlinkat: WASI's path_readlink; for a link made with an absolute target (symlinkat) the original string from the metadata table. Relative links, not-a-link EINVAL, missing ENOENT match Pyodide. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored, tests/test_basic.py::test_chdir_symlink_and_honest_enosys"
  },
  {
@@ -1951,7 +1959,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_unlinkat: flags other than 0 and AT_REMOVEDIR (0x200) are EINVAL before anything is removed; the record of the last name of a file (or of a removed directory) is dropped, so a new file with the same inode gets its own; the parent directory must allow write and search (dir_denies, EACCES as Pyodide's mayDelete). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: unlinkat(f, 1) -> EINVAL, file kept. The record of an unlinked file stays while a descriptor opened by the adapter still holds the inode (fstat keeps the mode) and is dropped at the last close; a new file never inherits it.",
+  "evidence": "adapter.c sc_unlinkat: flags other than 0 and AT_REMOVEDIR (0x200) are EINVAL before anything is removed; the record of the last name of a file (or of a removed directory) is dropped, so a new file with the same inode gets its own; the parent directory must allow write and search (dir_denies, EACCES as Pyodide's mayDelete). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings: unlinkat(f, 1) -> EINVAL, file kept. The record of an unlinked file stays while a descriptor opened by the adapter still holds the inode (fstat keeps the mode) and is dropped at the last close; a new file never inherits it. A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_fadvise_fallocate_fdatasync_unlinkat_linkat, tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_an_unlinked_open_file_keeps_its_mode_until_the_last_close"
  },
  {
@@ -1967,7 +1975,7 @@
   "class": "os",
   "verdict": "full",
   "gaps": [],
-  "evidence": "adapter.c sc_renameat; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match; the record of a replaced file is dropped, and a link made with an absolute target is made again for its new directory. Renaming a directory makes every symlink with a stored absolute target under it again (relink_tree).",
+  "evidence": "adapter.c sc_renameat; probe: rename, dir over file ENOTDIR, into itself EINVAL, replace all match; the record of a replaced file is dropped, and a link made with an absolute target is made again for its new directory. Renaming a directory makes every symlink with a stored absolute target under it again (relink_tree). A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_replacing_or_removing_a_file_drops_its_record, tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored, tests/test_files.py::test_a_renamed_directory_keeps_its_absolute_symlinks_pointing_at_the_same_file"
  },
  {
@@ -2004,7 +2012,7 @@
    "On Windows the link may not be made at all, and nothing here proves why: in CI (run 42829422107, windows-latest) a symlink made with an absolute or a `..` target failed with ENOENT (`/a/b/ln`, `/tmp/fx/l`) or EPERM (`/tmp/fx/lab`, the adapter writes the target relative to the link's directory, `../../tmp/fx/a/b`). The hypothesis, not confirmed by any log: wasmtime's Windows path_symlink resolves the target against the directory descriptor it is given (the guest root), not against the link's directory, and refuses a `..` that leaves it. Windows also needs a privilege (or developer mode) to create a symlink at all. The tests that need symlinks are skipped on win32 (tests/test_files.py, NO_WIN_SYMLINK); a symlink fix for Windows needs a Windows run to isolate the cause.",
    "A link in one preopen to an absolute target in another (a --mount) gives EXDEV, where Linux symlink(2) never fails that way. The reason is the platform's: wasmtime/cap-std refuses an ABSOLUTE target (EPERM) and cannot follow ANY link, even a relative one, from one preopen directory into another, so no target string stored in the host file can make the link work; making the link without a working target would be a dangling fake. (Links within one preopen, absolute or relative, work.)"
   ],
-  "evidence": "adapter.c sc_symlinkat/rel_target: wasmtime refuses an absolute target (EPERM), so the link is made with the target relative to the link's real directory (phys()) and the original string is kept in the metadata table: readlink returns exactly what the program stored, lstat's size is its length, opening through the link reaches the same file; rename makes the link again for its new directory (relink), copytree(symlinks=True) round-trips. The directory of the new link must allow write and search (EACCES). A link and a target under different preopens (a --mount) cannot be expressed: EXDEV. Relative targets are stored as they are. Targets are stored relative to the link's real directory; a directory renamed later has the stored absolute links inside it made again (relink_tree, skipped when no such link exists).",
+  "evidence": "adapter.c sc_symlinkat/rel_target: wasmtime refuses an absolute target (EPERM), so the link is made with the target relative to the link's real directory (phys()) and the original string is kept in the metadata table: readlink returns exactly what the program stored, lstat's size is its length, opening through the link reaches the same file; rename makes the link again for its new directory (relink), copytree(symlinks=True) round-trips. The directory of the new link must allow write and search (EACCES). A link and a target under different preopens (a --mount) cannot be expressed: EXDEV. Relative targets are stored as they are. Targets are stored relative to the link's real directory; a directory renamed later has the stored absolute links inside it made again (relink_tree, skipped when no such link exists). A relative path under an open descriptor that is no directory (a pipe, a socket, a file, a standard stream) is ENOTDIR (an empty one ENOENT), a closed number EBADF: Linux's answers (Pyodide: ENOENT for a pipe or a socket), tests/test_descriptors.py::test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_number_ebadf.",
   "tested": "tests/test_files.py::test_absolute_symlinks_work_and_read_back_as_stored"
  },
  {
@@ -2145,11 +2153,13 @@
   "evidence": "adapter.c sc_shutdown -> net.shutdown (the host's shutdown(2)); a non-socket is ENOTSOCK, an unopened descriptor EBADF; shutdown(SHUT_WR) then recv gives the rest and b'' (Linux semantics; Pyodide's JS has no shutdown).",
   "tested": "tests/test_sockets.py::test_poll_reports_a_hang_up"
  },
-  {
+ {
   "name": "__syscall_socket",
   "class": "os",
   "verdict": "partial",
-  "gaps": ["FD_CLOEXEC of a socket: deliberate difference (owner): FD_CLOEXEC is kept per descriptor number for EVERY descriptor (a bit per number: set by openat O_CLOEXEC, socket/accept4 SOCK_CLOEXEC, pipe2, dup3, F_DUPFD_CLOEXEC, F_SETFD; cleared by close and by dup/F_DUPFD; read by F_GETFD), as POSIX does; Python passes O_CLOEXEC/SOCK_CLOEXEC on everything (PEP 446), so os.get_inheritable is False for what Python opens here and True in Pyodide (whose F_GETFD is constant 0 and F_SETFD a no-op; F_DUPFD_CLOEXEC is EINVAL there). os.set_inheritable(fd, True) stays a no-op in both: the main module's libc answers FIOCLEX/FIONCLEX with 0 itself before the system call (fcntl F_SETFD works). CPython here has no pipe2, so os.pipe() is pipe() plus that same ioctl and reports inheritable True in both."],
+  "gaps": [
+   "FD_CLOEXEC of a socket: deliberate difference (owner): FD_CLOEXEC is kept per descriptor number for EVERY descriptor (a bit per number: set by openat O_CLOEXEC, socket/accept4 SOCK_CLOEXEC, pipe2, dup3, F_DUPFD_CLOEXEC, F_SETFD; cleared by close and by dup/F_DUPFD; read by F_GETFD), as POSIX does; Python passes O_CLOEXEC/SOCK_CLOEXEC on everything (PEP 446), so os.get_inheritable is False for what Python opens here and True in Pyodide (whose F_GETFD is constant 0 and F_SETFD a no-op; F_DUPFD_CLOEXEC is EINVAL there). os.set_inheritable(fd, True) stays a no-op in both: the main module's libc answers FIOCLEX/FIONCLEX with 0 itself before the system call (fcntl F_SETFD works). CPython here has no pipe2, so os.pipe() is pipe() plus that same ioctl and reports inheritable True in both."
+  ],
   "evidence": "adapter.c sc_socket (the lowest free number from fd_new, taken before the host's socket is made, no WASI descriptor behind it, SOCK_NONBLOCK kept), _net.py Net._n_socket: AF_INET and AF_INET6 (the host's own answer if it has no IPv6: EAFNOSUPPORT), SOCK_STREAM/SOCK_DGRAM (other types ESOCKTNOSUPPORT, Pyodide: EINVAL), a protocol that does not fit the type EPROTONOSUPPORT (as Pyodide). Probe: fused and dynamic. Every host error is translated by name to Emscripten's errno (ENOTSUP/EOPNOTSUPP is 138), also the Windows WSAE* numbers (_consts.py guest_errno); a net operation never raises into the wasm: EFAULT for a pointer outside the memory, EIO (logged) for the unforeseen. A full table is EMFILE before any host socket exists; SOCK_CLOEXEC is kept (F_GETFD)",
   "tested": "tests/test_sockets.py::test_many_sockets_can_be_opened_and_closed, tests/test_sockets.py::test_select_works_and_descriptors_are_small, tests/test_sockets.py::test_the_flag_is_visible_through_fcntl_and_the_constructor, tests/test_sockets.py::test_udp_has_addresses_in_both_directions, tests/test_sockets.py::test_host_errors_are_translated_by_name_on_every_os, tests/test_sockets.py::test_the_net_wrapper_turns_every_exception_into_an_errno, tests/test_sockets.py::test_the_accessors_check_the_memory, tests/test_review_fixes.py::test_descriptors_work_after_many_files_were_opened_and_closed, tests/test_review_fixes.py::test_cloexec_is_kept_for_every_descriptor, tests/test_descriptors.py::test_numbers_start_at_3_and_every_new_one_is_the_lowest_free, ::test_dup2_takes_any_number_below_the_limit_and_later_calls_stay_fast, ::test_the_table_is_full_at_4096_numbers_and_a_failed_call_leaves_nothing_behind, ::test_numbers_that_are_no_descriptor_are_ebadf_whatever_the_value, ::test_a_standard_number_closed_and_opened_again_is_a_file_and_dup2_puts_the_stream_back"
  },

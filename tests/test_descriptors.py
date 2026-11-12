@@ -772,7 +772,7 @@ def test_an_open_object_that_is_no_directory_as_dir_fd_is_enotdir_and_a_closed_n
     """Linux: ENOTDIR for a relative path under a pipe, a socket, a file or a standard stream, in every *at call
     (Pyodide says ENOENT for a pipe and a socket: the owner's decision is Linux); a closed number is
     EBADF; an absolute path ignores the descriptor; utime on a pipe, a socket or a standard stream succeeds, as
-    Pyodide's does."""
+    Pyodide's does. An empty path is ENOENT first; a directory descriptor is not slowed down (type asked once)."""
     out = run(
         guest,
         """
@@ -794,8 +794,13 @@ for name, fn in calls.items():
     for who, d in (("pipe", p), ("sock", s.fileno()), ("file", f), ("stdin", 0), ("stdout", 1), ("closed", c)):
         t(name + " " + who, lambda: fn(d))
 t("absolute", lambda: os.stat(base + "/f", dir_fd=p).st_size)
+t("empty open pipe", lambda: os.open("", os.O_RDONLY, dir_fd=p))
+t("empty unlink file", lambda: os.unlink("", dir_fd=f))
 for who, d in (("pipe", p), ("sock", s.fileno()), ("stdout", 1), ("file", f), ("closed", c)):
     t("utime fd " + who, lambda: os.utime(d, None))
+dd = os.open(base, os.O_RDONLY)
+for _ in range(3):
+    t("dir", lambda: os.close(os.open("f", os.O_RDONLY, dir_fd=dd)))
 """,
     )
     want = []
@@ -804,8 +809,13 @@ for who, d in (("pipe", p), ("sock", s.fileno()), ("stdout", 1), ("file", f), ("
             want.append(f"{name} {who} 'OSError ENOTDIR'")
         want.append(f"{name} closed 'OSError EBADF'")
     want.append("absolute 10")
+    want += [
+        "empty open pipe 'OSError ENOENT'",
+        "empty unlink file 'OSError ENOENT'",
+    ]
     want += [f"utime fd {w} None" for w in ("pipe", "sock", "stdout", "file")]
     want.append("utime fd closed 'OSError EBADF'")
+    want += ["dir None"] * 3
     assert out == want
 
 

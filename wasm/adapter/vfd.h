@@ -45,6 +45,7 @@ typedef struct {
     i32 fl;  // a pipe end's status flags (F_SETFL)
     u8 nb;   // O_NONBLOCK of a socket, a standard stream or a directory (WASI can not hold it for the last two)
     u8 std;  // a standard stream (fstat says character device)
+    u8 isdir;  // a file object: 0 not asked yet, 1 a directory, 2 no directory (the type of an open file never changes)
     Pipe *pipe;
     // K_FILE opened by openat: the absolute guest path and the open flags (what mmap's write-back opens again; the path is
     // 0 when it could not be kept), and the snapshot of a directory's listing, read at its first getdents64 (lseek(fd, 0,
@@ -124,7 +125,11 @@ static i32 notdir(i32 dirfd, const char *path) {
     u8 st[24] __attribute__((aligned(8)));
     Obj *o = path[0] == '/' ? 0 : vobj(dirfd);
     if (!o) return 0;
-    return o->kind != K_FILE || o->std || (!w_fd_fdstat_get(o->w, st) && st[0] != 3) ? FE_NOTDIR : 0;
+    if (o->kind == K_FILE && !o->std) {
+        if (!o->isdir) o->isdir = !w_fd_fdstat_get(o->w, st) && st[0] == 3 ? 1 : 2;  // one host call per object
+        if (o->isdir == 1) return 0;
+    }
+    return path[0] ? FE_NOTDIR : FE_NOENT;  // an empty path is ENOENT first (Linux)
 }
 static i32 nb_set(i32 fd, i32 on) {  // 0 or -errno
     Obj *o = vobj(fd);
