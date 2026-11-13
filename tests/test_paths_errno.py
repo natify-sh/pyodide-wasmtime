@@ -70,7 +70,8 @@ linkat = libc.linkat
 assert raw(linkat, -100, b'', -100, b'z', 0) == 'ENOENT' and raw(linkat, -100, b'f', -100, b'', 0) == 'ENOENT'
 # utimensat: "" is ENOENT (Linux; Pyodide takes it as the descriptor), os.utime(fd) is futimens (a null path) and works
 assert err(os.utime, '', (1, 1)) == 'ENOENT' and err(os.utime, '', (1, 1), dir_fd=dfd) == 'ENOENT'
-assert err(os.utime, dfd, (1, 1)) is None
+_u = err(os.utime, dfd, (1, 1))
+assert _u is None, _u
 assert os.stat('d').st_mtime > 1e9 and os.stat(dfd).st_mtime == 1
 # AT_EMPTY_PATH of fstatat is the descriptor (or the cwd); without it "" is ENOENT even for a bad descriptor (Linux)
 buf = ctypes.create_string_buffer(256)
@@ -94,7 +95,8 @@ open('e/sub/h', 'w').write('x')
 assert err(os.rmdir, 'e/') == 'ENOTEMPTY'
 shutil.rmtree('e/')
 assert not os.path.exists('e')
-assert err(os.rmdir, 'f/') == 'ENOTDIR' and err(os.rmdir, 'nothere/') == 'ENOENT' and err(os.rmdir, '.') == 'EINVAL'
+_r = (err(os.rmdir, 'f/'), err(os.rmdir, 'nothere/'), err(os.rmdir, '.'))
+assert _r == ('ENOTDIR', 'ENOENT', 'EINVAL'), _r
 os.rmdir(os.path.join(W, 'd') + '/')  # absolute, too
 assert not os.path.exists('d')
 os.mkdir('d')
@@ -121,7 +123,8 @@ else:
     raise AssertionError
 # a write-only file is still EBADF
 fd = os.open('f', os.O_WRONLY)
-assert err(os.read, fd, 1) == 'EBADF' and err(os.pread, fd, 1, 0) == 'EBADF'
+_w = (err(os.read, fd, 1), err(os.pread, fd, 1, 0))
+assert _w == ('EBADF', 'EBADF'), _w
 """,
     )
 
@@ -131,7 +134,8 @@ def test_open_of_a_directory_for_writing_is_eisdir(guest: Guest):
         guest,
         """
 for fl in (os.O_WRONLY, os.O_RDWR, os.O_WRONLY | os.O_CREAT, os.O_RDWR | os.O_TRUNC, os.O_WRONLY | os.O_APPEND):
-    assert err(os.open, 'd', fl) == 'EISDIR', fl
+    _o = err(os.open, 'd', fl)
+    assert _o == 'EISDIR', (fl, _o)
     assert err(os.open, '.', fl) == 'EISDIR', fl
 assert err(os.open, 'd', os.O_WRONLY | os.O_DIRECTORY) == 'EISDIR'
 assert err(os.open, 'f', os.O_DIRECTORY) == 'ENOTDIR'
