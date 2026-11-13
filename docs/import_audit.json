@@ -2050,7 +2050,8 @@
   "class": "os",
   "verdict": "partial",
   "gaps": [
-   "WASI timestamps are unsigned nanoseconds since 1970 (u64): a time before 1970 or after the year 2554 is EINVAL, where Pyodide's JavaScript Date accepts it (os.utime(f, (-5, 10)) and (2**40, 10))."
+   "WASI timestamps are unsigned nanoseconds since 1970 (u64): a time before 1970 or after the year 2554 is EINVAL, where Pyodide's JavaScript Date accepts it (os.utime(f, (-5, 10)) and (2**40, 10)).",
+   "Windows: utime of an open directory descriptor (futimens) is EACCES, a limit of the host's directory handle (no write-attributes access); not worked around."
   ],
   "evidence": "adapter.c sc_utimensat: path_filestat_set_times / fd_filestat_set_times (a null or empty path is the descriptor, futimens), UTIME_NOW and UTIME_OMIT per time, AT_SYMLINK_NOFOLLOW, ENOENT for a missing path, EINVAL for a bad nanosecond, ENOTDIR for a relative path under a dirfd that is an open non-directory (a pipe, a socket, a file, a standard stream), 0 for the descriptor itself when it is a pipe, a socket or a standard stream (Pyodide: None). probe fs_p1/fs_p2 (the audit's fs1/fs2/dir2/fa style) run in the real Pyodide 315.0.0-alpha.2 on Node and in both packagings match for ordinary times. (CPython's os.utime here goes through utimes(), so a time set from Python has microsecond precision.) By path on a virtual node: accepted and ignored (Pyodide's answer; shutil.copy2/copystat to /dev/null work), ENOENT for a name that is not there. B4b: a non-null empty path without AT_EMPTY_PATH is ENOENT (Linux; Pyodide takes '' as the descriptor, os.utime('', t) succeeds there: a defect of its own); futimens (os.utime(fd)) passes a null path and is unchanged, on a standard stream too.",
   "tested": "tests/test_files.py::test_utimensat_sets_the_times, tests/test_dev.py, tests/test_paths_errno.py::test_the_empty_path_is_enoent_in_every_call, tests/test_paths_errno.py::test_standard_streams_stat_and_times"

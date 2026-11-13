@@ -5,7 +5,11 @@ and Linux's is kept. The refusals of the mutating calls on /dev and /proc are th
 
 from __future__ import annotations
 
+import sys
+
 from conftest import Guest
+
+WIN = sys.platform == "win32"
 
 HEAD = """
 import os, errno, shutil, ctypes, tempfile
@@ -33,7 +37,7 @@ os.mkdir('d')
 
 def run(guest: Guest, body: str) -> None:
     # the script runs through exec with its source registered, so a failure shows the line, not only its number
-    script = HEAD + body
+    script = f"WIN = {WIN}\n" + HEAD + body
     code = (
         f"import linecache\nS = {script!r}\nlinecache.cache['<t>'] = (len(S), None, S.splitlines(True), '<t>')\n"
         "exec(compile(S, '<t>', 'exec'))\nprint('ok')"
@@ -70,9 +74,10 @@ linkat = libc.linkat
 assert raw(linkat, -100, b'', -100, b'z', 0) == 'ENOENT' and raw(linkat, -100, b'f', -100, b'', 0) == 'ENOENT'
 # utimensat: "" is ENOENT (Linux; Pyodide takes it as the descriptor), os.utime(fd) is futimens (a null path) and works
 assert err(os.utime, '', (1, 1)) == 'ENOENT' and err(os.utime, '', (1, 1), dir_fd=dfd) == 'ENOENT'
-_u = err(os.utime, dfd, (1, 1))
-assert _u is None, _u
-assert os.stat('d').st_mtime > 1e9 and os.stat(dfd).st_mtime == 1
+if not WIN:  # a Windows host's directory handle lacks write-attributes access (EACCES)
+    _u = err(os.utime, dfd, (1, 1))
+    assert _u is None, _u
+    assert os.stat('d').st_mtime > 1e9 and os.stat(dfd).st_mtime == 1
 # AT_EMPTY_PATH of fstatat is the descriptor (or the cwd); without it "" is ENOENT even for a bad descriptor (Linux)
 buf = ctypes.create_string_buffer(256)
 assert raw(libc.fstatat, dfd, b'', buf, 0x1000) == 0 and raw(libc.fstatat, -100, b'', buf, 0x1000) == 0
@@ -97,6 +102,12 @@ shutil.rmtree('e/')
 assert not os.path.exists('e')
 _r = (err(os.rmdir, 'f/'), err(os.rmdir, 'nothere/'), err(os.rmdir, '.'))
 assert _r == ('ENOTDIR', 'ENOENT', 'EINVAL'), _r
+# the last component decides: "." is EINVAL, ".." is ENOTEMPTY (a Windows host says EACCES for both)
+os.mkdir('e')
+_r = (err(os.rmdir, 'd/.'), err(os.rmdir, 'd/..'), err(os.rmdir, 'e/./'), err(os.rmdir, '..'), err(os.rmdir, './.'))
+assert _r == ('EINVAL', 'ENOTEMPTY', 'EINVAL', 'ENOTEMPTY', 'EINVAL'), _r
+assert os.path.isdir('d') and os.path.isdir('e')
+os.rmdir('e')
 os.rmdir(os.path.join(W, 'd') + '/')  # absolute, too
 assert not os.path.exists('d')
 os.mkdir('d')

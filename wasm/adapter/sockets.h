@@ -323,7 +323,11 @@ static i32 is_regular(i32 fd) { return fd_type(fd) == 4; }
 
 // WASI answers a read of a directory descriptor with EBADF: the error is looked at only after it happened, so the reads of
 // files pay nothing for it. A directory is EISDIR (Linux and Pyodide); a write-only file stays EBADF.
-static i32 eisdir(i32 fd, i32 e) { return e == FE_BADF && fd_type(fd) == 3 ? FE_ISDIR : e; }
+// A Windows host answers the read of a write-only file with EACCES: it is EBADF here too.
+static i32 eisdir(i32 fd, i32 e) {
+    if (e == FE_ACCES) return fd_type(fd) == 4 ? FE_BADF : e;
+    return e == FE_BADF && fd_type(fd) == 3 ? FE_ISDIR : e;
+}
 
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {

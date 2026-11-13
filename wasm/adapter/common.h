@@ -98,6 +98,7 @@ LOADER("cpuclock") i32 host_cpuclock(i32 id, i32 res, u64 *out);  // the host's 
 #define FE_PERM 63
 #define FE_NOSYS 52
 #define FE_NOTDIR 54
+#define FE_NOTEMPTY 55
 #define FE_SPIPE 70
 #define FE_XDEV 75
 #define FE_OPNOTSUPP 138

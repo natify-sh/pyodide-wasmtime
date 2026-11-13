@@ -521,7 +521,14 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
     u64 rights = acc == 0 ? all & ~writes : acc == 1 ? all & ~reads : all;
     i32 out = -1;
     i32 e = w_path_open(fd, (flags & 0400000) ? 0 : 1, p, n, oflags, rights, all, fdflags, &out);
-    if (e) return -e;
+    if (e) {
+        // a Windows host answers the write-open of a directory with EINVAL or EACCES, Linux with EISDIR (looked at only after the failure)
+        if ((e == FE_INVAL || e == FE_ACCES || e == FE_PERM) && (acc || (flags & (01000 | 02000 | 0100)))) {
+            u64 fs[8] = {0};
+            if (!w_path_filestat_get(fd, (flags & 0400000) ? 0 : 1, p, n, fs) && ((u8 *)fs)[16] == 3) return -FE_ISDIR;
+        }
+        return -e;
+    }
     if (created) {
         u64 fs[8];
         if (!w_fd_filestat_get(out, fs)) meta_created((const u8 *)fs, mode, 07777);

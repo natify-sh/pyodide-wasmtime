@@ -77,6 +77,7 @@ the browser-free `emscripten_*` names are not planned; HTTPS in a component woul
 ## 7. Work: the platforms (CI is the only check there)
 
 * Unverified guesses to look at in the next CI logs: UDP `send` without a peer on Windows (WSAENOTCONN mapped to EDESTADDRREQ without a log), `_t_localtime` on Windows (fixed by the offset from the fields: green now), poll HUP after `shutdown` on Windows (the host adds it), the wasm stack 1 MiB and the NEEDED depth cap 800/1500 (Linux measured only), `chmod /tmp` at start on Windows.
+* Windows host (wasmtime 50.0.1) answers the adapter normalises: `rmdir` of a path ending in `.`/`..` (EINVAL/ENOTEMPTY), a read of a write-only file (EBADF), a write-open of a directory (EISDIR); not normalised, a limit of the host handle: `os.utime(dir_fd, ...)` is EACCES.
 * Offline matrix: 6 jobs (3 OS x Python 3.10/3.15) plus the suite 2 and build 2 and network 1: fewer if the runners are the limit.
 * macOS CI flake: `test_a_non_blocking_send_never_waits` (send with MSG_DONTWAIT on a full AF_UNIX socketpair is not always EAGAIN on macOS); it passed on rerun.
 
