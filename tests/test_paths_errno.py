@@ -32,7 +32,13 @@ os.mkdir('d')
 
 
 def run(guest: Guest, body: str) -> None:
-    r = guest.run(HEAD + body + "\nprint('ok')", None)
+    # the script runs through exec with its source registered, so a failure shows the line, not only its number
+    script = HEAD + body
+    code = (
+        f"import linecache\nS = {script!r}\nlinecache.cache['<t>'] = (len(S), None, S.splitlines(True), '<t>')\n"
+        "exec(compile(S, '<t>', 'exec'))\nprint('ok')"
+    )
+    r = guest.run(code, None)
     err_lines = [ln for ln in r.stderr.splitlines() if not ln.startswith("[host]")]  # the traceback, not the host's log
     assert r.returncode == 0 and r.stdout.rstrip().endswith("ok"), (r.stdout[-1500:], "\n".join(err_lines)[-2500:])
 
