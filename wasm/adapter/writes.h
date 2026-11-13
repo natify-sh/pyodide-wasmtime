@@ -36,6 +36,9 @@ EXPORT("__syscall_unlinkat") i32 sc_unlinkat(i32 dirfd, const char *path, i32 fl
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
+    // rmdir("d/"), rmdir("d//"): the slashes are not part of the name (Linux; WASI's path_remove_directory says EINVAL for them)
+    if (flags & 0x200)
+        while (n > 1 && p[n - 1] == '/') n--;
     u64 key[2];
     i32 doomed = meta_doomed(fd, p, n, key);
     i32 de = dir_denies(fd, p, n, 0);
@@ -52,7 +55,7 @@ static void relink(i32 dirfd, const char *path);
 static void relink_tree(const char *abs, i32 depth);
 EXPORT("__syscall_renameat") i32 sc_renameat(i32 olddirfd, const char *oldpath, i32 newdirfd, const char *newpath) {
     i32 vd = vdeny(olddirfd, oldpath, 0);
-    if (!vd) vd = vdeny(newdirfd, newpath, 1);
+    if (!vd) vd = vdeny(newdirfd, newpath, 2);
     if (vd) return -vd;
     i32 nd = notdir(olddirfd, oldpath);
     if (!nd) nd = notdir(newdirfd, newpath);
@@ -98,9 +101,15 @@ EXPORT("__syscall_truncate64") i32 sc_truncate64(const char *path, i64 len) {
     Vn v;
     i32 vk = vnode(AT_FDCWD, path, &v);
     if (vk) return vk == 2 ? -v.err : v.id <= VN_SHM ? -FE_ISDIR : -FE_INVAL;  // a virtual node: as Pyodide's (EINVAL for a device)
+    if (!path[0]) return -FE_NOENT;
     char dot[2];
     const char *p;
     i32 n, fd = resolve(AT_FDCWD, path, &p, &n, dot), out = -1;
+    if (mt()->nrestrict) {  // the recorded mode must allow writing, as open() for writing checks it (Pyodide: EACCES; Linux lets root)
+        u64 fs[8];
+        Meta *r = w_path_filestat_get(fd, 1, p, n, fs) ? 0 : meta_find(fs[0], fs[1]);
+        if (r && !(r->mode & 0222)) return -FE_ACCES;
+    }
     i32 e = w_path_open(fd, 1, p, n, 0, (1ull << 6) | (1ull << 22), 0, 0, &out);  // rights: FD_WRITE (opens it for writing), FD_FILESTAT_SET_SIZE
     if (e) return -e;
     e = w_fd_set_size(out, (u64)len);
@@ -138,12 +147,14 @@ EXPORT("__syscall_fdatasync") i32 sc_fdatasync(i32 fd) {
     return e == 0 || e == FE_INVAL || e == FE_BADF || e == 58 /* ENOTSUP */ ? 0 : -e;
 }
 
-// advice only (nothing to do), but a bad descriptor is EBADF and a stream or a socket is ESPIPE
+// advice only (nothing to do), but a bad descriptor is EBADF, a stream or a socket is ESPIPE, and the advice must be one of
+// POSIX_FADV_NORMAL..DONTNEED (0..5: Linux's EINVAL; Pyodide takes any number)
 EXPORT("__syscall_fadvise64") i32 sc_fadvise64(i32 fd, i64 offset, i64 len, i32 advice) {
-    (void)offset, (void)len, (void)advice;
+    (void)offset, (void)len;
     i32 ft = fd_type(fd);
     if (ft < 0) return ft;
-    return fd_seekable(fd, ft) ? 0 : -FE_SPIPE;
+    if (!fd_seekable(fd, ft)) return -FE_SPIPE;
+    return (u32)advice > 5 ? -FE_INVAL : 0;
 }
 
 // A symlink with an absolute target: wasmtime refuses it (EPERM), so the link holds the relative path from its own
@@ -381,6 +392,7 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         return e ? -e : 0;
     }
     i32 e;
+    if (path && !(flags & 0x1000)) return -FE_NOENT;  // "" without AT_EMPTY_PATH (Linux; Pyodide takes it as the descriptor: a defect of its own)
     if (dirfd == AT_FDCWD) {
         char dot[2];
         dot[0] = '.', dot[1] = 0;

@@ -18,8 +18,8 @@
 // handles K_DEV explicitly or gets WASI's EBADF from rfd() == -1: never a guest number reaches a w_fd_* call.
 // For the calls that look at WASI's filestat (stat, access, chmod) a node is described by a synthesized filestat (vfs):
 // its st_dev is VDEV (no host file has it), its mode is in the padding at +20 (def_for reads it there), so a chmod/chown
-// is kept in the session's metadata like a file's. Not served here: the mutating path calls (mkdir, unlink, rename,
-// symlink, link, truncate, utimensat by path) and chdir do not look at virtual nodes yet (W3).
+// is kept in the session's metadata like a file's. The mutating path calls (mkdir, unlink, rmdir, rename,
+// symlink, link) are refused here (vdeny), truncate and utimensat by path answer for a node, chdir/fchdir enter the directories.
 #ifndef ADAPTER_DEV_H
 #define ADAPTER_DEV_H
 
@@ -371,12 +371,13 @@ static i32 dev_write(const Obj *o, const u32 *iov, i32 n, i32 *nw) {
 // ---- the mutating path calls (mkdir, unlink, rmdir, rename, symlink, link) never reach the host's folder for a path in the
 // virtual tree. -> 0 (not virtual: the caller goes on), else the errno. mk: the call makes the name (an existing node is
 // EEXIST, a name that can not exist here EACCES: nothing can be made under /dev or /proc), else it needs the name to exist
-// (a node is EACCES: it can not be removed or renamed; a name that is not there says why).
+// (a node is EACCES: it can not be removed or renamed; a name that is not there says why). mk == 2: rename's new name, which
+// would replace a node (EACCES: it can not be replaced, like a name that can not be made) where mkdir and symlink say EEXIST.
 static i32 vdeny(i32 dirfd, const char *path, i32 mk) {
     Vn v;
     i32 vk = vnode(dirfd, path, &v);
     if (!vk) return 0;
-    if (vk == 1) return mk ? FE_EXIST : FE_ACCES;
+    if (vk == 1) return mk == 1 ? FE_EXIST : FE_ACCES;
     return mk && v.err == FE_NOENT ? FE_ACCES : v.err;
 }
 

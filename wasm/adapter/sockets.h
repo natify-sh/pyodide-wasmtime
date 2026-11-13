@@ -321,6 +321,10 @@ static i32 file_iov(i32 op, i32 fd, const u32 *iov, i32 n, u64 off, i32 *done) {
 
 static i32 is_regular(i32 fd) { return fd_type(fd) == 4; }
 
+// WASI answers a read of a directory descriptor with EBADF: the error is looked at only after it happened, so the reads of
+// files pay nothing for it. A directory is EISDIR (Linux and Pyodide); a write-only file stays EBADF.
+static i32 eisdir(i32 fd, i32 e) { return e == FE_BADF && fd_type(fd) == 3 ? FE_ISDIR : e; }
+
 // the main module's WASI calls, for socket descriptors
 EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     i32 empty = 1;
@@ -328,7 +332,7 @@ EXPORT("fd_read") i32 x_fd_read(i32 fd, const u32 *iov, i32 n, i32 *nread) {
     if (empty && fd_std(fd)) return *nread = 0;  // a read of 0 bytes on stdin must not wait for input
     if (is_pipe(fd)) return pipe_read(vobj(fd), iov, n, nread);
     if (is_dev(fd)) return dev_read(vobj(fd), iov, n, nread);
-    if (!is_sock(fd)) return n <= 1 || !is_regular(fd) ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread);
+    if (!is_sock(fd)) return eisdir(fd, n <= 1 || !is_regular(fd) ? w_fd_read(rfd(fd), iov, n, nread) : file_iov(0, rfd(fd), iov, n, 0, nread));
     if (would_block(fd, 0, 1)) return EAGAIN_;
     i32 tot = 0;
     for (i32 k = 0; k < n; k++) {
@@ -383,8 +387,8 @@ EXPORT("fd_fdstat_get") i32 x_fd_fdstat_get(i32 fd, u8 *buf) {
 WASI("fd_sync") i32 w_fd_sync(i32 fd);
 EXPORT("fd_pread") i32 x_fd_pread(i32 fd, const void *iov, i32 n, u64 off, i32 *nread) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;  // the glue's bigintToI53Checked
-    if (is_dev(fd) && vobj(fd)->dev == VN_NULL) return dev_read(vobj(fd), (const u32 *)iov, n, nread);  // (the others have no offset)
-    return is_virt(fd) ? FE_SPIPE : file_iov(2, rfd(fd), (const u32 *)iov, n, off, nread);
+    if (is_dev(fd) && (vobj(fd)->dev == VN_NULL || dev_isdir(vobj(fd)))) return dev_read(vobj(fd), (const u32 *)iov, n, nread);  // (the other devices have no offset; a directory is EISDIR)
+    return is_virt(fd) ? FE_SPIPE : eisdir(fd, file_iov(2, rfd(fd), (const u32 *)iov, n, off, nread));
 }
 EXPORT("fd_pwrite") i32 x_fd_pwrite(i32 fd, const void *iov, i32 n, u64 off, i32 *nw) {
     if ((i64)off > (1ll << 53) || (i64)off < -(1ll << 53)) return FE_FBIG;

@@ -129,10 +129,13 @@ static i32 nb_keeps(i32 fd) {
     Obj *o = vobj(fd);
     return o && (o->kind == K_DEV || (o->kind == K_FILE && (o->std || (!w_fd_fdstat_get(o->w, st) && st[0] == 3))));
 }
-// ENOTDIR for a relative path under a dirfd that is an open object but no directory (a pipe, a socket, a file, a standard
-// stream; Linux), else 0: a free number stays EBADF (WASI), and an absolute path has no use for the directory
+// The check that every call with a path makes first (Linux's order): an empty path is ENOENT, whatever the directory is (WASI
+// would read it as "."; only fstatat's AT_EMPTY_PATH and utimensat's null path or AT_EMPTY_PATH name the descriptor itself,
+// and they do not come here); a relative path under a dirfd that is an open object but no directory (a pipe, a socket, a
+// file, a standard stream) is ENOTDIR. Else 0: a free number stays EBADF (WASI), and an absolute path has no use for the dirfd.
 static i32 notdir(i32 dirfd, const char *path) {
     u8 st[24] __attribute__((aligned(8)));
+    if (!path[0]) return FE_NOENT;
     Obj *o = path[0] == '/' ? 0 : vobj(dirfd);
     if (!o) return 0;
     if (o->kind == K_DEV && dev_isdir(o)) return 0;
@@ -140,7 +143,7 @@ static i32 notdir(i32 dirfd, const char *path) {
         if (!o->isdir) o->isdir = !w_fd_fdstat_get(o->w, st) && st[0] == 3 ? 1 : 2;  // one host call per object
         if (o->isdir == 1) return 0;
     }
-    return path[0] ? FE_NOTDIR : FE_NOENT;  // an empty path is ENOENT first (Linux)
+    return FE_NOTDIR;
 }
 static i32 nb_set(i32 fd, i32 on) {  // 0 or -errno
     Obj *o = vobj(fd);

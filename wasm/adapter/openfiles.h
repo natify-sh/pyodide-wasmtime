@@ -97,6 +97,13 @@ static i32 lead_dots_only(const char *s) {  // every ".." comes before the first
     }
     return 1;
 }
+static i32 under_virt(const char *s) {  // the absolute path lies at or below /dev or /proc (dev.h's tree)
+    while (*s == '/') s++;
+    i32 l = 0;
+    while (s[l] && s[l] != '/') l++;
+    u64 k = ckey(s, l);
+    return k == N_DEV || k == N_PROC;
+}
 static const char *fixpath(i32 gfd, const char *path) {  // gfd: a guest number, or AT_FDCWD
     i32 dirfd = rfd(gfd);
     Cwd *C = cwdst();
@@ -156,6 +163,13 @@ static const char *fixpath(i32 gfd, const char *path) {  // gfd: a guest number,
                 continue;
             }
             depth--;
+            o[k] = 0;
+            if (compose && under_virt(o)) {  // the cwd is in /dev or /proc, which the host has not: ".." is popped here, not left to WASI
+                k--;                         // (o ends with the '/' before this name)
+                while (k > 0 && o[k - 1] != '/') k--;
+                while (path[i] == '/') i++;
+                continue;
+            }
         } else if (!(l == 1 && path[st] == '.')) {
             depth++;
         }
@@ -423,10 +437,29 @@ static i32 phys(const char *base, const char *path, i32 follow, char **res) {
     return 0;
 }
 
+// chdir from or into /dev or /proc (the host has no such folder): a virtual directory is entered, its path is made here.
+// -> 0 or -errno, or 1: the path is not in the virtual tree (or leaves it with ".." at once: "..", "/dev/.."), the caller walks it
+// physically. (A path that goes down into the tree and comes back with ".." ("/dev/../tmp") is ENOENT: vnode() classifies by the
+// first names, as the B4a notes say.)
+static i32 chdir_virt(Cwd *C, const char *path) {
+    Vn v;
+    i32 vk = vnode(AT_FDCWD, path, &v);
+    if (!vk) return 1;
+    if (vk == 2 || v.id > VN_SHM) return -(vk == 2 ? v.err : FE_NOTDIR);  // (a node that is no directory, a link included)
+    char *vp = (char *)malloc(16);
+    if (!vp) return -ENOMEM;
+    vn_put(vp, v.id);
+    free(C->cwd);
+    C->cwd = vp;
+    return 0;
+}
+
 // chdir is physical: getcwd after chdir through a link shows the real directory, and ".." is its real parent
 EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
     if (!path[0]) return -FE_NOENT;
     Cwd *C = cwdst();
+    i32 ve = chdir_virt(C, path);  // (vnode() answers 0 at once for a path outside the tree)
+    if (ve != 1) return ve;
     char *res;
     i32 e = phys(C->cwd, path, 1, &res);
     if (e) return -e;
@@ -447,6 +480,8 @@ EXPORT("__syscall_chdir") i32 sc_chdir(const char *path) {
 
 EXPORT("__syscall_fchdir") i32 sc_fchdir(i32 fd) {
     const char *p = fd_base_path(fd);  // a directory opened by openat
+    Obj *vo = vobj(fd);
+    if (!p && vo && vo->kind == K_DEV && dev_isdir(vo)) p = vo->path;  // a virtual directory
     if (p) return sc_chdir(p);
     return vobj(fd) ? -FE_NOTDIR : -FE_BADF;  // a stream, a file or a socket: not a directory
 }
@@ -543,7 +578,10 @@ EXPORT("__syscall_fstat64") i32 sc_fstat64(i32 fd, void *buf) {
     i32 e = w_fd_filestat_get(rfd(fd), fs);
     if (e) return -e;
     put_stat((u8 *)buf, (const u8 *)fs);
-    if (fd_std(fd)) *(u32 *)((u8 *)buf + 4) = 0020666;  // the standard streams are character devices (Pyodide's fstat(1))
+    if (fd_std(fd)) {  // the standard streams are character devices with one link (Pyodide's fstat(1))
+        *(u32 *)((u8 *)buf + 4) = 0020666;
+        *(u32 *)((u8 *)buf + 8) = 1;
+    }
     return 0;
 }
 

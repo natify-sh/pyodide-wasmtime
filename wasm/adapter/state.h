@@ -45,9 +45,11 @@ static Pre *preopens(void) {
         r = (Pre *)malloc(sizeof(Pre));
         r->n = 0;
         for (i32 fd = 3; fd < 3 + 64 && r->n < MAXPRE; fd++) {
-            u32 st[2];
+            // WASI's prestat is {tag u8, 3 bytes of padding, name length u32}: the host writes the tag byte and the length only, so the
+            // tag is read at the width of its field (the invariant for every out-struct of a WASI call: read a field at its own width)
+            u32 st[2] = {0, 0};
             if (w_fd_prestat_get(fd, st)) break;
-            if (st[0] != 0 || st[1] >= 63) continue;
+            if ((u8)st[0] != 0 || st[1] >= 63) continue;
             w_fd_prestat_dir_name(fd, r->name[r->n], (i32)st[1]);
             i32 l = (i32)st[1];
             while (l > 1 && r->name[r->n][l - 1] == '/') l--;  // "/dev/" -> "/dev"
