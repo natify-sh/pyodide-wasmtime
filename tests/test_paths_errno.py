@@ -33,7 +33,8 @@ os.mkdir('d')
 
 def run(guest: Guest, body: str) -> None:
     r = guest.run(HEAD + body + "\nprint('ok')", None)
-    assert r.returncode == 0 and r.stdout.rstrip().endswith("ok"), (r.stdout[-1500:], r.stderr[-2500:])
+    err_lines = [ln for ln in r.stderr.splitlines() if not ln.startswith("[host]")]  # the traceback, not the host's log
+    assert r.returncode == 0 and r.stdout.rstrip().endswith("ok"), (r.stdout[-1500:], "\n".join(err_lines)[-2500:])
 
 
 def test_the_empty_path_is_enoent_in_every_call(guest: Guest):

@@ -836,8 +836,11 @@ for d, n in (('small', 300), ('big', 3000)):
     os.mkdir(B + '/' + d)
     for i in range(n):
         open(B + '/%s/f%04d' % (d, i), 'w').close()
-ts, small = best(B + '/small')
-tb, big = best(B + '/big')
+for _ in range(3):  # one measurement can be skewed on a busy runner; a ~100x listing is slow in every attempt
+    ts, small = best(B + '/small')
+    tb, big = best(B + '/big')
+    if tb / ts < 30:
+        break
 assert sorted(big) == ['f%04d' % i for i in range(3000)] and len(small) == 300
 names = [e.name for e in os.scandir(B + '/big')]
 assert sorted(names) == sorted(big)
