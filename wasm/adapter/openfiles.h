@@ -104,6 +104,40 @@ static i32 under_virt(const char *s) {  // the absolute path lies at or below /d
     u64 k = ckey(s, l);
     return k == N_DEV || k == N_PROC;
 }
+// A relative path under a directory descriptor, walked physically (every link followed except the last name) from the
+// directory the descriptor stands for: its recorded path is the one it was OPENED with, which may go through a symlink, so
+// it is resolved physically first, and it must still name the same directory (a renamed one is not guessed at). Not for a
+// path that ends with '/' or '/.' (the last link must then be followed, which is left to WASI's own answer).
+// -> the absolute physical path in a buffer of ours, or 0 (the caller keeps WASI's refusal: a failing call is better than
+// a wrong file).
+static const char *byfd_phys(i32 gfd, const char *path) {
+    i32 dirfd = rfd(gfd), pl = slen(path);
+    if (pl == 0 || path[pl - 1] == '/' || (path[pl - 1] == '.' && (pl == 1 || path[pl - 2] == '/'))) return 0;
+    const char *base = fd_base_path(gfd);
+    if (!base) return 0;
+    char *pb, *r;
+    if (phys(base, base, 1, &pb)) return 0;
+    char dot[2];
+    const char *bp;
+    u64 fs[8], gs[8];
+    i32 bn, bfd = resolve(AT_FDCWD, pb, &bp, &bn, dot);
+    if (w_fd_filestat_get(dirfd, fs) || w_path_filestat_get(bfd, 1, bp, bn, gs) || fs[0] != gs[0] || fs[1] != gs[1]) {
+        free(pb);
+        return 0;
+    }
+    i32 e = phys(pb, path, 0, &r);
+    free(pb);
+    if (e) return 0;
+    u32 n = (u32)slen(r);
+    Cwd *C = cwdst();
+    char *o = slot(C->flip, n + 1);
+    if (o) {
+        C->flip ^= 1;
+        for (u32 i = 0; i <= n; i++) o[i] = r[i];
+    }
+    free(r);
+    return o;
+}
 static const char *fixpath(i32 gfd, const char *path) {  // gfd: a guest number, or AT_FDCWD
     i32 dirfd = rfd(gfd);
     Cwd *C = cwdst();
@@ -112,21 +146,16 @@ static const char *fixpath(i32 gfd, const char *path) {  // gfd: a guest number,
     const char *base = 0;
     i32 byfd = rel && dirfd != AT_FDCWD;
     if (byfd) {
-        u64 fs[8], gs[8];
+        u64 fs[8];
         if (!dd || w_path_filestat_get(dirfd, 0, path, slen(path), fs) != FE_PERM) return path;
-        base = fd_base_path(gfd);
-        char dot[2];
-        const char *bp;
-        i32 bn, bfd;
-        if (!base) return path;
-        bfd = resolve(AT_FDCWD, base, &bp, &bn, dot);
-        if (w_fd_filestat_get(dirfd, fs) || w_path_filestat_get(bfd, 1, bp, bn, gs) || fs[0] != gs[0] || fs[1] != gs[1]) return path;
+        const char *o = byfd_phys(gfd, path);  // ".." out of the descriptor (WASI refuses it)
+        return o ? o : path;
     } else if (rel) {
         base = C->cwd;
     }
     i32 compose = rel && !byfd && !(C->cwd[0] == '/' && C->cwd[1] == 0);
     if (!compose && !dd) return path;
-    if (dd && (byfd || !lead_dots_only(path))) {
+    if (dd && !lead_dots_only(path)) {
         char *r;
         if (!phys(base, path, 0, &r)) {
             u32 n = (u32)slen(r);
@@ -139,7 +168,6 @@ static const char *fixpath(i32 gfd, const char *path) {  // gfd: a guest number,
             }
             free(r);
         }
-        if (byfd) return path;
     }
     i32 depth = base ? ncomp(base) : 0;
     u32 bl = compose ? (u32)slen(base) : 0;
@@ -276,6 +304,19 @@ static i32 fd_fs(i32 fd, u64 *fs) {
 }
 i32 sc_fstat64(i32 fd, void *buf);
 
+// A path under a directory descriptor that WASI refused with EPERM because a symlink on the way (relative with "..", or an
+// absolute one, stored relative) leaves the descriptor, which is WASI's sandbox: it is walked physically from the path the
+// descriptor stands for (byfd_phys(), as the ".." case of fixpath() does).
+// Called only after such a failure, so a call that succeeds costs nothing. -> 1, and the new fd/path/length (an absolute
+// path in a buffer of ours) when the call is worth making again, else 0.
+static i32 reresolve(i32 gfd, const char *path, i32 *fd, const char **p, i32 *n, char *dot) {
+    if (path[0] == '/' || rfd(gfd) == AT_FDCWD) return 0;
+    const char *o = byfd_phys(gfd, path);
+    if (!o) return 0;
+    *fd = resolve(AT_FDCWD, o, p, n, dot);
+    return 1;
+}
+
 // the WASI filestat of dirfd + path: an empty path is ENOENT (only AT_EMPTY_PATH allows it); -> an errno or 0
 static i32 fx_real(i32 dirfd, const char *path, i32 follow, u64 *fs) {
     if (!path[0]) return FE_NOENT;
@@ -284,7 +325,9 @@ static i32 fx_real(i32 dirfd, const char *path, i32 follow, u64 *fs) {
     char dot[2];
     const char *p;
     i32 n, fd = resolve(dirfd, path, &p, &n, dot);
-    return w_path_filestat_get(fd, follow ? 1 : 0, p, n, fs);
+    i32 e = w_path_filestat_get(fd, follow ? 1 : 0, p, n, fs);
+    if (e == FE_PERM && reresolve(dirfd, path, &fd, &p, &n, dot)) e = w_path_filestat_get(fd, follow ? 1 : 0, p, n, fs);
+    return e;
 }
 // a virtual node's filestat (the target's for a followed /proc/self/fd/N), or the answer of fx_real
 static i32 fx_lookup(i32 dirfd, const char *path, i32 follow, u64 *fs) {
@@ -503,7 +546,9 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
     if (flags & 04000) fdflags |= 4;     // O_NONBLOCK
     if (!nocheck && ((flags & 0100) || mt()->nrestrict)) {  // is it made now? if it exists, may it be opened (its recorded mode)?
         u64 fs[8];
-        if (w_path_filestat_get(fd, (flags & 0400000) ? 0 : 1, p, n, fs)) {
+        i32 se = w_path_filestat_get(fd, (flags & 0400000) ? 0 : 1, p, n, fs);
+        if (se == FE_PERM && reresolve(dirfd, path, &fd, &p, &n, dot)) se = w_path_filestat_get(fd, (flags & 0400000) ? 0 : 1, p, n, fs);
+        if (se) {
             created = (flags & 0100) != 0;
         } else if (!((flags & 0100) && (flags & 0200))) {
             Meta *r = meta_find(fs[0], fs[1]);
@@ -521,6 +566,7 @@ static i32 open_at(i32 dirfd, const char *path, i32 flags, u32 mode, i32 nocheck
     u64 rights = acc == 0 ? all & ~writes : acc == 1 ? all & ~reads : all;
     i32 out = -1;
     i32 e = w_path_open(fd, (flags & 0400000) ? 0 : 1, p, n, oflags, rights, all, fdflags, &out);
+    if (e == FE_PERM && reresolve(dirfd, path, &fd, &p, &n, dot)) e = w_path_open(fd, (flags & 0400000) ? 0 : 1, p, n, oflags, rights, all, fdflags, &out);
     if (e) {
         // a Windows host answers the write-open of a directory with EINVAL or EACCES, Linux with EISDIR (looked at only after the failure)
         if ((e == FE_INVAL || e == FE_ACCES || e == FE_PERM) && (acc || (flags & (01000 | 02000 | 0100)))) {
@@ -612,6 +658,7 @@ EXPORT("__syscall_readlinkat") i32 sc_readlinkat(i32 dirfd, const char *path, ch
     const char *p;
     i32 n, used = 0, fd = resolve(dirfd, path, &p, &n, dot);
     i32 e = w_path_readlink(fd, p, n, buf, len, &used);
+    if (e == FE_PERM && reresolve(dirfd, path, &fd, &p, &n, dot)) e = w_path_readlink(fd, p, n, buf, len, &used);
     if (e) return -e;
     if (mt()->ntarget) {  // a link made with an absolute target: what the program stored, not the relative one it holds
         u64 fs[8];

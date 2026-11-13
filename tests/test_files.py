@@ -675,6 +675,80 @@ if not WIN:  # Windows refuses to rename a directory with an open handle inside 
 
 
 @NO_WIN_SYMLINK
+def test_a_symlink_that_leaves_the_directory_descriptor_is_followed(guest: Guest):
+    # os.fwalk and shutil.rmtree use the descriptor of a directory with the names of its entries; WASI's sandbox is the
+    # descriptor, so a link to ".." or an absolute one (stored relative) was EPERM for stat/open: fwalk listed a file
+    check(
+        guest,
+        """
+os.makedirs('/w/d/sub')
+os.makedirs('/w/t2')
+open('/w/t2/f', 'w').write('in')
+os.symlink('/w/t2', '/w/d/sub/abs')
+os.symlink('../../t2', '/w/d/sub/rel')
+d = os.open('/w/d/sub', os.O_RDONLY)
+for name in ('abs', 'rel'):
+    assert stat.S_ISDIR(os.stat(name, dir_fd=d).st_mode), name
+    assert stat.S_ISLNK(os.stat(name, dir_fd=d, follow_symlinks=False).st_mode), name
+    assert os.read(os.open(name + '/f', os.O_RDONLY, dir_fd=d), 2) == b'in', name
+assert sorted(e.name for e in os.scandir(d) if e.is_dir()) == ['abs', 'rel']
+top, dirs, files, _ = next(os.fwalk('/w/d/sub'))
+assert sorted(dirs) == ['abs', 'rel'] and files == [], (dirs, files)
+""",
+    )
+
+
+@NO_WIN_SYMLINK
+def test_the_retry_after_a_symlink_left_the_descriptor_covers_each_call_and_never_picks_another_file(guest: Guest):
+    check(
+        guest,
+        """
+os.makedirs('/w/d/sub/sd')
+os.makedirs('/w/t2')
+os.makedirs('/w/sd')
+open('/w/t2/f', 'w').write('in')
+open('/w/sd/file', 'w').write('RIGHT')
+open('/w/d/sub/sd/file', 'w').write('WRONG')  # what a lexical walk of '../sd' from the link's name would reach
+open('/w/x_right', 'w').write('RIGHT')
+open('/w/d/sub/x_right', 'w').write('WRONG')
+os.symlink('/w/t2', '/w/d/sub/abs')
+os.symlink('../sd', '/w/t2/updir')
+os.symlink('../x_right', '/w/t2/up')
+d = os.open('/w/d/sub', os.O_RDONLY)
+# readlinkat: an intermediate link that leaves the descriptor; the last name is read, not followed
+os.symlink('target', '/w/t2/inner')
+assert os.readlink('abs/inner', dir_fd=d) == 'target'
+assert os.readlink('abs', dir_fd=d) == '/w/t2'
+# chmod and utimensat by path through the link (os.access has no dir_fd here)
+os.chmod('abs/f', 0o600, dir_fd=d)
+assert stat.S_IMODE(os.stat('/w/t2/f').st_mode) == 0o600
+os.utime('abs/f', ns=(7000, 8000), dir_fd=d)
+assert os.stat('/w/t2/f').st_mtime_ns == 8000
+# a path that ends with a slash is not walked here: the answer is Linux's or a refusal, never the link itself
+for name in ('abs/', 'abs/.'):
+    try:
+        assert stat.S_ISDIR(os.stat(name, dir_fd=d, follow_symlinks=False).st_mode), name
+    except PermissionError:
+        pass
+try:
+    os.readlink('abs/', dir_fd=d)
+    raise AssertionError('readlink of a directory')
+except OSError as e:
+    assert e.errno in (errno.EINVAL, errno.EPERM), e
+# a descriptor opened THROUGH the link names /w/t2, not /w/d/sub/abs: '..' and links are walked from the real place
+d2 = os.open('abs', os.O_RDONLY, dir_fd=d)
+assert open(os.open('updir/file', os.O_RDONLY, dir_fd=d2)).read() == 'RIGHT'
+assert open(os.open('up', os.O_RDONLY, dir_fd=d2)).read() == 'RIGHT'
+assert open(os.open('../x_right', os.O_RDONLY, dir_fd=d2)).read() == 'RIGHT'
+os.chmod('updir/file', 0o400, dir_fd=d2)
+assert stat.S_IMODE(os.stat('/w/sd/file').st_mode) == 0o400
+assert stat.S_IMODE(os.stat('/w/d/sub/sd/file').st_mode) != 0o400
+assert open(os.open('abs/updir/file', os.O_RDONLY, dir_fd=d)).read() == 'RIGHT'
+""",
+    )
+
+
+@NO_WIN_SYMLINK
 def test_a_renamed_directory_keeps_its_absolute_symlinks_pointing_at_the_same_file(guest: Guest):
     check(
         guest,

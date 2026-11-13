@@ -395,6 +395,7 @@ EXPORT("__syscall_utimensat") i32 sc_utimensat(i32 dirfd, const char *path, cons
         const char *p;
         i32 n, fd = resolve(dirfd, path, &p, &n, dot);
         i32 e = w_path_set_times(fd, (flags & 0x100) ? 0 : 1, p, n, tv[0], tv[1], ff);  // AT_SYMLINK_NOFOLLOW
+        if (e == FE_PERM && reresolve(dirfd, path, &fd, &p, &n, dot)) e = w_path_set_times(fd, (flags & 0x100) ? 0 : 1, p, n, tv[0], tv[1], ff);
         return e ? -e : 0;
     }
     i32 e;
