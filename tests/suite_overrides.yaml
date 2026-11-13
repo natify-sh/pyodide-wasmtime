@@ -1,0 +1,81 @@
+# Our own record of what Pyodide's official suite (python_tests.yaml of the release, which is not edited) still fails on
+# this build, per test, with the concrete reason. tests/test_pyodide_suite.py adds these `skip` globs (libregrtest test
+# ids; `*` matches anything) to the module's own list, and reports them as the `own_skips` property of the test in the
+# junit file. A record for a module that Pyodide marks `xfail` replaces that xfail (the cause is known per test).
+#
+#   <module>:
+#     - skip: [glob, ...]
+#       reason: what happens and why it is not ours to fix (or what the difference is)
+#       flavor: both | fused | dynamic     (default both)
+#       platform: sys.platform prefix of the host     (default every host)
+#
+# PYODIDE_SUITE_NO_OVERLAY=1 ignores this file (with PYODIDE_SUITE_RUN_XFAIL=1 that is the raw failing set).
+
+test_os.test_os:
+  - skip:
+      - "*ReadlinkTests.test_bytes"
+      - "*ReadlinkTests.test_pathlike"
+      - "*ReadlinkTests.test_pathlike_bytes"
+    reason: >-
+      the test makes a symlink in the working directory (the guest's root, a host folder) to an absolute path inside the
+      mounted `test` folder (another WASI preopen; the harness mounts `test` as a separate preopen, so this is partly an
+      artefact of the harness, the same link inside one tree works); a link is stored as a path relative to its own directory, and no
+      relative path leads from one preopen to another, so os.symlink is EXDEV (platform limit of WASI/cap-std, written
+      in the audit entry of __syscall_symlinkat; Pyodide's MEMFS has one tree)
+
+test_posixpath:
+  - skip:
+      - test_realpath_invalid_paths
+    reason: >-
+      realpath(b'/\xff', strict=ALL_BUT_LAST) must return the path (and strict=True raise FileNotFoundError); WASI paths
+      are UTF-8 text, so the host answers EILSEQ for every call with a name that is not (platform limit,
+      docs/DIFF_AUDIT_files.md section 4; Pyodide's MEMFS decodes the bytes to lone surrogates and answers ENOENT). The
+      skip also drops the assertions that follow it in the same test (b'/nonexistent/\xff' with all three strict modes)
+
+test_pathlib.test_pathlib:
+  - skip:
+      - "*test_copy_dir_preserve_metadata"
+      - "*test_copy_file_preserve_metadata"
+    reason: >-
+      the test copies the times with os.utime(ns=...) and compares st_atime/st_mtime with the source's. Pyodide's CPython
+      is built without utimensat (sysconfig HAVE_UTIMENSAT is 0), so os.utime goes through libc utimes(): the time
+      reaches the host in whole microseconds, while the host's file system keeps nanoseconds (MEMFS keeps milliseconds,
+      so the copy always equals the source there). The copy is shorter than the source by the sub-microsecond part
+      (1794585312.5305772 against 1794585312.530577); it passes by chance when the source's time is a whole number of
+      microseconds
+  - skip:
+      - "*test_matches_writablepath_docstrings"
+    reason: >-
+      the test uses `pathlib.types` without importing it; in Python 3.15 pathlib imports it lazily and only the other
+      test modules of the package (test_copy, test_read, ...) import it, so run alone the test fails with
+      AttributeError. The same in Pyodide itself (import pathlib: hasattr(pathlib, 'types') is False), not a difference
+
+test_filecmp:
+  - skip:
+      - "*FileCompareTestCase*"
+      - "*DirCompareTestCase*"
+    reason: >-
+      every test's setUp makes files with the same size and mtime through shutil.copystat (os.utime(ns=...)) and asserts
+      the mtimes are equal: the same microsecond truncation as test_pathlib's copy tests (os.utime goes through utimes(),
+      the host keeps nanoseconds). Which tests fail varies from run to run (12 to 15 of 16 in 5 runs per packaging)
+      because it holds when the source's time happens to be a whole number of microseconds (a coarse kernel timestamp);
+      both classes are skipped, so the module runs no tests here
+
+test_importlib.extension.test_finder:
+  - skip:
+      - "*test_abi3_extension_suffixes"
+    reason: >-
+      sysconfig.get_config_var('SOABI_PLATFORM') is '"wasm32-emscripten"' with the quotes (the value is in Pyodide's own
+      build data, python_stdlib.zip; the real Pyodide 315.0.0-alpha.2 gives the same), so the test looks for
+      '.abi3-"wasm32-emscripten".so' and the suffix list has '.abi3-wasm32-emscripten.so'
+
+test_importlib.extension.test_loader:
+  - skip:
+      - "*LoaderTests.test_is_package"
+      - "*SinglePhaseExtensionModuleTests.test_unloadable"
+      - "*SinglePhaseExtensionModuleTests.test_unloadable_nonascii"
+    reason: >-
+      the tests need the extension `_testsinglephase.so`, which Pyodide's `test` wheel does not contain (its side modules
+      are _ctypes_test, _testbuffer, _testcapi, _testimportmultiple, _testinternalcapi, _testmultiphase), so
+      util.EXTENSIONS.path is None; this is Pyodide's own `TODO: why does it fail?` xfail of the whole module, the other
+      tests of it pass

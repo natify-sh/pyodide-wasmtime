@@ -88,7 +88,7 @@ uv run pytest -m suite                           # Pyodide's official CPython te
 PYODIDE_SUITE_FLAVORS=fused PYODIDE_SUITE_SHARD=3/8 uv run pytest -n auto -m suite -k test_json      # a part (-n: pytest-xdist)
 ```
 The suite runs one guest process per test module, as Pyodide's `test_cpython_core` does: `xfail` entries are reported as xfail (`PYODIDE_SUITE_RUN_XFAIL=1` runs them),
-`skip` globs are passed on. Not included: the tests of the JavaScript API and `@run_in_pyodide`, which need a browser or Node.
+`skip` globs are passed on, with our own per-test skips and their reasons from `tests/suite_overrides.yaml` (`PYODIDE_SUITE_NO_OVERLAY=1` ignores them). Not included: the tests of the JavaScript API and `@run_in_pyodide`, which need a browser or Node.
 CI (`tests.yml`): the offline tests on Linux, Windows and macOS (Python 3.10 and 3.15), the network checks, and the suite (one job per build, the modules spread over the cores by pytest-xdist).
 
 ## Licenses
