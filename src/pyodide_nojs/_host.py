@@ -24,6 +24,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -89,7 +90,7 @@ class Pyodide:
     """One Python (Pyodide's CPython) in wasm, run by wasmtime.
 
     >>> py = Pyodide()                       # the dynamic build from the package's data (fused if only that is there)
-    >>> py.run("print(1 + 1)")               # 0 if the code ran, -1 if it raised (the traceback is on stderr)
+    >>> py.run("print(1 + 1)")               # 0 if the code ran, 1 if it raised (the traceback is on stderr)
 
     ``site``: a folder (or several) copied into the guest's ``site-packages`` (a wheel unpacked, ``micropip``...);
     ``mounts``: ``{guest path: host folder}`` preopened as they are (the guest can write there);
@@ -182,6 +183,12 @@ class Pyodide:
         self.converted = 0  # modules whose legacy exceptions the loader converted at dlopen
         self.summary = ""
         self._started = False
+        # where interrupt() writes: (the memory's base address or None, the cell, the flag byte), set when the start is
+        # over and forgotten by close(), both under the lock
+        self._sig: tuple[int | None, int, int] | None = None
+        self._sig_lock = threading.RLock()
+        self._sig_posted = False  # interrupt() ran since this run began
+        self._sig_since_run = False  # interrupt() ran since the last run ended (what it left in a run's wrapper)
         self._runs = 0
         self._exited: int | None = None
         # table slots of freed closures (ffi_closure_free_js), reused last in, first out
@@ -732,23 +739,48 @@ class Pyodide:
         _engine.engine()
         return _engine.depth_cap(_engine.STATE["wasm_stack"])
 
-    def interrupt(self, signum: int = 2) -> None:
-        """Post signal `signum` (SIGINT: KeyboardInterrupt) to the guest's Python, as JavaScript's
-        ``Py_EmscriptenSignalBuffer[0] = 2`` does. Python takes it when it checks for signals: between bytecodes of the
-        running code, within a few dozen of them, not while it waits in a system call. Call it from a host function
-        that the guest is calling (a host callback, an ``fd_read`` hook, a socket operation) or between ``run()``
-        calls; the guest's memory is written, which is not safe from another thread while the guest runs."""
-        if not self._started:
-            raise RuntimeError("the guest is not running")
-        self.host_state = True
-        flag = self.instances[0]["exports"][
-            "Py_EMSCRIPTEN_SIGNAL_HANDLING"
-        ]  # a byte: Python looks for signals if it is 1
-        self._wr(flag.value(self.guest.cur[-1]), b"\x01")
-        cell = self._svc_ex["__nojs_sigcell_addr"](self.guest.cur[-1]) & 0xFFFFFFFF  # the adapter's, made on first call
+    def _arm_signals(self) -> None:
+        """When the start is over (the start code and the preload have run: a signal must not land in them), on the
+        guest's thread: remember where `interrupt` writes (the cell the adapter's `check_signals` reads, Python's flag
+        byte, the memory's base address). The adapter makes the cell's block at the first ask."""
+        store = self.guest.store
+        cell = self._svc_ex["__nojs_sigcell_addr"](store) & 0xFFFFFFFF
         if not cell:
             raise RuntimeError("the guest is out of memory: no word for the signal")
-        self._wr(cell, struct.pack("<I", signum))
+        flag = self.instances[0]["exports"]["Py_EMSCRIPTEN_SIGNAL_HANDLING"].value(store)
+        base = ctypes.addressof(self.guest.memory.data_ptr(store).contents) if _engine.STATE["stable_memory"] else None
+        with self._sig_lock:
+            self._sig = (base, cell, flag)
+
+    def interrupt(self, signum: int = 2) -> None:
+        """Post signal `signum` (SIGINT: KeyboardInterrupt) to the guest's Python, as JavaScript's
+        ``Py_EmscriptenSignalBuffer[0] = 2`` does: Python takes it when it next looks for
+        signals, between bytecodes of the running code (within about 50 of them), not inside one long C call and not
+        while it waits in a system call (``time.sleep`` is a spin of libc here: not yet interruptible). Call it from
+        any thread, a signal handler included, while the guest runs in another (as Pyodide's docs advise), or between
+        ``run()`` calls: a signal posted between runs is taken by the next one, a late one (posted after the last
+        look of a run) is dropped at the end of that run. RuntimeError if the guest is not started or is closed.
+
+        Until the start (the start code and the ``preload``) has finished the guest is not armed: RuntimeError.
+        A host where the memory can not be reserved for good (not 64-bit) raises RuntimeError: a raw write is unsafe."""
+        # One lock, held for the whole write and by close() when it forgets the memory: a thread never writes into
+        # memory that is freed (the Store, and the memory with it, is dropped only after `_sig` is None). RLock: a
+        # signal handler on the thread that holds it must not deadlock. Nothing else is held or waited for under it.
+        with self._sig_lock:
+            sig = self._sig
+            if sig is None:
+                raise RuntimeError("the guest is not running")
+            base, cell, flag = sig
+            if base is None:
+                raise RuntimeError("interrupt() from another thread needs a host where the memory cannot move")
+            self.host_state = True  # a snapshot of the memory would not hold a posted signal
+            self._sig_posted = self._sig_since_run = True  # before the write: a run that takes it knows (130)
+            # Safe against the running guest: the memory can not move (engine(): memory_may_move off, 4 GiB reserved,
+            # the most a 32-bit memory can have), so base + address is valid for as long as `_sig` is set, and what
+            # is written is one aligned word and one byte that the adapter and CPython read with plain loads. The
+            # cell first: the look that sees the flag finds the cell.
+            ctypes.memmove(base + cell, struct.pack("<I", signum), 4)
+            ctypes.memmove(base + flag, b"\x01", 1)  # opt-in: no look for signals (no cost) until the first post
 
     def _cpu_clock(self, cid: int, res: int, out: int) -> int:
         return _timecalc.cpu_clock(self._wr, cid, res, out)
@@ -1104,6 +1136,8 @@ class Pyodide:
                 self._chdir_home()
                 # the hash seed and `random`'s state are the snapshot's: a fresh seed, as a normal start has
                 self.run(self._at_start() + 'import sys; "random" in sys.modules and __import__("random").seed()')
+                if self._started:
+                    self._arm_signals()
                 return
         self.guest.ex["emscripten_stack_init"](store)
         self.guest.ex["__wasm_call_ctors"](store)
@@ -1119,7 +1153,11 @@ class Pyodide:
             raise RuntimeError(f"Pyodide's main() returned {rc}: CPython did not start")
         self._started = True
         self.run(self._at_start())
-        if self.preload is not None and self.run(self.preload) == 0 and path is not None:
+        saved = self.preload is not None and self.run(self.preload) == 0 and path is not None
+        if self._started:  # (a preload that ended the process closed the interpreter)
+            self._arm_signals()
+        if saved:
+            assert path is not None
             self._save(path)
 
     def _restore(self, path: Path, slots: tuple[int, int]) -> bool:
@@ -1223,7 +1261,8 @@ class Pyodide:
     # ------------------------------------------------------------------ public
     def run(self, code: str, argv: list[str] | None = None) -> int:
         """Run Python source in the guest, in its ``__main__``: 0 if it ran, 1 if it raised (the traceback is on
-        stderr), N for ``sys.exit(N)`` (a message or None-like code as CPython's: text -> 1, None -> 0)."""
+        stderr; 130 for an uncaught KeyboardInterrupt, a shell's 128 + SIGINT), N for ``sys.exit(N)`` (a message or
+        None-like code as CPython's: text -> 1, None -> 0)."""
         if not self._started:
             self._start()
         assert self.root is not None
@@ -1236,6 +1275,7 @@ class Pyodide:
         store = self.guest.store
         p = self.guest.ex["PyMem_Malloc"](store, len(src))
         self._wr(p, src)
+        self._sig_posted = False  # only a post that comes during this run can be late for it: older ones persist
         try:
             rc = self.guest.ex["PyRun_SimpleString"](store, p)
         except (
@@ -1258,18 +1298,34 @@ class Pyodide:
             )
             self._exited = 134  # as for a trap
             rc = 134
+        posted, self._sig_since_run = self._sig_posted or self._sig_since_run, False
+        if self._sig_posted and self._exited is None:
+            self._drop_late_signal()
         rc_path = self.root / rc_file.lstrip("/")
         if self._exited is not None:
             self.close()  # a next run() starts a new interpreter
             self._exited = None
-        elif rc_path.exists():
-            rc = int(rc_path.read_text())
+        else:
+            try:
+                rc = int(rc_path.read_text())
+            except (OSError, ValueError):  # no status written: a signal ended the wrapper itself
+                rc = 130 if posted else 1
         if self.lazy:
             log.info("[loader] imports bound lazily (no definition at load): %s", ", ".join(sorted(set(self.lazy))))
         self.net.flush_log()
         return rc
 
+    def _drop_late_signal(self) -> None:
+        """A signal that came after the last look of this run must not hit the next, unrelated one. Only the cell is
+        cleared: Python's flag byte is shared with the timers (setitimer sets it), so it stays set."""
+        with self._sig_lock:
+            self._sig_posted = False
+            if self._sig is not None:
+                self._wr(self._sig[1], bytes(4))
+
     def close(self) -> None:
+        with self._sig_lock:  # before anything is freed: a writer in another thread then gets a RuntimeError
+            self._sig = None
         self.net.close_all()
         self.slots.clear()
         self.instances = [None]

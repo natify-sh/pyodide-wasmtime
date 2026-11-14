@@ -2,6 +2,7 @@
 
 # pyright: reportAttributeAccessIssue=false
 import errno
+import signal
 import sys
 import traceback
 
@@ -25,18 +26,18 @@ def start(site_first):
         sys.path.insert(0 if sys.flags.safe_path else 1, sp)
 
 
-def run(src_path, rc_path):
-    """One `run()` of the host: the user's code in __main__, SystemExit as an exit status (the interpreter must
-    survive it: Emscripten's exit() ends in `unreachable`), any other error as a traceback and status 1."""
-    import __main__
+def _drop(signum, frame):
+    pass
 
+
+def _finish(err):
+    """The status of a run and the report of how it ended: the SystemExit's code or message, the traceback of an
+    uncaught error (130 for a KeyboardInterrupt, a shell's 128 + SIGINT, else 1), the flush of the standard streams."""
     rc = 0
-    try:
-        with open(src_path) as f:
-            code = compile(f.read(), "<string>", "exec")
-        exec(code, __main__.__dict__)
-    except SystemExit as e:
-        c = e.code
+    if err is None:
+        pass
+    elif isinstance(err, SystemExit):
+        c = err.code
         if c is None:
             rc = 0
         elif isinstance(c, int):
@@ -44,8 +45,9 @@ def run(src_path, rc_path):
         else:
             print(c, file=sys.stderr)
             rc = 1
-    except BaseException as e:
-        rc = 1
+    else:
+        e = err
+        rc = 130 if isinstance(e, KeyboardInterrupt) else 1
         e.__traceback__ = e.__traceback__.tb_next if e.__traceback__ else None  # not our frame (a SyntaxError has none)
         try:  # (OSError: the program closed descriptor 2, so there is nowhere to say it; Pyodide's runPython throws it)
             if sys.excepthook is sys.__excepthook__:
@@ -69,5 +71,38 @@ def run(src_path, rc_path):
                     print(f"Exception ignored in: {s!r}\n{type(e4).__name__}: {e4}", file=sys.__stderr__)
                 except OSError:
                     pass
-    with open(rc_path, "w") as f:
+    return rc
+
+
+def run(src_path, rc_path):
+    """One `run()` of the host: the user's code in __main__, SystemExit as an exit status (the interpreter must
+    survive it: Emscripten's exit() ends in `unreachable`), an uncaught KeyboardInterrupt as a traceback and status 130
+    (a shell's 128 + SIGINT), any other error as a traceback and status 1.
+
+    The host's Ctrl-C (`Pyodide.interrupt`) can come at any look for signals, also in this wrapper: once the user's code
+    is over, SIGINT is given to a handler that does nothing until the status is written, so that a late signal can not
+    cut the traceback, the flush or the status file (the host drops a signal that came late for the run anyway)."""
+    err = None
+    try:
+        import __main__
+
+        with open(src_path) as f:
+            code = compile(f.read(), "<string>", "exec")
+        exec(code, __main__.__dict__)
+    except BaseException as e:
+        err = e
+    saved = None
+    while True:  # a signal can still come between the end of the code and this handler
+        try:
+            if saved is None:
+                saved = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _drop)
+            break
+        except KeyboardInterrupt:
+            if err is None:
+                err = KeyboardInterrupt()
+    rc = _finish(err)
+    with open(rc_path, "w") as f:  # one write of the whole text
         f.write(str(rc))
+    # the user's handler is back (a program that had none has Python's own)
+    signal.signal(signal.SIGINT, signal.default_int_handler if saved is None else saved)

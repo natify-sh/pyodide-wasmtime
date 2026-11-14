@@ -6,9 +6,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
+import threading
+from collections.abc import Callable
+from typing import Any
 
-from . import PYODIDE_ABI, PYODIDE_VERSION, __version__
+from . import PYODIDE_ABI, PYODIDE_VERSION, __version__, _engine
 from ._host import FLAVORS, TESTENV_HINT, Pyodide
 
 CWD_MOUNT = "/host"  # where --mount-cwd puts the host's current folder
@@ -73,9 +77,76 @@ def _reader():
         return input
 
 
-def repl(py: Pyodide) -> int:
-    """The REPL on PY, which was made with ``preload=SETUP.format(aw=...)``."""
-    py.run(BANNER.format(v=PYODIDE_VERSION))
+def guest_caller(py: Pyodide) -> Callable[..., Any]:
+    """``call(fn, *args, program=False)``: run ``fn(*args)`` (a ``py.run``) on a worker thread while this, the main
+    thread, waits. While it waits, SIGINT has a Python handler that turns Ctrl-C into ``py.interrupt(2)`` (the advice
+    of Pyodide's docs): a KeyboardInterrupt in the guest at its next look for signals. A handler, not an exception:
+    a second Ctrl-C can not escape from this function while the worker still runs wasm (the end of the
+    ``with Pyodide`` would pull the files from under it). It returns only when the worker is done; a guest that
+    never takes the signal is stopped as CPython's is, with Ctrl-\\ or kill; a long call of C code is not interrupted.
+    The worker blocks SIGINT, so the signal reaches this thread and a guest blocked in a read of stdin is not cut by
+    EINTR into a fake EOF (it waits for its input).
+
+    A Ctrl-C is for the user's PROGRAM (``program=True``: the code of ``-c``, the file, one REPL line), not for the
+    start or the housekeeping runs, where the guest is not armed or a signal would leave it half set up: it is kept
+    and posted right before the next program run."""
+    _engine.engine()  # made here: the wasm stack is sized for the main thread, and the worker's stack is as big
+    pending = False
+
+    def call(fn: Callable[..., Any], *args: Any, program: bool = False) -> Any:
+        nonlocal pending
+        out: list[Any] = []
+
+        def work() -> None:
+            if hasattr(signal, "pthread_sigmask"):
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+            try:
+                out.append(fn(*args))
+            except BaseException as e:
+                out.append(e)
+
+        def on_sigint(signum: int, frame: Any) -> None:
+            nonlocal pending
+            if not program:
+                pending = True
+                return
+            try:
+                py.interrupt(2)
+            except RuntimeError:  # gone
+                pending = True
+
+        if program and pending:
+            pending = False
+            try:
+                py.interrupt(2)  # between runs: taken by the program's first look
+            except RuntimeError:
+                pass
+        try:
+            before = signal.signal(signal.SIGINT, on_sigint)
+        except ValueError:  # not the main thread (a caller of main()): no Ctrl-C handling
+            before = None
+        old = threading.stack_size(8 << 20)  # read by start(); the guest's wasm runs on this stack
+        try:
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+        finally:
+            threading.stack_size(old)
+        try:
+            while t.is_alive():  # a plain join() is not interruptible on Windows
+                t.join(0.1)
+        finally:
+            if before is not None:
+                signal.signal(signal.SIGINT, before)
+        if isinstance(out[0], BaseException):
+            raise out[0]
+        return out[0]
+
+    return call
+
+
+def repl(py: Pyodide, call: Callable[..., Any]) -> int:
+    """The REPL on PY, which was made with ``preload=SETUP.format(aw=...)``; CALL runs the guest (`guest_caller`)."""
+    call(py.run, BANNER.format(v=PYODIDE_VERSION))
     assert py.root is not None
     flag = py.root / "_repl"
     read = _reader()
@@ -88,11 +159,11 @@ def repl(py: Pyodide) -> int:
             return 0
         except KeyboardInterrupt:
             print("\nKeyboardInterrupt")
-            py.run("_console.resetbuffer()")
+            call(py.run, "_console.resetbuffer()")
             more = False
             continue
         flag.unlink(missing_ok=True)
-        rc = py.run(PUSH.format(line=line))
+        rc = call(py.run, PUSH.format(line=line), program=True)
         state = flag.read_text() if flag.exists() else "done"
         if state == "exit":
             return rc
@@ -196,8 +267,11 @@ def main(argv: list[str] | None = None) -> int:
         asm_wasm=ns.asm_wasm,
         stdlib=ns.stdlib,
     ) as py:
+        call = guest_caller(py)
+        call(py.run, "pass")  # the start (it can be long): a Ctrl-C during it is delivered to the program that follows
         if ns.mount_cwd:
-            py.run(f"__import__('os').chdir({CWD_MOUNT!r})")
+            call(py.run, f"__import__('os').chdir({CWD_MOUNT!r})")
         if code is None:
-            return repl(py)
-        return py.run(code, argv0)  # 0, 1 for an uncaught error, or the code of sys.exit()/os._exit()
+            return repl(py, call)
+        # 0, 1 for an uncaught error, 130 for an uncaught KeyboardInterrupt, or the code of sys.exit()/os._exit()
+        return call(py.run, code, argv0, program=True)

@@ -149,6 +149,13 @@ def engine() -> Any:
         cfg.wasm_function_references = True
         cfg.wasm_gc = True
         STATE["wasm_stack"] = cfg.max_wasm_stack = _wasm_stack()  # the loader's NEEDED recursion runs on it
+        # A guest's linear memory never moves: all of its address space (4 GiB, the most a 32-bit memory can have) is
+        # reserved at once, so growing only commits pages and the base address stays. `Pyodide.interrupt` writes into
+        # the memory from another thread through that address; it is a guarantee only where the reservation fits.
+        STATE["stable_memory"] = stable = sys.maxsize > 2**32
+        if stable:
+            cfg.memory_may_move = False
+            cfg.memory_reservation = 4 << 30
         STATE["engine"] = wt.Engine(cfg)
     return STATE["engine"]
 
